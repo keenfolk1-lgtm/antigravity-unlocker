@@ -1715,6 +1715,24 @@ namespace PixelTunnel
                     UpdateCheckboxVisual(_chkBoxWeb, _chkMarkWeb, _iconBoxWeb, _optSocialWeb, true);
                     SaveCurrentState();
                     TriggerCategoryHotReloadIfConnected();
+                    if (_optSocialWeb)
+                    {
+                        var tgRes = MessageBox.Show(
+                            this,
+                            "Подключить Telegram Desktop к туннелю PixelTunnel (SOCKS5 127.0.0.1:17891)?\n\nОткроется окно Telegram с кнопкой «Включить прокси».",
+                            "Telegram Proxy — 1 клик",
+                            MessageBoxButton.YesNo,
+                            MessageBoxImage.Question
+                        );
+                        if (tgRes == MessageBoxResult.Yes)
+                        {
+                            try
+                            {
+                                Process.Start(new ProcessStartInfo("tg://socks?server=127.0.0.1&port=17891") { UseShellExecute = true });
+                            }
+                            catch { }
+                        }
+                    }
                 },
                 true,
                 false
