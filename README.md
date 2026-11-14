@@ -1,6 +1,12 @@
-# PixelTunnel — Open-Source Windows Unlocker
+# PixelTunnel v1.9.0 — Open-Source Windows Unlocker
 
-Лёгкий и полностью открытый клиент для Windows (C# / WPF / .NET Framework 4.x) с точечной маршрутизацией трафика (Split-Tunneling).
+Лёгкий и полностью открытый клиент для Windows (C# / WPF / .NET Framework 4.x) с точечной маршрутизацией трафика (Split-Tunneling) и мультиплексированным транспортом **PWP-3**.
+
+## Что нового в v1.9.0
+- **Zero-Secret Client & Динамический манифест**: удалены любые зашитые триал-ключи, UUID и общие секреты; конфигурация и ключи узлов загружаются динамически из подписанного ECDSA P-256 манифеста `nodes_v3.enc` с защитой от отката версии (`ManifestVersion`) и проверкой `issued_utc`.
+- **Строгий TLS / SPKI Pinning & Anti-DPI**: отключён открытый HTTP fallback `:25442` и самоподписанный TLS fallback (`_allowSelfSignedFallback = false`); проверка сертификата по цепочке TLS и pinned SPKI SHA-256, ротация `MuxSession` до переполнения счётчика шифраторных блоков.
+- **Прокси, IPv6 & Локальная безопасность**: закрыт таймер-лик в `BridgeDirectAsync`, добавлена поддержка IPv4-mapped IPv6 и Telegram IPv6-префиксов, точное сопоставление доменов (`HostMatchesDomain`), строгая проверка `Host` для локального API `/__pixelcore/status` и `0x00`-метода в SOCKS5.
+- **Надёжность WinINet, Telegram, Updater & CLI**: `RunOnce` (`PixelTunnelProxyReset`) аварийный сброс прокси после сбоя питания, динамическая 1-клик настройка Telegram SOCKS5, верификация обновлений по ECDSA P-256 + SHA-256 и корректные переменные `ALL_PROXY=socks5h://` / `NO_PROXY` для CLI.
 
 ## Что работает бесплатно и бессрочно
 - **Antigravity 2.0, IDE и Терминал** — вход, плагины, MCP-серверы и агенты

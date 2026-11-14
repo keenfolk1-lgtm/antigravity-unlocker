@@ -26,7 +26,7 @@ $refs = @(
     "$wpf\PresentationFramework.dll"
 ) -join ","
 
-Write-Host "Building PixelTunnel.exe from open source..."
+Write-Host "Building PixelTunnel.exe v1.9.0 from open source..."
 & $csc /nologo /target:winexe /optimize+ /platform:x64 `
     "/win32icon:$src\pixel.ico" `
     "/win32manifest:$src\app.manifest" `
