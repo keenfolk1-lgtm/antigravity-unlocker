@@ -9,6 +9,7 @@ using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Authentication;
 using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -29,6 +30,9 @@ namespace PixelTunnel
         private int _padIndex = 0;
         private readonly SHA256 _sha = SHA256.Create();
 
+        public const uint HardBlockLimit = 0xE0000000u;
+        public uint BlockCounter { get { return _counter; } }
+
         public PixelStreamCipher(string key, string salt)
         {
             byte[] k = Encoding.UTF8.GetBytes(key);
@@ -45,6 +49,10 @@ namespace PixelTunnel
             {
                 if (_padIndex >= _keystreamPad.Length)
                 {
+                    if (_counter >= HardBlockLimit)
+                    {
+                        throw new IOException("Mux cipher block limit reached (0xE0000000)");
+                    }
                     if (blk == null)
                     {
                         blk = new byte[_keyBuffer.Length + 4];
@@ -586,6 +594,17 @@ namespace PixelTunnel
             }
         }
 
+        public bool IsCipherLimitNear
+        {
+            get
+            {
+                const uint SoftRetireThreshold = 0xD0000000u;
+                if (_encryptor != null && _encryptor.BlockCounter >= SoftRetireThreshold) return true;
+                if (_decryptor != null && _decryptor.BlockCounter >= SoftRetireThreshold) return true;
+                return false;
+            }
+        }
+
         public int ActiveStreamCount { get { return _streams.Count; } }
         public int ActiveUdpCount { get { return _udpHandlers.Count; } }
         public int LastRttMs { get { return _lastRttMs; } }
@@ -755,6 +774,11 @@ namespace PixelTunnel
             lock (_writeLock)
             {
                 if (_closed) throw new ObjectDisposedException("Pwp3MuxClient");
+                if (_encryptor != null && _encryptor.BlockCounter >= 0xDFF00000u)
+                {
+                    Shutdown();
+                    throw new IOException("Mux encryptor cipher block threshold reached (0xE0000000)");
+                }
                 if (_nativeTlsBulk)
                 {
                     _encryptor.ProcessBytes(frame, 0, 9);
@@ -776,6 +800,10 @@ namespace PixelTunnel
             {
                 while (!_closed)
                 {
+                    if (_decryptor != null && _decryptor.BlockCounter >= 0xDFF00000u)
+                    {
+                        throw new IOException("Mux decryptor cipher block threshold reached (0xE0000000)");
+                    }
                     PixelCoreService.ReadExactInternal(_transport, hdr, 0, 9);
                     _decryptor.ProcessBytes(hdr, 0, 9);
 
@@ -947,8 +975,8 @@ namespace PixelTunnel
 
     public static class PixelCoreService
     {
+        public const string ENGINE_VERSION = "1.9.0";
         private const string DEFAULT_HOST = "201.34.152.97";
-        private const string DEFAULT_SECRET = "pixel-super-secret-key-2026";
         private const string DEFAULT_SNI = "ai.pixelstore.space";
         private const int WARM_POOL_TARGET = 2;
 
@@ -957,13 +985,21 @@ namespace PixelTunnel
         private const string DEFAULT_MANIFEST_AES_HEX = "296181aecf480e7f58dcd21d8989b45d078ac2e7546a679f764312242bf95fa8";
         private const string DEFAULT_GITHUB_MANIFEST_URL = "https://raw.githubusercontent.com/keenfolk1-lgtm/antigravity-unlocker/main/manifest/nodes_v3.enc";
         private const string DEFAULT_DOH_TXT_DOMAIN = "_v3.pixelstore.space";
+        private const string DEFAULT_PINNED_SPKI_SHA256 = "057ab81186e5e5beae4ac0fade013988ca7abfa9d69dafe3bfb548f94ec434f0";
 
         private static string _manifestPubKeyB64 = DEFAULT_MANIFEST_PUBKEY_B64;
         private static string _manifestAesHex = DEFAULT_MANIFEST_AES_HEX;
         private static string _manifestGithubUrl = DEFAULT_GITHUB_MANIFEST_URL;
         private static string _manifestDohDomain = DEFAULT_DOH_TXT_DOMAIN;
         private static string _manifestCachePath = "";
+        private static string _manifestStatePath = "";
+        private static int _persistedManifestVersion = 0;
+        private static readonly object _manifestFetchLock = new object();
         private static bool _enableRemoteManifestFetch = true;
+        private static HashSet<string> _pinnedSpkiHashes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            DEFAULT_PINNED_SPKI_SHA256
+        };
 
         private static readonly List<PixelServerNode> _nodes = new List<PixelServerNode>();
         private static readonly object _nodesLock = new object();
@@ -980,12 +1016,12 @@ namespace PixelTunnel
 
         private static int _localPort = 17890;
         private static int _socksPort = 17891;
-        private static string _secret = DEFAULT_SECRET;
+        private static string _secret = "";
         private static string _defaultSni = DEFAULT_SNI;
-        private static string _clientUuid = "e434aed7-0a9f-449f-81b9-870086cf2d09";
+        private static string _clientUuid = "";
         private static string _machineHwid = "7F8A9C1E";
         private static bool _enableDpiFragment = true;
-        private static bool _allowSelfSignedFallback = true;
+        private static bool _allowSelfSignedFallback = false;
         private static string _preferredRegion = "auto";
 
         private static HashSet<string> _directDomains = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -1307,6 +1343,92 @@ namespace PixelTunnel
             catch { return "7F8A9C1E"; }
         }
 
+        private static Task _activeManifestFetchTask = null;
+
+        private static void EnsureManifestPathsInitialized()
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(_manifestCachePath) || string.IsNullOrEmpty(_manifestStatePath))
+                {
+                    string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "PixelTunnel");
+                    Directory.CreateDirectory(dir);
+                    if (string.IsNullOrEmpty(_manifestCachePath))
+                        _manifestCachePath = Path.Combine(dir, "nodes_v3.cache.enc");
+                    if (string.IsNullOrEmpty(_manifestStatePath))
+                        _manifestStatePath = Path.Combine(dir, "manifest_version.state");
+                }
+            }
+            catch { }
+        }
+
+        private static int LoadPersistedManifestVersion()
+        {
+            try
+            {
+                EnsureManifestPathsInitialized();
+                if (!string.IsNullOrEmpty(_manifestStatePath) && File.Exists(_manifestStatePath))
+                {
+                    string raw = File.ReadAllText(_manifestStatePath, Encoding.ASCII).Trim();
+                    int v;
+                    if (int.TryParse(raw, out v) && v > 0) return v;
+                }
+            }
+            catch { }
+            return 0;
+        }
+
+        private static void PersistManifestVersion(int ver)
+        {
+            if (ver <= 0) return;
+            try
+            {
+                EnsureManifestPathsInitialized();
+                if (!string.IsNullOrEmpty(_manifestStatePath))
+                {
+                    File.WriteAllText(_manifestStatePath, ver.ToString(CultureInfo.InvariantCulture), Encoding.ASCII);
+                }
+            }
+            catch { }
+        }
+
+        private static bool HasAnyNodeWithSecret()
+        {
+            lock (_nodesLock)
+            {
+                foreach (var n in _nodes)
+                {
+                    if (!string.IsNullOrEmpty(n.Secret)) return true;
+                }
+            }
+            return false;
+        }
+
+        private static void EnsureManifestSecretsLoaded(int maxWaitMs = 5000)
+        {
+            try
+            {
+                EnsureManifestPathsInitialized();
+                if (_persistedManifestVersion <= 0)
+                    _persistedManifestVersion = LoadPersistedManifestVersion();
+                if (!HasAnyNodeWithSecret())
+                    TryLoadCachedManifest();
+                if (HasAnyNodeWithSecret() || !_enableRemoteManifestFetch) return;
+
+                Task t;
+                lock (_manifestFetchLock)
+                {
+                    if (_activeManifestFetchTask == null || _activeManifestFetchTask.IsCompleted)
+                    {
+                        _activeManifestFetchTask = Task.Run(() => RefreshRemoteManifestInBackground());
+                    }
+                    t = _activeManifestFetchTask;
+                }
+                t.Wait(Math.Max(500, maxWaitMs));
+            }
+            catch { }
+        }
+
         public static void StartService(string configPath)
         {
             string rawJson = "";
@@ -1345,16 +1467,11 @@ namespace PixelTunnel
                     ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
                 }
 
-                if (string.IsNullOrEmpty(_manifestCachePath))
-                {
-                    try
-                    {
-                        string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "PixelTunnel");
-                        Directory.CreateDirectory(dir);
-                        _manifestCachePath = Path.Combine(dir, "nodes_v3.cache.enc");
-                    }
-                    catch { }
-                }
+                EnsureManifestPathsInitialized();
+                int persisted = LoadPersistedManifestVersion();
+                if (persisted > _persistedManifestVersion) _persistedManifestVersion = persisted;
+                if (ManifestVersion > _persistedManifestVersion) _persistedManifestVersion = ManifestVersion;
+                ManifestVersion = 0;
 
                 _machineHwid = ComputeHardwareId();
                 _startTime = DateTime.UtcNow;
@@ -1540,21 +1657,15 @@ namespace PixelTunnel
                 SupportsMuxV3 = false,
                 LatencyMs = 28
             });
+        }
 
-            // 5. Аварийный открытый фоллбэк 25442 PWP-3 Stealth-TCP
-            _nodes.Add(new PixelServerNode
-            {
-                Name = "NL-Stealth-Mux",
-                Region = "nl",
-                Host = DEFAULT_HOST,
-                Port = 25442,
-                Secret = secret,
-                Sni = DEFAULT_SNI,
-                UpgradePath = "/api/v3/telemetry/mux",
-                UseTls = false,
-                SupportsMuxV3 = true,
-                LatencyMs = 35
-            });
+        private static bool IsLoopbackHostString(string h)
+        {
+            if (string.IsNullOrEmpty(h)) return false;
+            string clean = h.Trim().Trim('[', ']');
+            return string.Equals(clean, "127.0.0.1", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(clean, "::1", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(clean, "localhost", StringComparison.OrdinalIgnoreCase);
         }
 
         private static void LoadCompatibleJsonString(string json)
@@ -1581,9 +1692,9 @@ namespace PixelTunnel
                 if (mAddr.Success && !string.IsNullOrEmpty(mAddr.Groups[1].Value))
                     serverAddr = mAddr.Groups[1].Value.Trim();
 
-                Match mUuid = Regex.Match(json, "\"id\"\\s*:\\s*\"([^\"]+)\"", RegexOptions.IgnoreCase);
-                if (mUuid.Success && !string.IsNullOrEmpty(mUuid.Groups[1].Value))
-                    _clientUuid = mUuid.Groups[1].Value.Trim();
+                Match mUuid = Regex.Match(json, "\"id\"\\s*:\\s*\"([^\"]*)\"", RegexOptions.IgnoreCase);
+                if (mUuid.Success)
+                    _clientUuid = (mUuid.Groups[1].Value ?? "").Trim();
 
                 Match mSni = Regex.Match(json, "\"serverName\"\\s*:\\s*\"([^\"]+)\"", RegexOptions.IgnoreCase);
                 if (mSni.Success && !string.IsNullOrEmpty(mSni.Groups[1].Value))
@@ -1604,6 +1715,9 @@ namespace PixelTunnel
                 if (mPwpTls.Success)
                     useTls = string.Equals(mPwpTls.Groups[1].Value, "true", StringComparison.OrdinalIgnoreCase);
 
+                if (!useTls && !IsLoopbackHostString(serverAddr))
+                    useTls = true;
+
                 Match mPwpMux = Regex.Match(json, "\"pwpMux\"\\s*:\\s*(true|false)", RegexOptions.IgnoreCase);
                 if (mPwpMux.Success)
                     muxV3 = string.Equals(mPwpMux.Groups[1].Value, "true", StringComparison.OrdinalIgnoreCase);
@@ -1617,7 +1731,7 @@ namespace PixelTunnel
                     _nodes.Clear();
                     if ((string.IsNullOrEmpty(serverAddr) ||
                          string.Equals(serverAddr, DEFAULT_HOST, StringComparison.OrdinalIgnoreCase) ||
-                         serverAddr.EndsWith("pixelstore.space", StringComparison.OrdinalIgnoreCase)) &&
+                         HostMatchesDomain(serverAddr, "pixelstore.space")) &&
                         !mPwpPort.Success)
                     {
                         AddPixelClusterNodesLocked(secret, sni);
@@ -1637,7 +1751,7 @@ namespace PixelTunnel
                             SupportsMuxV3 = muxV3,
                             LatencyMs = 10
                         });
-                        if (!string.Equals(serverAddr, "127.0.0.1", StringComparison.OrdinalIgnoreCase))
+                        if (!IsLoopbackHostString(serverAddr))
                         {
                             AddPixelClusterNodesLocked(_secret, DEFAULT_SNI);
                         }
@@ -1758,7 +1872,33 @@ namespace PixelTunnel
                 int ver = 0;
                 Match mVer = Regex.Match(json, "\"version\"\\s*:\\s*(\\d+)");
                 if (mVer.Success) int.TryParse(mVer.Groups[1].Value, out ver);
-                if (ver > 0 && ver < ManifestVersion) return false;
+                if (ver <= 0) return false;
+                if (ver < _persistedManifestVersion) return false;
+                if (ManifestVersion > 0 && ver <= ManifestVersion) return false;
+
+                string issuedUtcStr = ExtractJsonStr(json, "issued_utc");
+                if (!string.IsNullOrEmpty(issuedUtcStr))
+                {
+                    DateTimeOffset issuedDto;
+                    if (!DateTimeOffset.TryParse(
+                        issuedUtcStr,
+                        CultureInfo.InvariantCulture,
+                        DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+                        out issuedDto))
+                    {
+                        return false;
+                    }
+                    DateTime minEpoch = new DateTime(2025, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+                    if (issuedDto.UtcDateTime < minEpoch) return false;
+                    DateTime effectiveNow = DateTime.UtcNow.AddSeconds(Interlocked.Read(ref _clockOffsetSeconds));
+                    if (effectiveNow.Year >= 2025)
+                    {
+                        if (issuedDto.UtcDateTime > effectiveNow.AddDays(2)) return false;
+                        if (issuedDto.UtcDateTime < effectiveNow.AddDays(-180)) return false;
+                    }
+                }
+
+                string topSecret = ExtractJsonStr(json, "secret");
 
                 MatchCollection objMatches = Regex.Matches(json, "\\{[^{}]*\"host\"\\s*:\\s*\"[^\"]+\"[^{}]*\\}");
                 if (objMatches.Count == 0) return false;
@@ -1779,13 +1919,19 @@ namespace PixelTunnel
                     bool frag = ExtractJsonBool(item, "frag", true);
 
                     if (string.IsNullOrEmpty(host) || port <= 0) continue;
+                    if (!tls && !IsLoopbackHostString(host)) continue;
+
+                    string effectiveSecret = !string.IsNullOrEmpty(nodeSecret)
+                        ? nodeSecret
+                        : (!string.IsNullOrEmpty(topSecret) ? topSecret : _secret);
+
                     parsedNodes.Add(new PixelServerNode
                     {
                         Name = string.IsNullOrEmpty(name) ? (host + ":" + port) : name,
                         Region = string.IsNullOrEmpty(region) ? "nl" : region.ToLowerInvariant(),
                         Host = host,
                         Port = port,
-                        Secret = string.IsNullOrEmpty(nodeSecret) ? _secret : nodeSecret,
+                        Secret = effectiveSecret,
                         Sni = string.IsNullOrEmpty(sni) ? host : sni,
                         UpgradePath = string.IsNullOrEmpty(path) ? (mux ? "/api/v3/telemetry/mux" : "/api/v2/telemetry/stream") : path,
                         UseTls = tls,
@@ -1797,6 +1943,19 @@ namespace PixelTunnel
                 }
 
                 if (parsedNodes.Count == 0) return false;
+
+                string[] spkiPins = ExtractJsonStrArray(json, "spki_sha256");
+                if (spkiPins == null || spkiPins.Length == 0) spkiPins = ExtractJsonStrArray(json, "cert_pins");
+                if (spkiPins != null && spkiPins.Length > 0)
+                {
+                    var nextPins = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { DEFAULT_PINNED_SPKI_SHA256 };
+                    foreach (string rawPin in spkiPins)
+                    {
+                        string normPin = NormalizeSpkiPinToHex(rawPin);
+                        if (!string.IsNullOrEmpty(normPin)) nextPins.Add(normPin);
+                    }
+                    _pinnedSpkiHashes = nextPins;
+                }
 
                 string latestVer = ExtractJsonStr(json, "latest_version");
                 string updUrl = ExtractJsonStr(json, "update_url");
@@ -1829,6 +1988,11 @@ namespace PixelTunnel
                 RebuildServerBypassSet();
                 ManifestVersion = ver;
                 ManifestSource = sourceLabel;
+                if (ver > _persistedManifestVersion)
+                {
+                    _persistedManifestVersion = ver;
+                    PersistManifestVersion(ver);
+                }
 
                 if (saveToCache && !string.IsNullOrEmpty(_manifestCachePath))
                 {
@@ -1895,21 +2059,21 @@ namespace PixelTunnel
         {
             if (!_enableRemoteManifestFetch) return;
 
-            // Канал 1: GitHub Raw (прямое соединение мимо системного прокси)
+            // Канал 1a: Прямой Edge-манифест PixelStore (несёт актуальные per-node secrets)
+            string rawEdge = FetchUrlDirectBypassProxy("https://ai.pixelstore.space/nodes_v3.enc", null, 4500);
+            if (!string.IsNullOrEmpty(rawEdge) && TryApplySignedManifestEnvelope(rawEdge, "Edge-Signed", true) && HasAnyNodeWithSecret())
+            {
+                return;
+            }
+
+            // Канал 1b: GitHub Raw (прямое соединение мимо системного прокси)
             if (!string.IsNullOrEmpty(_manifestGithubUrl))
             {
                 string rawGh = FetchUrlDirectBypassProxy(_manifestGithubUrl, null, 4500);
-                if (!string.IsNullOrEmpty(rawGh) && TryApplySignedManifestEnvelope(rawGh, "GitHub-Signed", true))
+                if (!string.IsNullOrEmpty(rawGh) && TryApplySignedManifestEnvelope(rawGh, "GitHub-Signed", true) && HasAnyNodeWithSecret())
                 {
                     return;
                 }
-            }
-
-            // Канал 1b: Прямой Edge-манифест PixelStore (мгновенная доставка даже при блокировке raw.githubusercontent.com)
-            string rawEdge = FetchUrlDirectBypassProxy("https://ai.pixelstore.space/nodes_v3.enc", null, 4500);
-            if (!string.IsNullOrEmpty(rawEdge) && TryApplySignedManifestEnvelope(rawEdge, "Edge-Signed", true))
-            {
-                return;
             }
 
             // Канал 2: DNS-over-HTTPS (Cloudflare 1.1.1.1 & Google 8.8.8.8 TXT запись _v3.pixelstore.space)
@@ -1924,11 +2088,13 @@ namespace PixelTunnel
                 {
                     string dohJson = FetchUrlDirectBypassProxy(u, "application/dns-json", 4000);
                     if (string.IsNullOrEmpty(dohJson)) continue;
-                    Match mData = Regex.Match(dohJson, "\"data\"\\s*:\\s*\"([^\"]*PTM3\\.[^\"]*)\"");
-                    if (mData.Success)
+                    MatchCollection matches = Regex.Matches(dohJson, "\"data\"\\s*:\\s*\"((?:\\\\.|[^\"\\\\])*)\"");
+                    foreach (Match mData in matches)
                     {
-                        string cleaned = mData.Groups[1].Value.Replace("\\\"", "").Replace(" ", "");
-                        if (TryApplySignedManifestEnvelope(cleaned, "DoH-DNS-Signed", true))
+                        string rawVal = mData.Groups[1].Value;
+                        if (rawVal.IndexOf("PTM3.", StringComparison.Ordinal) < 0) continue;
+                        string cleaned = rawVal.Replace("\\\"", "").Replace(" ", "");
+                        if (TryApplySignedManifestEnvelope(cleaned, "DoH-DNS-Signed", true) && HasAnyNodeWithSecret())
                         {
                             return;
                         }
@@ -1994,19 +2160,35 @@ namespace PixelTunnel
                 tickCount++;
                 if (!string.IsNullOrEmpty(LastLicenseError)) continue;
 
-                // 1. Live Keep-Alive PING на Lane 0 (измеряет реальный RTT внутри открытого TLS-туннеля)
+                // 1. Live Keep-Alive PING на Lane 0 (и мягкий ресайкл перед порогом счётчика шифра)
                 Pwp3MuxClient l0 = _laneInteractive;
                 if (l0 != null && !l0.IsClosed)
                 {
-                    try { l0.SendPing(); }
-                    catch { l0.Shutdown(); }
+                    if (l0.IsCipherLimitNear)
+                    {
+                        if (l0.ActiveStreamCount == 0 && l0.ActiveUdpCount == 0 &&
+                            Interlocked.CompareExchange(ref _laneInteractive, null, l0) == l0)
+                        {
+                            l0.Dispose();
+                            await EnsureInteractiveLaneWarmAsync(token).ConfigureAwait(false);
+                        }
+                        else
+                        {
+                            await EnsureInteractiveLaneWarmAsync(token).ConfigureAwait(false);
+                        }
+                    }
+                    else
+                    {
+                        try { l0.SendPing(); }
+                        catch { l0.Shutdown(); }
+                    }
                 }
                 else
                 {
                     await EnsureInteractiveLaneWarmAsync(token).ConfigureAwait(false);
                 }
 
-                // 2. Lane 1 (Bulk/Media): закрываем при простое > 180 сек без активных потоков, иначе пингуем
+                // 2. Lane 1 (Bulk/Media): закрываем при простое > 180 сек или приближении лимита счётчика шифра
                 Pwp3MuxClient l1 = _laneBulk;
                 if (l1 != null)
                 {
@@ -2015,7 +2197,7 @@ namespace PixelTunnel
                         Interlocked.CompareExchange(ref _laneBulk, null, l1);
                     }
                     else if (l1.ActiveStreamCount == 0 && l1.ActiveUdpCount == 0 &&
-                             (DateTime.UtcNow - l1.LastActivityUtc).TotalSeconds > 180.0)
+                             (l1.IsCipherLimitNear || (DateTime.UtcNow - l1.LastActivityUtc).TotalSeconds > 180.0))
                     {
                         if (Interlocked.CompareExchange(ref _laneBulk, null, l1) == l1)
                         {
@@ -2080,15 +2262,26 @@ namespace PixelTunnel
         private static async Task<Pwp3MuxClient> GetOrConnectMuxLaneAsync(bool isBulkMediaLane, CancellationToken token)
         {
             Pwp3MuxClient existing = isBulkMediaLane ? _laneBulk : _laneInteractive;
-            if (existing != null && !existing.IsClosed) return existing;
+            if (existing != null && !existing.IsClosed && !existing.IsCipherLimitNear) return existing;
 
             SemaphoreSlim sem = isBulkMediaLane ? _lane1ConnectSem : _lane0ConnectSem;
             await sem.WaitAsync(token).ConfigureAwait(false);
             try
             {
                 existing = isBulkMediaLane ? _laneBulk : _laneInteractive;
-                if (existing != null && !existing.IsClosed) return existing;
+                if (existing != null && !existing.IsClosed && !existing.IsCipherLimitNear) return existing;
+                if (existing != null && existing.IsCipherLimitNear && existing.ActiveStreamCount == 0 && existing.ActiveUdpCount == 0)
+                {
+                    if (isBulkMediaLane) Interlocked.CompareExchange(ref _laneBulk, null, existing);
+                    else Interlocked.CompareExchange(ref _laneInteractive, null, existing);
+                    existing.Dispose();
+                }
                 if (!string.IsNullOrEmpty(LastLicenseError)) return null;
+
+                if (!HasAnyNodeWithSecret())
+                {
+                    await Task.Run(() => EnsureManifestSecretsLoaded(4500)).ConfigureAwait(false);
+                }
 
                 List<PixelServerNode> candidates = GetOrderedCandidateNodes(true);
                 foreach (var node in candidates)
@@ -2322,17 +2515,27 @@ namespace PixelTunnel
         // =========================================================================
         // ROUTING, DUAL-LANE CLASSIFICATION & LOCAL ACCEPT LOOP
         // =========================================================================
+        private static bool HostMatchesDomain(string host, string dom)
+        {
+            if (string.IsNullOrEmpty(host) || string.IsNullOrEmpty(dom)) return false;
+            string nh = host.Trim().Trim('[', ']').TrimEnd('.').ToLowerInvariant();
+            string nd = dom.Trim().TrimEnd('.').ToLowerInvariant();
+            if (nh.Length == 0 || nd.Length == 0) return false;
+            return nh.Equals(nd, StringComparison.Ordinal) || nh.EndsWith("." + nd, StringComparison.Ordinal);
+        }
+
         private static bool IsBulkMediaHost(string host)
         {
             if (string.IsNullOrEmpty(host)) return false;
-            string h = host.ToLowerInvariant();
-            if (h.EndsWith("googlevideo.com") || h.EndsWith("ytimg.com") || h.EndsWith("youtube.com") ||
-                h.EndsWith("youtu.be") || h.EndsWith("ggpht.com") || h.Equals("youtubei.googleapis.com") ||
-                h.EndsWith("nflxvideo.net") || h.EndsWith("netflix.com") ||
-                h.EndsWith("ttvnw.net") || h.EndsWith("jtvnw.net") || h.EndsWith("twitch.tv") ||
-                h.EndsWith("scdn.co") || h.EndsWith("spotifycdn.com") ||
-                h.EndsWith("cdn.discordapp.com") || h.EndsWith("media.discordapp.net") ||
-                h.EndsWith("fbcdn.net") || h.EndsWith("cdninstagram.com") || h.EndsWith("tiktokcdn.com"))
+            if (HostMatchesDomain(host, "googlevideo.com") || HostMatchesDomain(host, "ytimg.com") ||
+                HostMatchesDomain(host, "youtube.com") || HostMatchesDomain(host, "youtu.be") ||
+                HostMatchesDomain(host, "ggpht.com") || HostMatchesDomain(host, "youtubei.googleapis.com") ||
+                HostMatchesDomain(host, "nflxvideo.net") || HostMatchesDomain(host, "netflix.com") ||
+                HostMatchesDomain(host, "ttvnw.net") || HostMatchesDomain(host, "jtvnw.net") ||
+                HostMatchesDomain(host, "twitch.tv") || HostMatchesDomain(host, "scdn.co") ||
+                HostMatchesDomain(host, "spotifycdn.com") || HostMatchesDomain(host, "cdn.discordapp.com") ||
+                HostMatchesDomain(host, "media.discordapp.net") || HostMatchesDomain(host, "fbcdn.net") ||
+                HostMatchesDomain(host, "cdninstagram.com") || HostMatchesDomain(host, "tiktokcdn.com"))
             {
                 return true;
             }
@@ -2342,27 +2545,31 @@ namespace PixelTunnel
         private static bool MatchesDomainSet(string host, HashSet<string> set)
         {
             if (set == null || set.Count == 0) return false;
-            if (set.Contains(host)) return true;
-            int dot = host.IndexOf('.');
-            while (dot > 0 && dot + 1 < host.Length)
+            string nh = host.Trim().Trim('[', ']').TrimEnd('.').ToLowerInvariant();
+            if (set.Contains(nh)) return true;
+            int dot = nh.IndexOf('.');
+            while (dot > 0 && dot + 1 < nh.Length)
             {
-                string parent = host.Substring(dot + 1);
+                string parent = nh.Substring(dot + 1);
                 if (set.Contains(parent)) return true;
-                dot = host.IndexOf('.', dot + 1);
+                dot = nh.IndexOf('.', dot + 1);
             }
             return false;
         }
 
         private static bool IsPrivateOrServerLoopbackHost(string h)
         {
-            if (h == "localhost" || h == "::1" || h == "0.0.0.0") return true;
+            if (string.IsNullOrEmpty(h)) return true;
+            string clean = h.Trim().Trim('[', ']').TrimEnd('.').ToLowerInvariant();
+            if (clean == "localhost" || clean == "::1" || clean == "0.0.0.0") return true;
             HashSet<string> srvBypass = _serverHostBypass;
-            if (srvBypass != null && srvBypass.Contains(h)) return true;
-            if (h == "pixelstore.space" || h.EndsWith(".pixelstore.space")) return true;
+            if (srvBypass != null && srvBypass.Contains(clean)) return true;
+            if (HostMatchesDomain(clean, "pixelstore.space")) return true;
 
             IPAddress ip;
-            if (IPAddress.TryParse(h, out ip))
+            if (IPAddress.TryParse(clean, out ip))
             {
+                if (ip.IsIPv4MappedToIPv6) ip = ip.MapToIPv4();
                 if (IPAddress.IsLoopback(ip)) return true;
                 byte[] b = ip.GetAddressBytes();
                 if (ip.AddressFamily == AddressFamily.InterNetwork && b.Length == 4)
@@ -2375,6 +2582,7 @@ namespace PixelTunnel
                 }
                 else if (ip.AddressFamily == AddressFamily.InterNetworkV6 && b.Length == 16)
                 {
+                    if (ip.Equals(IPAddress.IPv6Any) || ip.Equals(IPAddress.IPv6Loopback)) return true;
                     if (ip.IsIPv6LinkLocal || ip.IsIPv6SiteLocal || ip.IsIPv6Multicast) return true;
                     if ((b[0] & 0xFE) == 0xFC) return true;
                 }
@@ -2384,24 +2592,39 @@ namespace PixelTunnel
 
         private static bool IsTelegramDcIp(IPAddress ip)
         {
-            if (ip == null || ip.AddressFamily != AddressFamily.InterNetwork) return false;
+            if (ip == null) return false;
+            if (ip.IsIPv4MappedToIPv6) ip = ip.MapToIPv4();
+
             byte[] b = ip.GetAddressBytes();
-            if (b.Length != 4) return false;
-            if (b[0] == 149 && b[1] == 154 && b[2] >= 160 && b[2] <= 175) return true; // 149.154.160.0/20
-            if (b[0] == 91 && b[1] == 108)
+            if (ip.AddressFamily == AddressFamily.InterNetwork && b.Length == 4)
             {
-                if ((b[2] >= 4 && b[2] <= 23) || (b[2] >= 56 && b[2] <= 59)) return true; // 91.108.4-23, 56-59
+                if (b[0] == 149 && b[1] == 154 && b[2] >= 160 && b[2] <= 175) return true; // 149.154.160.0/20
+                if (b[0] == 91 && b[1] == 108)
+                {
+                    if ((b[2] >= 4 && b[2] <= 23) || (b[2] >= 56 && b[2] <= 59)) return true; // 91.108.4-23, 56-59
+                }
+                if (b[0] == 91 && b[1] == 105 && (b[2] == 192 || b[2] == 193)) return true; // 91.105.192.0/23
+                if (b[0] == 185 && b[1] == 76 && b[2] == 151) return true; // 185.76.151.0/24
+                if (b[0] == 95 && b[1] == 161 && b[2] >= 64 && b[2] <= 79) return true; // 95.161.64.0/20
+                return false;
             }
-            if (b[0] == 91 && b[1] == 105 && (b[2] == 192 || b[2] == 193)) return true; // 91.105.192.0/23
-            if (b[0] == 185 && b[1] == 76 && b[2] == 151) return true; // 185.76.151.0/24
-            if (b[0] == 95 && b[1] == 161 && b[2] >= 64 && b[2] <= 79) return true; // 95.161.64.0/20
+            if (ip.AddressFamily == AddressFamily.InterNetworkV6 && b.Length == 16)
+            {
+                // 2001:b28:f23d::/48
+                if (b[0] == 0x20 && b[1] == 0x01 && b[2] == 0x0b && b[3] == 0x28 && b[4] == 0xf2 && b[5] == 0x3d) return true;
+                // 2001:67c:4e8::/48
+                if (b[0] == 0x20 && b[1] == 0x01 && b[2] == 0x06 && b[3] == 0x7c && b[4] == 0x04 && b[5] == 0xe8) return true;
+                // 2a0a:f280::/32
+                if (b[0] == 0x2a && b[1] == 0x0a && b[2] == 0xf2 && b[3] == 0x80) return true;
+                return false;
+            }
             return false;
         }
 
         private static bool ShouldBypassDirect(string host)
         {
             if (string.IsNullOrEmpty(host)) return false;
-            string h = host.Trim().Trim('[', ']').ToLowerInvariant();
+            string h = host.Trim().Trim('[', ']').TrimEnd('.').ToLowerInvariant();
 
             if (IsPrivateOrServerLoopbackHost(h)) return true;
             if (MatchesDomainSet(h, _proxyDomains)) return false;
@@ -2410,15 +2633,21 @@ namespace PixelTunnel
             if (IPAddress.TryParse(h, out parsedIp) && IsTelegramDcIp(parsedIp) && MatchesDomainSet("telegram.org", _proxyDomains))
                 return false;
 
-            if (h.EndsWith("googleapis.com") || h.EndsWith("antigravity.google") ||
-                h.EndsWith("antigravity-unleash.goog") || h.EndsWith("1e100.net") ||
-                h.EndsWith("gstatic.com") || h.EndsWith("google.com") || h.EndsWith("gvt1.com"))
+            if (HostMatchesDomain(h, "googleapis.com") || HostMatchesDomain(h, "antigravity.google") ||
+                HostMatchesDomain(h, "antigravity-unleash.goog") || HostMatchesDomain(h, "1e100.net") ||
+                HostMatchesDomain(h, "gstatic.com") || HostMatchesDomain(h, "google.com") || HostMatchesDomain(h, "gvt1.com"))
                 return false;
 
-            if (h.EndsWith(".ru") || h.EndsWith(".su") || h.EndsWith(".xn--p1ai") || h.EndsWith(".by") ||
-                h.EndsWith("yastatic.net") || h.EndsWith("yandex.net") || h.EndsWith("userapi.com") ||
-                h.EndsWith("vkuseraudio.net") || h.EndsWith("wbstatic.net") || h.EndsWith("ozonusercontent.com") ||
-                h.Contains(".ozon.") || h.EndsWith("steamcontent.com") || h.EndsWith("steampowered.com"))
+            if (h.EndsWith(".ru", StringComparison.Ordinal) || h.EndsWith(".su", StringComparison.Ordinal) ||
+                h.EndsWith(".xn--p1ai", StringComparison.Ordinal) || h.EndsWith(".by", StringComparison.Ordinal) ||
+                HostMatchesDomain(h, "yastatic.net") || HostMatchesDomain(h, "yandex.net") ||
+                HostMatchesDomain(h, "userapi.com") || HostMatchesDomain(h, "vkuseraudio.net") ||
+                HostMatchesDomain(h, "wbstatic.net") || HostMatchesDomain(h, "ozonusercontent.com") ||
+                HostMatchesDomain(h, "ozon.kz") || HostMatchesDomain(h, "ozon.tech") ||
+                HostMatchesDomain(h, "ozon.com") || HostMatchesDomain(h, "ozon.travel") ||
+                HostMatchesDomain(h, "ozon.team") || HostMatchesDomain(h, "ozonru.me") ||
+                HostMatchesDomain(h, "ozonrucn.me") || HostMatchesDomain(h, "ozoncom.me") ||
+                HostMatchesDomain(h, "steamcontent.com") || HostMatchesDomain(h, "steampowered.com"))
                 return true;
 
             if (MatchesDomainSet(h, _directDomains)) return true;
@@ -2448,6 +2677,79 @@ namespace PixelTunnel
             }
         }
 
+        private static async Task<bool> ReadExactAsync(Stream s, byte[] buf, int offset, int count)
+        {
+            int total = 0;
+            while (total < count)
+            {
+                int r = await s.ReadAsync(buf, offset + total, count - total).ConfigureAwait(false);
+                if (r <= 0) return false;
+                total += r;
+            }
+            return true;
+        }
+
+        private static int FindHeaderTerminator(byte[] buf, int len)
+        {
+            for (int i = 0; i <= len - 4; i++)
+            {
+                if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' && buf[i + 3] == '\n')
+                {
+                    return i;
+                }
+            }
+            return -1;
+        }
+
+        private static async Task<Tuple<string, byte[]>> ReadHttpRequestHeadersBufferedAsync(NetworkStream stream, byte firstByte, int maxHeaderBytes = 8192)
+        {
+            using (MemoryStream ms = new MemoryStream())
+            {
+                ms.WriteByte(firstByte);
+                byte[] chunk = new byte[1024];
+                while (ms.Length < maxHeaderBytes)
+                {
+                    byte[] cur = ms.GetBuffer();
+                    int len = (int)ms.Length;
+                    int foundIdx = FindHeaderTerminator(cur, len);
+                    if (foundIdx >= 0)
+                    {
+                        int hdrEnd = foundIdx + 4;
+                        string hdr = Encoding.ASCII.GetString(cur, 0, hdrEnd);
+                        byte[] extra = null;
+                        if (len > hdrEnd)
+                        {
+                            extra = new byte[len - hdrEnd];
+                            Buffer.BlockCopy(cur, hdrEnd, extra, 0, extra.Length);
+                        }
+                        return Tuple.Create(hdr, extra);
+                    }
+
+                    int maxRead = Math.Min(chunk.Length, maxHeaderBytes - len);
+                    int nr = await stream.ReadAsync(chunk, 0, maxRead).ConfigureAwait(false);
+                    if (nr <= 0) return null;
+                    ms.Write(chunk, 0, nr);
+                }
+
+                byte[] finalBuf = ms.GetBuffer();
+                int finalLen = (int)ms.Length;
+                int finalIdx = FindHeaderTerminator(finalBuf, finalLen);
+                if (finalIdx >= 0)
+                {
+                    int hdrEnd = finalIdx + 4;
+                    string hdr = Encoding.ASCII.GetString(finalBuf, 0, hdrEnd);
+                    byte[] extra = null;
+                    if (finalLen > hdrEnd)
+                    {
+                        extra = new byte[finalLen - hdrEnd];
+                        Buffer.BlockCopy(finalBuf, hdrEnd, extra, 0, extra.Length);
+                    }
+                    return Tuple.Create(hdr, extra);
+                }
+                return null;
+            }
+        }
+
         private static async Task HandleLocalClientAsync(TcpClient localClient)
         {
             Interlocked.Increment(ref _activeConns);
@@ -2472,14 +2774,30 @@ namespace PixelTunnel
 
                 if (isSocks5)
                 {
-                    int nMethods = localStream.ReadByte();
-                    if (nMethods < 0) return;
+                    byte[] nmBuf = new byte[1];
+                    if (!await ReadExactAsync(localStream, nmBuf, 0, 1).ConfigureAwait(false)) return;
+                    int nMethods = nmBuf[0];
+                    if (nMethods <= 0)
+                    {
+                        await localStream.WriteAsync(new byte[] { 0x05, 0xFF }, 0, 2).ConfigureAwait(false);
+                        return;
+                    }
                     byte[] methods = new byte[nMethods];
-                    ReadExactInternal(localStream, methods, 0, nMethods);
+                    if (!await ReadExactAsync(localStream, methods, 0, nMethods).ConfigureAwait(false)) return;
+                    bool hasNoAuth = false;
+                    for (int i = 0; i < nMethods; i++)
+                    {
+                        if (methods[i] == 0x00) { hasNoAuth = true; break; }
+                    }
+                    if (!hasNoAuth)
+                    {
+                        await localStream.WriteAsync(new byte[] { 0x05, 0xFF }, 0, 2).ConfigureAwait(false);
+                        return;
+                    }
                     await localStream.WriteAsync(new byte[] { 0x05, 0x00 }, 0, 2).ConfigureAwait(false);
 
                     byte[] reqHdr = new byte[4];
-                    ReadExactInternal(localStream, reqHdr, 0, 4);
+                    if (!await ReadExactAsync(localStream, reqHdr, 0, 4).ConfigureAwait(false)) return;
                     byte cmd = reqHdr[1];
                     byte atyp = reqHdr[3];
 
@@ -2508,23 +2826,11 @@ namespace PixelTunnel
                 }
                 else
                 {
-                    MemoryStream ms = new MemoryStream();
-                    ms.WriteByte((byte)firstByte);
-                    byte[] temp = new byte[1];
-                    int state = 0;
-                    while (ms.Length < 8192 && localStream.Read(temp, 0, 1) == 1)
-                    {
-                        ms.WriteByte(temp[0]);
-                        byte b = temp[0];
-                        if (state == 0 && b == '\r') state = 1;
-                        else if (state == 1 && b == '\n') state = 2;
-                        else if (state == 2 && b == '\r') state = 3;
-                        else if (state == 3 && b == '\n') { state = 4; break; }
-                        else if (b != '\r') state = 0;
-                    }
-                    if (state != 4) return;
+                    Tuple<string, byte[]> hdrRead = await ReadHttpRequestHeadersBufferedAsync(localStream, (byte)firstByte, 8192).ConfigureAwait(false);
+                    if (hdrRead == null) return;
+                    string headerStr = hdrRead.Item1;
+                    byte[] extraBody = hdrRead.Item2;
 
-                    string headerStr = Encoding.ASCII.GetString(ms.ToArray());
                     string firstLine = headerStr.Split(new[] { "\r\n" }, StringSplitOptions.None)[0];
                     string[] parts = firstLine.Split(' ');
                     if (parts.Length < 2) return;
@@ -2535,6 +2841,23 @@ namespace PixelTunnel
                     if (rawTarget.StartsWith("/__pixelcore/status", StringComparison.OrdinalIgnoreCase) ||
                         rawTarget.EndsWith("/__pixelcore/status", StringComparison.OrdinalIgnoreCase))
                     {
+                        string hostHdr = ExtractHeader(headerStr, "Host").Trim();
+                        int listenPort = _localPort;
+                        try
+                        {
+                            IPEndPoint lep = localClient.Client.LocalEndPoint as IPEndPoint;
+                            if (lep != null && lep.Port > 0) listenPort = lep.Port;
+                        }
+                        catch { }
+                        bool validLocalHost =
+                            string.Equals(hostHdr, "127.0.0.1", StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(hostHdr, "127.0.0.1:" + listenPort.ToString(CultureInfo.InvariantCulture), StringComparison.OrdinalIgnoreCase);
+                        if (!validLocalHost)
+                        {
+                            byte[] forbidden = Encoding.ASCII.GetBytes("HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+                            await localStream.WriteAsync(forbidden, 0, forbidden.Length).ConfigureAwait(false);
+                            return;
+                        }
                         ServeTelemetryApi(localStream);
                         return;
                     }
@@ -2543,6 +2866,10 @@ namespace PixelTunnel
                     {
                         isHttpConnect = true;
                         ParseConnectHostPort(rawTarget, out targetHost, out targetPort);
+                        if (extraBody != null && extraBody.Length > 0)
+                        {
+                            initialPayload = extraBody;
+                        }
                     }
                     else
                     {
@@ -2550,7 +2877,17 @@ namespace PixelTunnel
                         if (!Uri.TryCreate(rawTarget, UriKind.Absolute, out uri)) return;
                         targetHost = uri.Host.Trim('[', ']');
                         targetPort = uri.Port > 0 ? uri.Port : 80;
-                        initialPayload = RewritePlainHttpProxyRequest(headerStr, uri);
+                        byte[] reqHead = RewritePlainHttpProxyRequest(headerStr, uri);
+                        if (extraBody != null && extraBody.Length > 0)
+                        {
+                            initialPayload = new byte[reqHead.Length + extraBody.Length];
+                            Buffer.BlockCopy(reqHead, 0, initialPayload, 0, reqHead.Length);
+                            Buffer.BlockCopy(extraBody, 0, initialPayload, reqHead.Length, extraBody.Length);
+                        }
+                        else
+                        {
+                            initialPayload = reqHead;
+                        }
                     }
                 }
 
@@ -2806,13 +3143,19 @@ namespace PixelTunnel
                 return;
             }
 
-            Socket localUdp = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-            Socket directUdp = null;
+            IPEndPoint ctrlEp = null;
+            try { ctrlEp = controlTcp.Client.LocalEndPoint as IPEndPoint; } catch { }
+            bool isV6 = (ctrlEp != null && ctrlEp.AddressFamily == AddressFamily.InterNetworkV6);
+
+            Socket localUdp = new Socket(isV6 ? AddressFamily.InterNetworkV6 : AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            Socket directUdp4 = null;
+            Socket directUdp6 = null;
+            object directLock = new object();
             uint assocId = 0;
 
             try
             {
-                localUdp.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+                localUdp.Bind(new IPEndPoint(isV6 ? IPAddress.IPv6Loopback : IPAddress.Loopback, 0));
                 int boundPort = ((IPEndPoint)localUdp.LocalEndPoint).Port;
 
                 EndPoint learnedClientEp = null;
@@ -2840,13 +3183,28 @@ namespace PixelTunnel
                     }
                 });
 
-                byte[] reply = new byte[]
+                byte[] reply;
+                if (isV6)
                 {
-                    0x05, 0x00, 0x00, 0x01,
-                    127, 0, 0, 1,
-                    (byte)((boundPort >> 8) & 0xFF),
-                    (byte)(boundPort & 0xFF)
-                };
+                    reply = new byte[4 + 16 + 2];
+                    reply[0] = 0x05;
+                    reply[1] = 0x00;
+                    reply[2] = 0x00;
+                    reply[3] = 0x04;
+                    Buffer.BlockCopy(IPAddress.IPv6Loopback.GetAddressBytes(), 0, reply, 4, 16);
+                    reply[20] = (byte)((boundPort >> 8) & 0xFF);
+                    reply[21] = (byte)(boundPort & 0xFF);
+                }
+                else
+                {
+                    reply = new byte[]
+                    {
+                        0x05, 0x00, 0x00, 0x01,
+                        127, 0, 0, 1,
+                        (byte)((boundPort >> 8) & 0xFF),
+                        (byte)(boundPort & 0xFF)
+                    };
+                }
                 await controlStream.WriteAsync(reply, 0, reply.Length).ConfigureAwait(false);
                 await controlStream.FlushAsync().ConfigureAwait(false);
 
@@ -2854,7 +3212,7 @@ namespace PixelTunnel
                 Thread udpPump = new Thread(() =>
                 {
                     byte[] rxBuf = new byte[16384];
-                    EndPoint senderEp = new IPEndPoint(IPAddress.Any, 0);
+                    EndPoint senderEp = new IPEndPoint(isV6 ? IPAddress.IPv6Any : IPAddress.Any, 0);
                     while (!serviceToken.IsCancellationRequested)
                     {
                         int n;
@@ -2876,50 +3234,66 @@ namespace PixelTunnel
 
                         if (ShouldBypassDirect(dstHost))
                         {
-                            try
+                            byte[] rawOut = new byte[dataLen];
+                            Buffer.BlockCopy(rxBuf, dataOff, rawOut, 0, dataLen);
+                            string capHost = dstHost;
+                            int capPort = dstPort;
+
+                            var unused = Task.Run(async delegate
                             {
-                                if (directUdp == null)
+                                try
                                 {
-                                    directUdp = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-                                    directUdp.Bind(new IPEndPoint(IPAddress.Any, 0));
-                                    Socket capDirect = directUdp;
-                                    Thread dRx = new Thread(() =>
+                                    IPAddress[] addrs;
+                                    IPAddress parsedDirect;
+                                    if (IPAddress.TryParse(capHost, out parsedDirect))
                                     {
-                                        byte[] dBuf = new byte[16384];
-                                        EndPoint rEp = new IPEndPoint(IPAddress.Any, 0);
-                                        while (true)
+                                        addrs = new[] { parsedDirect };
+                                    }
+                                    else
+                                    {
+                                        addrs = await Dns.GetHostAddressesAsync(capHost).ConfigureAwait(false);
+                                    }
+
+                                    IPAddress chosen = null;
+                                    foreach (var a in addrs)
+                                    {
+                                        if (a.AddressFamily == AddressFamily.InterNetwork) { chosen = a; break; }
+                                    }
+                                    if (chosen == null && addrs.Length > 0) chosen = addrs[0];
+                                    if (chosen == null) return;
+
+                                    bool targetV6 = (chosen.AddressFamily == AddressFamily.InterNetworkV6);
+                                    Socket sendSock = null;
+                                    lock (directLock)
+                                    {
+                                        if (targetV6)
                                         {
-                                            try
+                                            if (directUdp6 == null)
                                             {
-                                                int dn = capDirect.ReceiveFrom(dBuf, 0, dBuf.Length, SocketFlags.None, ref rEp);
-                                                IPEndPoint rip = rEp as IPEndPoint;
-                                                EndPoint cEp;
-                                                lock (epLock) { cEp = learnedClientEp; }
-                                                if (dn > 0 && rip != null && cEp != null)
-                                                {
-                                                    byte[] sp = BuildSocks5UdpPacket(rip.Address.ToString(), rip.Port, dBuf, 0, dn);
-                                                    if (sp != null) localUdp.SendTo(sp, 0, sp.Length, SocketFlags.None, cEp);
-                                                }
+                                                directUdp6 = new Socket(AddressFamily.InterNetworkV6, SocketType.Dgram, ProtocolType.Udp);
+                                                directUdp6.Bind(new IPEndPoint(IPAddress.IPv6Any, 0));
+                                                StartDirectUdpRxLoop(directUdp6, IPAddress.IPv6Any, localUdp, epLock, () => learnedClientEp);
                                             }
-                                            catch { break; }
+                                            sendSock = directUdp6;
                                         }
-                                    });
-                                    dRx.IsBackground = true;
-                                    dRx.Start();
-                                }
-                                IPAddress[] addrs = Dns.GetHostAddresses(dstHost);
-                                foreach (var a in addrs)
-                                {
-                                    if (a.AddressFamily == AddressFamily.InterNetwork)
+                                        else
+                                        {
+                                            if (directUdp4 == null)
+                                            {
+                                                directUdp4 = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+                                                directUdp4.Bind(new IPEndPoint(IPAddress.Any, 0));
+                                                StartDirectUdpRxLoop(directUdp4, IPAddress.Any, localUdp, epLock, () => learnedClientEp);
+                                            }
+                                            sendSock = directUdp4;
+                                        }
+                                    }
+                                    if (sendSock != null)
                                     {
-                                        byte[] rawOut = new byte[dataLen];
-                                        Buffer.BlockCopy(rxBuf, dataOff, rawOut, 0, dataLen);
-                                        directUdp.SendTo(rawOut, new IPEndPoint(a, dstPort));
-                                        break;
+                                        sendSock.SendTo(rawOut, new IPEndPoint(chosen, capPort));
                                     }
                                 }
-                            }
-                            catch { }
+                                catch { }
+                            });
                         }
                         else
                         {
@@ -2962,8 +3336,39 @@ namespace PixelTunnel
                     mux.UnregisterUdpAssociation(assocId);
                 }
                 try { localUdp.Close(); } catch { }
-                try { if (directUdp != null) directUdp.Close(); } catch { }
+                lock (directLock)
+                {
+                    try { if (directUdp4 != null) directUdp4.Close(); } catch { }
+                    try { if (directUdp6 != null) directUdp6.Close(); } catch { }
+                }
             }
+        }
+
+        private static void StartDirectUdpRxLoop(Socket capDirect, IPAddress anyAddr, Socket localUdp, object epLock, Func<EndPoint> getClientEp)
+        {
+            Thread dRx = new Thread(() =>
+            {
+                byte[] dBuf = new byte[16384];
+                EndPoint rEp = new IPEndPoint(anyAddr, 0);
+                while (true)
+                {
+                    try
+                    {
+                        int dn = capDirect.ReceiveFrom(dBuf, 0, dBuf.Length, SocketFlags.None, ref rEp);
+                        IPEndPoint rip = rEp as IPEndPoint;
+                        EndPoint cEp;
+                        lock (epLock) { cEp = getClientEp(); }
+                        if (dn > 0 && rip != null && cEp != null)
+                        {
+                            byte[] sp = BuildSocks5UdpPacket(rip.Address.ToString(), rip.Port, dBuf, 0, dn);
+                            if (sp != null) localUdp.SendTo(sp, 0, sp.Length, SocketFlags.None, cEp);
+                        }
+                    }
+                    catch { break; }
+                }
+            });
+            dRx.IsBackground = true;
+            dRx.Start();
         }
 
         private static bool TryParseSocks5UdpHeader(byte[] buf, int pktLen, out string host, out int port, out int dataOffset)
@@ -3021,6 +3426,17 @@ namespace PixelTunnel
                 pkt[8] = (byte)((srcPort >> 8) & 0xFF);
                 pkt[9] = (byte)(srcPort & 0xFF);
                 Buffer.BlockCopy(data, dataOff, pkt, 10, dataLen);
+                return pkt;
+            }
+            else if (ip != null && ip.AddressFamily == AddressFamily.InterNetworkV6)
+            {
+                byte[] ipBytes = ip.GetAddressBytes();
+                byte[] pkt = new byte[4 + 16 + 2 + dataLen];
+                pkt[3] = 0x04;
+                Buffer.BlockCopy(ipBytes, 0, pkt, 4, 16);
+                pkt[20] = (byte)((srcPort >> 8) & 0xFF);
+                pkt[21] = (byte)(srcPort & 0xFF);
+                Buffer.BlockCopy(data, dataOff, pkt, 22, dataLen);
                 return pkt;
             }
             else
@@ -3161,6 +3577,10 @@ namespace PixelTunnel
                 PixelWarmTunnel tunnel = (attempt == 0) ? TryPopWarmTunnel() : null;
                 if (tunnel == null)
                 {
+                    if (!HasAnyNodeWithSecret())
+                    {
+                        await Task.Run(() => EnsureManifestSecretsLoaded(4500)).ConfigureAwait(false);
+                    }
                     var candidates = GetOrderedCandidateNodes(false);
                     foreach (var cand in candidates)
                     {
@@ -3263,7 +3683,17 @@ namespace PixelTunnel
                         Task finished = await Task.WhenAny(upTask, downTask).ConfigureAwait(false);
                         if (finished == upTask)
                         {
-                            await Task.WhenAny(downTask, Task.Delay(1800000)).ConfigureAwait(false);
+                            using (CancellationTokenSource delayCts = new CancellationTokenSource())
+                            {
+                                try
+                                {
+                                    await Task.WhenAny(downTask, Task.Delay(1800000, delayCts.Token)).ConfigureAwait(false);
+                                }
+                                finally
+                                {
+                                    delayCts.Cancel();
+                                }
+                            }
                         }
                         try { localClient.Client.Shutdown(SocketShutdown.Both); } catch { }
                         return;
@@ -3273,6 +3703,115 @@ namespace PixelTunnel
                 {
                 }
             }
+        }
+
+        private static bool ReadAsnLen(byte[] buf, ref int pos, int limit, out int len)
+        {
+            len = 0;
+            if (pos >= limit) return false;
+            byte first = buf[pos++];
+            if ((first & 0x80) == 0)
+            {
+                len = first;
+                return pos + len <= limit;
+            }
+            int numBytes = first & 0x7F;
+            if (numBytes == 0 || numBytes > 4 || pos + numBytes > limit) return false;
+            int val = 0;
+            for (int i = 0; i < numBytes; i++)
+            {
+                val = (val << 8) | buf[pos++];
+            }
+            len = val;
+            return len >= 0 && pos + len <= limit;
+        }
+
+        private static bool ReadAsnTlv(byte[] buf, ref int pos, int limit, out byte tag, out int contentOff, out int contentLen, out int totalEnd)
+        {
+            tag = 0;
+            contentOff = 0;
+            contentLen = 0;
+            totalEnd = 0;
+            if (pos >= limit) return false;
+            tag = buf[pos++];
+            if (!ReadAsnLen(buf, ref pos, limit, out contentLen)) return false;
+            contentOff = pos;
+            totalEnd = pos + contentLen;
+            if (totalEnd > limit) return false;
+            pos = totalEnd;
+            return true;
+        }
+
+        private static string GetCertSpkiSha256Hex(X509Certificate cert)
+        {
+            if (cert == null) return "";
+            try
+            {
+                byte[] raw = cert.GetRawCertData();
+                if (raw == null || raw.Length < 32) return "";
+                int pos = 0;
+                byte tag;
+                int certOff, certLen, certEnd;
+                if (!ReadAsnTlv(raw, ref pos, raw.Length, out tag, out certOff, out certLen, out certEnd) || tag != 0x30) return "";
+                pos = certOff;
+                int tbsOff, tbsLen, tbsEnd;
+                if (!ReadAsnTlv(raw, ref pos, certEnd, out tag, out tbsOff, out tbsLen, out tbsEnd) || tag != 0x30) return "";
+                pos = tbsOff;
+                int elOff, elLen, elEnd;
+                if (!ReadAsnTlv(raw, ref pos, tbsEnd, out tag, out elOff, out elLen, out elEnd)) return "";
+                if (tag == 0xA0)
+                {
+                    if (!ReadAsnTlv(raw, ref pos, tbsEnd, out tag, out elOff, out elLen, out elEnd)) return ""; // serialNumber
+                }
+                for (int skip = 0; skip < 4; skip++) // signature, issuer, validity, subject
+                {
+                    if (!ReadAsnTlv(raw, ref pos, tbsEnd, out tag, out elOff, out elLen, out elEnd)) return "";
+                }
+                int spkiStart = pos;
+                if (!ReadAsnTlv(raw, ref pos, tbsEnd, out tag, out elOff, out elLen, out elEnd) || tag != 0x30) return "";
+                int spkiLen = elEnd - spkiStart;
+                using (var sha = SHA256.Create())
+                {
+                    byte[] h = sha.ComputeHash(raw, spkiStart, spkiLen);
+                    return BitConverter.ToString(h).Replace("-", "").ToLowerInvariant();
+                }
+            }
+            catch
+            {
+                return "";
+            }
+        }
+
+        private static string NormalizeSpkiPinToHex(string rawPin)
+        {
+            if (string.IsNullOrEmpty(rawPin)) return "";
+            string clean = rawPin.Trim();
+            if (clean.StartsWith("sha256/", StringComparison.OrdinalIgnoreCase))
+            {
+                clean = clean.Substring(7).Trim();
+            }
+            if (clean.Length == 64 && Regex.IsMatch(clean, "^[0-9a-fA-F]{64}$"))
+            {
+                return clean.ToLowerInvariant();
+            }
+            try
+            {
+                byte[] bytes = Convert.FromBase64String(clean);
+                if (bytes.Length == 32)
+                {
+                    return BitConverter.ToString(bytes).Replace("-", "").ToLowerInvariant();
+                }
+            }
+            catch { }
+            return "";
+        }
+
+        private static bool IsPinnedServerSpki(X509Certificate cert)
+        {
+            string actual = GetCertSpkiSha256Hex(cert);
+            if (string.IsNullOrEmpty(actual)) return false;
+            HashSet<string> pins = _pinnedSpkiHashes;
+            return pins != null && pins.Contains(actual);
         }
 
         private static void ParseEdgeTelemetryHeader(string raw)
@@ -3327,8 +3866,17 @@ namespace PixelTunnel
 
             if (node.UseTls)
             {
+                IPAddress tmpHostIp;
+                bool isRawIpHost = !string.IsNullOrEmpty(node.Host) && IPAddress.TryParse(node.Host.Trim('[', ']'), out tmpHostIp);
+                bool isMaskedRawIp = isRawIpHost && !HostMatchesDomain(sniHost, "pixelstore.space");
+
                 SslStream ssl = new SslStream(fragStream, false, (sender, cert, chain, errors) =>
                 {
+                    if (isMaskedRawIp)
+                    {
+                        if (_allowSelfSignedFallback) return true;
+                        return IsPinnedServerSpki(cert);
+                    }
                     if (errors == SslPolicyErrors.None) return true;
                     return _allowSelfSignedFallback;
                 });
@@ -3350,6 +3898,11 @@ namespace PixelTunnel
                 transportStream = ssl;
             }
 
+            if (string.IsNullOrEmpty(node.Secret))
+            {
+                throw new InvalidOperationException("Missing manifest secret for " + node.Name);
+            }
+
             long prevOffset = Interlocked.Read(ref _clockOffsetSeconds);
             long ts = (long)(DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds + prevOffset;
             string tsStr = ts.ToString();
@@ -3364,7 +3917,7 @@ namespace PixelTunnel
             string wsKey = Convert.ToBase64String(wsKeyRaw);
             string junkToken = Convert.ToBase64String(junkBytes).TrimEnd('=').Replace('+', '-').Replace('/', '_');
 
-            string cUuid = string.IsNullOrEmpty(_clientUuid) ? "e434aed7-0a9f-449f-81b9-870086cf2d09" : _clientUuid;
+            string cUuid = string.IsNullOrEmpty(_clientUuid) ? "" : _clientUuid;
             string cHwid = string.IsNullOrEmpty(_machineHwid) ? ComputeHardwareId() : _machineHwid;
 
             string sigHex32;
@@ -3507,10 +4060,46 @@ namespace PixelTunnel
                 if (finished == upTask)
                 {
                     try { remote.Client.Shutdown(SocketShutdown.Send); } catch { }
-                    await Task.WhenAny(downTask, Task.Delay(1800000)).ConfigureAwait(false);
+                    using (CancellationTokenSource delayCts = new CancellationTokenSource())
+                    {
+                        try
+                        {
+                            await Task.WhenAny(downTask, Task.Delay(1800000, delayCts.Token)).ConfigureAwait(false);
+                        }
+                        finally
+                        {
+                            delayCts.Cancel();
+                        }
+                    }
                 }
                 try { localClient.Client.Shutdown(SocketShutdown.Both); } catch { }
             }
+        }
+
+        private static string EscapeJson(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            StringBuilder sb = new StringBuilder(s.Length + 8);
+            foreach (char c in s)
+            {
+                switch (c)
+                {
+                    case '\\': sb.Append("\\\\"); break;
+                    case '"': sb.Append("\\\""); break;
+                    case '\r': sb.Append("\\r"); break;
+                    case '\n': sb.Append("\\n"); break;
+                    case '\t': sb.Append("\\t"); break;
+                    case '\b': sb.Append("\\b"); break;
+                    case '\f': sb.Append("\\f"); break;
+                    default:
+                        if (c < 0x20)
+                            sb.AppendFormat(CultureInfo.InvariantCulture, "\\u{0:x4}", (int)c);
+                        else
+                            sb.Append(c);
+                        break;
+                }
+            }
+            return sb.ToString();
         }
 
         private static void ServeTelemetryApi(NetworkStream localStream)
@@ -3523,8 +4112,9 @@ namespace PixelTunnel
                     var n = _nodes[i];
                     if (i > 0) nodesJson.Append(",");
                     nodesJson.AppendFormat(
+                        CultureInfo.InvariantCulture,
                         "{{\"name\":\"{0}\",\"region\":\"{1}\",\"host\":\"{2}\",\"port\":{3},\"mux\":{4},\"online\":{5},\"latency_ms\":{6}}}",
-                        n.Name, n.Region, n.Host, n.Port,
+                        EscapeJson(n.Name), EscapeJson(n.Region), EscapeJson(n.Host), n.Port,
                         n.SupportsMuxV3 ? "true" : "false",
                         n.IsOnline ? "true" : "false",
                         n.LatencyMs);
@@ -3536,30 +4126,31 @@ namespace PixelTunnel
             long uptimeSec = (long)(DateTime.UtcNow - _startTime).TotalSeconds;
             string body = string.Format(
                 CultureInfo.InvariantCulture,
-                "{{\"engine\":\"PixelCore v3.0\",\"protocol\":\"{0}\",\"region\":\"{1}\",\"manifest_ver\":{2},\"manifest_src\":\"{3}\",\"mux_streams\":{4},\"udp_assocs\":{5},\"dpi_clienthello_split\":{6},\"dpi_profile\":\"{7}\",\"anti_freeze_ok\":{8},\"dpi_escalations\":{9},\"clock_offset_sec\":{22},\"license_tier\":\"{10}\",\"days_left\":{11},\"devices_used\":{12},\"devices_max\":{13},\"speed_mbps\":{14:0.00},\"latest_version\":\"{15}\",\"license_error\":\"{16}\",\"uptime_sec\":{17},\"active_connections\":{18},\"bytes_up\":{19},\"bytes_down\":{20},\"nodes\":{21}}}",
-                ActiveProtocol ?? "PWP-3 Mux",
-                _preferredRegion,
+                "{{\"engine\":\"PixelCore v3.0 (v{23})\",\"engine_version\":\"{23}\",\"protocol\":\"{0}\",\"region\":\"{1}\",\"manifest_ver\":{2},\"manifest_src\":\"{3}\",\"mux_streams\":{4},\"udp_assocs\":{5},\"dpi_clienthello_split\":{6},\"dpi_profile\":\"{7}\",\"anti_freeze_ok\":{8},\"dpi_escalations\":{9},\"clock_offset_sec\":{22},\"license_tier\":\"{10}\",\"days_left\":{11},\"devices_used\":{12},\"devices_max\":{13},\"speed_mbps\":{14:0.00},\"latest_version\":\"{15}\",\"license_error\":\"{16}\",\"uptime_sec\":{17},\"active_connections\":{18},\"bytes_up\":{19},\"bytes_down\":{20},\"nodes\":{21}}}",
+                EscapeJson(ActiveProtocol ?? "PWP-3 Mux"),
+                EscapeJson(_preferredRegion),
                 ManifestVersion,
-                ManifestSource ?? "Embedded",
+                EscapeJson(ManifestSource ?? "Embedded"),
                 ActiveMuxStreams,
                 ActiveUdpAssociations,
                 _enableDpiFragment ? "true" : "false",
-                AntiDpiProfileName,
+                EscapeJson(AntiDpiProfileName),
                 LastAntiFreezeProbePassed ? "true" : "false",
                 AntiFreezeEscalations,
-                ServerLicenseTier ?? "",
+                EscapeJson(ServerLicenseTier ?? ""),
                 ServerDaysLeft,
                 ServerDevicesUsed,
                 ServerDevicesMax,
                 LiveTotalMbps,
-                ManifestLatestVersion ?? "",
-                LastLicenseError ?? "",
+                EscapeJson(ManifestLatestVersion ?? ""),
+                EscapeJson(LastLicenseError ?? ""),
                 uptimeSec,
                 Interlocked.Read(ref _activeConns),
                 Interlocked.Read(ref _totalBytesUp),
                 Interlocked.Read(ref _totalBytesDown),
                 nodesJson.ToString(),
-                Interlocked.Read(ref _clockOffsetSeconds));
+                Interlocked.Read(ref _clockOffsetSeconds),
+                ENGINE_VERSION);
 
             byte[] bodyBytes = Encoding.UTF8.GetBytes(body);
             string respHdr =
@@ -3925,6 +4516,8 @@ namespace PixelTunnel
         /// </summary>
         public static async Task<List<NodeBenchmarkResult>> RunParallelNodeBenchmarkAsync(int timeoutMs = 3400)
         {
+            if (!HasAnyNodeWithSecret())
+                await Task.Run(() => EnsureManifestSecretsLoaded(4500)).ConfigureAwait(false);
             List<PixelServerNode> snapshot = new List<PixelServerNode>();
             lock (_nodesLock)
             {
