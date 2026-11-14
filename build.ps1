@@ -1,8 +1,17 @@
+param(
+    [switch]$AllPlatforms,
+    [switch]$SkipGoBuild
+)
+
 $ErrorActionPreference = "Stop"
 
 $root = $PSScriptRoot
 $src = Join-Path $root "src"
+$goEngineDir = Join-Path $src "go-engine"
+$distDir = Join-Path $root "dist"
 $outExe = Join-Path $root "PixelTunnel.exe"
+$metaPath = Join-Path $src "EmbeddedEngineMeta.g.cs"
+$winGoBin = Join-Path $distDir "pixelcore-utls-windows-amd64.exe"
 
 $csc = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
 $wpf = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\WPF"
@@ -11,33 +20,200 @@ if (-not (Test-Path $csc)) {
     throw "csc.exe not found at $csc (.NET Framework 4.x required)"
 }
 
-$refs = @(
-    "System.dll",
-    "System.Core.dll",
-    "System.Data.dll",
-    "System.Drawing.dll",
-    "System.Windows.Forms.dll",
-    "System.Xaml.dll",
-    "System.Net.Http.dll",
-    "System.IO.Compression.dll",
-    "System.IO.Compression.FileSystem.dll",
-    "$wpf\WindowsBase.dll",
-    "$wpf\PresentationCore.dll",
-    "$wpf\PresentationFramework.dll"
-) -join ","
+function Invoke-GoBuildTarget {
+    param(
+        [string]$SourceDir,
+        [string]$TargetOS,
+        [string]$TargetArch,
+        [string]$OutputPath,
+        [string]$LdFlags
+    )
 
-Write-Host "Building PixelTunnel.exe v1.9.0 from open source..."
-& $csc /nologo /target:winexe /optimize+ /platform:x64 `
-    "/win32icon:$src\pixel.ico" `
-    "/win32manifest:$src\app.manifest" `
-    "/resource:$src\pixel.ico,PixelTunnel.pixel.ico" `
-    "/out:$outExe" `
-    "/reference:$refs" `
-    "$src\PixelTunnelNext.cs" `
-    "$src\PixelCoreEngineV3.cs"
-
-if ($LASTEXITCODE -ne 0) {
-    throw "Build failed with exit code $LASTEXITCODE"
+    Write-Host "  -> Building Go engine ($TargetOS/$TargetArch) -> $OutputPath"
+    $origCgo = $env:CGO_ENABLED
+    $origOs = $env:GOOS
+    $origArch = $env:GOARCH
+    Push-Location $SourceDir
+    try {
+        $env:CGO_ENABLED = "0"
+        $env:GOOS = $TargetOS
+        $env:GOARCH = $TargetArch
+        & go build -buildvcs=false -trimpath "-ldflags=$LdFlags" -o $OutputPath .
+        if ($LASTEXITCODE -ne 0) {
+            throw "go build failed for $TargetOS/$TargetArch with exit code $LASTEXITCODE"
+        }
+    }
+    finally {
+        Pop-Location
+        $env:CGO_ENABLED = $origCgo
+        $env:GOOS = $origOs
+        $env:GOARCH = $origArch
+    }
 }
 
-Write-Host "OK: $outExe ($((Get-Item $outExe).Length) bytes)"
+function Write-GzipFile {
+    param(
+        [string]$InputPath,
+        [string]$OutputPath
+    )
+
+    $inStream = [System.IO.File]::OpenRead($InputPath)
+    try {
+        $outStream = [System.IO.File]::Create($OutputPath)
+        try {
+            $gzip = New-Object System.IO.Compression.GZipStream($outStream, [System.IO.Compression.CompressionLevel]::Optimal)
+            try {
+                $inStream.CopyTo($gzip)
+            }
+            finally {
+                $gzip.Dispose()
+            }
+        }
+        finally {
+            $outStream.Dispose()
+        }
+    }
+    finally {
+        $inStream.Dispose()
+    }
+}
+
+if (-not $SkipGoBuild) {
+    $goCmd = Get-Command go -ErrorAction SilentlyContinue
+    if (-not $goCmd) {
+        throw "Go compiler ('go') was not found in PATH. Install Go 1.26+ (https://go.dev/dl/ or 'winget install GoLang.Go') and reopen your terminal, or pass -SkipGoBuild to build using a prebuilt dist\ binary / C# fallback."
+    }
+    $goModPath = Join-Path $goEngineDir "go.mod"
+    if (-not (Test-Path $goModPath)) {
+        throw "Go engine source not found at $goEngineDir (missing go.mod). Ensure src\go-engine is present or pass -SkipGoBuild for C#-only fallback."
+    }
+
+    if (-not (Test-Path $distDir)) {
+        New-Item -ItemType Directory -Path $distDir -Force | Out-Null
+    }
+
+    Write-Host "Building PixelCore Go uTLS engine (CGO_ENABLED=0)..."
+    Invoke-GoBuildTarget -SourceDir $goEngineDir -TargetOS "windows" -TargetArch "amd64" -OutputPath $winGoBin -LdFlags "-s -w -H=windowsgui"
+
+    if ($AllPlatforms) {
+        $targets = @(
+            @{ OS = "darwin";  Arch = "arm64"; Out = (Join-Path $distDir "pixeltunnel-macos-arm64"); Flags = "-s -w" },
+            @{ OS = "darwin";  Arch = "amd64"; Out = (Join-Path $distDir "pixeltunnel-macos-amd64"); Flags = "-s -w" },
+            @{ OS = "linux";   Arch = "amd64"; Out = (Join-Path $distDir "pixeltunnel-linux-amd64"); Flags = "-s -w" },
+            @{ OS = "linux";   Arch = "arm64"; Out = (Join-Path $distDir "pixeltunnel-linux-arm64"); Flags = "-s -w" }
+        )
+        foreach ($t in $targets) {
+            Invoke-GoBuildTarget -SourceDir $goEngineDir -TargetOS $t.OS -TargetArch $t.Arch -OutputPath $t.Out -LdFlags $t.Flags
+        }
+    }
+}
+
+$expectedSha = ""
+$tempGzPath = ""
+
+try {
+    if (Test-Path $winGoBin) {
+        $expectedSha = (Get-FileHash -Path $winGoBin -Algorithm SHA256).Hash.ToLowerInvariant()
+        $tempGzPath = Join-Path ([System.IO.Path]::GetTempPath()) ("pixelcore-utls-" + [Guid]::NewGuid().ToString("N") + ".gz")
+        Write-GzipFile -InputPath $winGoBin -OutputPath $tempGzPath
+        Write-Host "Embedded Go engine ready (SHA256=$expectedSha, GZip=$((Get-Item $tempGzPath).Length) bytes)"
+    }
+    else {
+        Write-Warning "Go engine binary not found at $winGoBin; compiling PixelTunnel.exe with C#-only fallback (ExpectedSha256=`"`")."
+    }
+
+    $metaContent = @"
+// <auto-generated by build.ps1 />
+namespace PixelTunnel
+{
+    internal static class EmbeddedEngineMeta
+    {
+        public const string ExpectedSha256 = "$expectedSha";
+        public const string EngineVersion = "2.0.0";
+        public const string ResourceName = "PixelTunnel.pixelcore_utls.gz";
+    }
+}
+"@
+    [System.IO.File]::WriteAllText($metaPath, $metaContent, (New-Object System.Text.UTF8Encoding($false)))
+
+    $refs = @(
+        "System.dll",
+        "System.Core.dll",
+        "System.Data.dll",
+        "System.Drawing.dll",
+        "System.Windows.Forms.dll",
+        "System.Xaml.dll",
+        "System.Net.Http.dll",
+        "System.IO.Compression.dll",
+        "System.IO.Compression.FileSystem.dll",
+        "$wpf\WindowsBase.dll",
+        "$wpf\PresentationCore.dll",
+        "$wpf\PresentationFramework.dll"
+    ) -join ","
+
+    $cscArgs = @(
+        "/nologo",
+        "/target:winexe",
+        "/optimize+",
+        "/platform:x64",
+        "/win32icon:$src\pixel.ico",
+        "/win32manifest:$src\app.manifest",
+        "/resource:$src\pixel.ico,PixelTunnel.pixel.ico"
+    )
+    if ($tempGzPath -and (Test-Path $tempGzPath)) {
+        $cscArgs += "/resource:$tempGzPath,PixelTunnel.pixelcore_utls.gz"
+    }
+    $cscArgs += @(
+        "/out:$outExe",
+        "/reference:$refs",
+        "$src\PixelTunnelNext.cs",
+        "$src\PixelCoreEngineV3.cs",
+        $metaPath
+    )
+
+    Write-Host "Building PixelTunnel.exe v2.0.0 from open source..."
+    & $csc @cscArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "Build failed with exit code $LASTEXITCODE"
+    }
+
+    Write-Host "OK: $outExe ($((Get-Item $outExe).Length) bytes)"
+
+    if ($AllPlatforms) {
+        if (-not (Test-Path $distDir)) {
+            New-Item -ItemType Directory -Path $distDir -Force | Out-Null
+        }
+        Copy-Item -Path $outExe -Destination (Join-Path $distDir "PixelTunnel.exe") -Force
+        $installSh = Join-Path $root "install.sh"
+        if (Test-Path $installSh) {
+            Copy-Item -Path $installSh -Destination (Join-Path $distDir "install.sh") -Force
+        }
+
+        $assetOrder = @(
+            "PixelTunnel.exe",
+            "pixeltunnel-macos-arm64",
+            "pixeltunnel-macos-amd64",
+            "pixeltunnel-linux-amd64",
+            "pixeltunnel-linux-arm64",
+            "pixelcore-utls-windows-amd64.exe",
+            "install.sh"
+        )
+        $sumLines = New-Object System.Collections.Generic.List[string]
+        foreach ($asset in $assetOrder) {
+            $assetPath = Join-Path $distDir $asset
+            if (Test-Path $assetPath) {
+                $h = (Get-FileHash -Path $assetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+                $sumLines.Add("$h  $asset")
+            }
+        }
+        $sumsPath = Join-Path $distDir "SHA256SUMS.txt"
+        $sumsText = ($sumLines -join "`n") + "`n"
+        [System.IO.File]::WriteAllText($sumsPath, $sumsText, (New-Object System.Text.UTF8Encoding($false)))
+        Write-Host "OK: $sumsPath ($($sumLines.Count) entries)"
+    }
+}
+finally {
+    if ($tempGzPath -and (Test-Path $tempGzPath)) {
+        Remove-Item -Path $tempGzPath -Force -ErrorAction SilentlyContinue
+    }
+}

@@ -1,0 +1,10 @@
+PixelTunnel.exe
+dist/
+*.gz
+logs/
+engine/
+saved_key.txt
+*.old_update
+*.new_verified
+__pycache__/
+*.pyc
