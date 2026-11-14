@@ -3,8 +3,10 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
+using System.IO.Pipes;
 using System.Net;
 using System.Net.NetworkInformation;
+using System.Net.Security;
 using System.Net.Sockets;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -26,15 +28,15 @@ using Microsoft.Win32;
 using ShapePath = System.Windows.Shapes.Path;
 
 [assembly: AssemblyTitle("PixelTunnel")]
-[assembly: AssemblyDescription("PWP-3 Dual-Lane Mux & Regional Routing Assistant for Antigravity IDE")]
+[assembly: AssemblyDescription("Native Go uTLS + PWP-3 Mux & Smart PAC Assistant for Antigravity IDE")]
 [assembly: AssemblyCompany("PixelTunnel Community")]
 [assembly: AssemblyProduct("PixelTunnel")]
 [assembly: AssemblyCopyright("Copyright © 2026 PixelTunnel")]
 [assembly: AssemblyTrademark("")]
 [assembly: AssemblyCulture("")]
 [assembly: ComVisible(false)]
-[assembly: AssemblyVersion("1.9.0.0")]
-[assembly: AssemblyFileVersion("1.9.0.0")]
+[assembly: AssemblyVersion("2.0.0.0")]
+[assembly: AssemblyFileVersion("2.0.0.0")]
 [assembly: System.Runtime.Versioning.TargetFramework(".NETFramework,Version=v4.8", FrameworkDisplayName = ".NET Framework 4.8")]
 
 namespace PixelTunnel
@@ -74,8 +76,70 @@ namespace PixelTunnel
             {
                 ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
             }
+
+            // 1. SAFE --genconfig: MUST execute BEFORE Mutex, process killing, or Registry writes!
+            bool isGenConfig = false;
+            bool autoConnect = false;
+            bool autoDiag = false;
+            string deepLinkUri = null;
+            if (args != null)
+            {
+                foreach (var a in args)
+                {
+                    if (string.Equals(a, "--genconfig", StringComparison.OrdinalIgnoreCase))
+                        isGenConfig = true;
+                    else if (string.Equals(a, "--autoconnect", StringComparison.OrdinalIgnoreCase) ||
+                             string.Equals(a, "--connect", StringComparison.OrdinalIgnoreCase))
+                        autoConnect = true;
+                    else if (string.Equals(a, "--autodiag", StringComparison.OrdinalIgnoreCase))
+                        autoDiag = true;
+                    else if (!string.IsNullOrWhiteSpace(a) && a.Trim().StartsWith("pixeltunnel://", StringComparison.OrdinalIgnoreCase))
+                        deepLinkUri = a.Trim();
+                }
+            }
+
+            if (isGenConfig)
+            {
+                string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+                string keyPath = System.IO.Path.Combine(baseDir, "saved_key.txt");
+                string outDir = System.IO.Path.Combine(baseDir, "engine");
+                if (!Directory.Exists(outDir)) Directory.CreateDirectory(outDir);
+                string outPath = System.IO.Path.Combine(outDir, "active_config.json");
+                string[] lines = File.Exists(keyPath) ? File.ReadAllLines(keyPath, Encoding.UTF8) : new string[0];
+                string raw = (lines.Length > 0 && !string.IsNullOrWhiteSpace(lines[0]))
+                    ? lines[0].Trim()
+                    : PixelTunnel.MainWindow.GetFreeModeSentinelUri();
+                if (lines.Length > 1) PixelTunnel.MainWindow.ApplySavedFlagsForConfigGen(lines[1]);
+                var n = PixelTunnel.MainWindow.ParseVlessUri(raw) ??
+                        PixelTunnel.MainWindow.ParseVlessUri(PixelTunnel.MainWindow.GetFreeModeSentinelUri());
+                string cfg = PixelTunnel.MainWindow.BuildSingBoxConfig(n, true, true, true, true, true);
+                File.WriteAllText(outPath, cfg, new UTF8Encoding(false));
+                return;
+            }
+
+            // 2. Single-instance Mutex & pixeltunnel:// Deep-Link IPC forwarding WITHOUT killing running app!
             bool createdNew;
             _mutex = new Mutex(true, "Local\\PixelTunnel_Antigravity_v1", out createdNew);
+
+            if (!createdNew && !string.IsNullOrEmpty(deepLinkUri))
+            {
+                try
+                {
+                    using (var client = new NamedPipeClientStream(".", PixelTunnel.MainWindow.IPC_PIPE_NAME, PipeDirection.Out))
+                    {
+                        client.Connect(2000);
+                        byte[] payload = Encoding.UTF8.GetBytes(deepLinkUri + "\n");
+                        client.Write(payload, 0, payload.Length);
+                        client.Flush();
+                    }
+                }
+                catch { }
+                return;
+            }
+
+            // Register HKCU\Software\Classes\pixeltunnel URL protocol (normal launch only, never in --genconfig)
+            PixelTunnel.MainWindow.RegisterPixelTunnelUrlProtocol();
+
             int myPid = Process.GetCurrentProcess().Id;
             bool failedToKillElevated = false;
             bool hadRunningTunnelCore = false;
@@ -137,44 +201,12 @@ namespace PixelTunnel
             }
 
             PixelTunnel.MainWindow.CleanupOldUpdateArtifacts();
-
-            bool autoConnect = hadRunningTunnelCore;
-            bool autoDiag = false;
-            if (args != null)
-            {
-                foreach (var a in args)
-                {
-                    if (string.Equals(a, "--autoconnect", StringComparison.OrdinalIgnoreCase) ||
-                        string.Equals(a, "--connect", StringComparison.OrdinalIgnoreCase))
-                        autoConnect = true;
-                    if (string.Equals(a, "--autodiag", StringComparison.OrdinalIgnoreCase))
-                        autoDiag = true;
-                    if (string.Equals(a, "--genconfig", StringComparison.OrdinalIgnoreCase))
-                    {
-                        string baseDir = AppDomain.CurrentDomain.BaseDirectory;
-                        string keyPath = System.IO.Path.Combine(baseDir, "saved_key.txt");
-                        string outDir = System.IO.Path.Combine(baseDir, "engine");
-                        if (!Directory.Exists(outDir)) Directory.CreateDirectory(outDir);
-                        string outPath = System.IO.Path.Combine(outDir, "active_config.json");
-                        string raw = File.Exists(keyPath)
-                            ? File.ReadAllLines(keyPath)[0].Trim()
-                            : PixelTunnel.MainWindow.GetFreeModeSentinelUri();
-                        var n = PixelTunnel.MainWindow.ParseVlessUri(raw);
-                        if (n == null)
-                        {
-                            n = PixelTunnel.MainWindow.ParseVlessUri(PixelTunnel.MainWindow.GetFreeModeSentinelUri());
-                        }
-                        string cfg = PixelTunnel.MainWindow.BuildSingBoxConfig(n, true, true, true, true, true);
-                        File.WriteAllText(outPath, cfg, new UTF8Encoding(false));
-                        return;
-                    }
-                }
-            }
+            if (hadRunningTunnelCore) autoConnect = true;
 
             try
             {
                 var app = new App();
-                var win = new MainWindow(autoConnect, autoDiag);
+                var win = new MainWindow(autoConnect, autoDiag, deepLinkUri);
                 app.Run(win);
             }
             catch (Exception ex)
@@ -264,19 +296,35 @@ namespace PixelTunnel
             }
         }
 
-        private static void ApplyWinInetPerConnectionProxy(bool enable, string proxyServer, string proxyBypass)
+        private static void FreeHGlobalPtrSafe(IntPtr p) { if (p != IntPtr.Zero) Marshal.FreeHGlobal(p); }
+
+        private static void ApplyWinInetPerConnectionProxy(bool enable, string proxyServer, string proxyBypass, string autoConfigUrl = "")
         {
             IntPtr srvPtr = IntPtr.Zero;
             IntPtr bypPtr = IntPtr.Zero;
+            IntPtr pacPtr = IntPtr.Zero;
             IntPtr emptyPtr = IntPtr.Zero;
             try
             {
                 srvPtr = Marshal.StringToHGlobalAuto(proxyServer ?? "");
                 bypPtr = Marshal.StringToHGlobalAuto(proxyBypass ?? "");
+                pacPtr = Marshal.StringToHGlobalAuto(autoConfigUrl ?? "");
                 emptyPtr = Marshal.StringToHGlobalAuto("");
 
                 INTERNET_PER_CONN_OPTION[] options;
-                if (enable)
+                if (enable && !string.IsNullOrEmpty(autoConfigUrl))
+                {
+                    options = new INTERNET_PER_CONN_OPTION[4];
+                    options[0].dwOption = 1; // INTERNET_PER_CONN_FLAGS
+                    options[0].Value.dwValue = 5; // PROXY_TYPE_DIRECT (1) | PROXY_TYPE_AUTO_PROXY_URL (4)
+                    options[1].dwOption = 4; // INTERNET_PER_CONN_AUTOCONFIG_URL
+                    options[1].Value.pszValue = pacPtr;
+                    options[2].dwOption = 2; // INTERNET_PER_CONN_PROXY_SERVER
+                    options[2].Value.pszValue = emptyPtr;
+                    options[3].dwOption = 3; // INTERNET_PER_CONN_PROXY_BYPASS
+                    options[3].Value.pszValue = emptyPtr;
+                }
+                else if (enable)
                 {
                     options = new INTERNET_PER_CONN_OPTION[4];
                     options[0].dwOption = 1; // INTERNET_PER_CONN_FLAGS
@@ -326,9 +374,10 @@ namespace PixelTunnel
             catch { }
             finally
             {
-                if (srvPtr != IntPtr.Zero) Marshal.FreeHGlobal(srvPtr);
-                if (bypPtr != IntPtr.Zero) Marshal.FreeHGlobal(bypPtr);
-                if (emptyPtr != IntPtr.Zero) Marshal.FreeHGlobal(emptyPtr);
+                FreeHGlobalPtrSafe(srvPtr);
+                FreeHGlobalPtrSafe(bypPtr);
+                FreeHGlobalPtrSafe(pacPtr);
+                FreeHGlobalPtrSafe(emptyPtr);
             }
             RefreshWinInet();
         }
@@ -351,22 +400,103 @@ namespace PixelTunnel
                 return PixelCoreService.ManifestDonateUrl;
             return "https://ai.pixelstore.space/donate";
         }
+        private void RunOnUiThread(Action action)
+        {
+            if (action == null) return;
+            try
+            {
+                var disp = this.Dispatcher;
+                if (disp == null || disp.HasShutdownStarted || disp.HasShutdownFinished) return;
+                if (disp.CheckAccess())
+                    action();
+                else
+                    disp.BeginInvoke(new Action(delegate { try { action(); } catch { } }));
+            }
+            catch { }
+        }
+
+        private void RunOnUiThreadWithPriority(Action action, DispatcherPriority priority)
+        {
+            if (action == null) return;
+            try
+            {
+                var disp = this.Dispatcher;
+                if (disp == null || disp.HasShutdownStarted || disp.HasShutdownFinished) return;
+                disp.BeginInvoke(priority, new Action(delegate { try { action(); } catch { } }));
+            }
+            catch { }
+        }
+
+        private void RunOnUiThreadSync(Action action)
+        {
+            if (action == null) return;
+            try
+            {
+                var disp = this.Dispatcher;
+                if (disp == null || disp.HasShutdownStarted || disp.HasShutdownFinished) return;
+                if (disp.CheckAccess())
+                    action();
+                else
+                    disp.Invoke(new Action(delegate { try { action(); } catch { } }));
+            }
+            catch { }
+        }
+
+        private T ReadFromUiThread<T>(Func<T> getter, T fallback)
+        {
+            if (getter == null) return fallback;
+            try
+            {
+                var disp = this.Dispatcher;
+                if (disp == null || disp.HasShutdownStarted || disp.HasShutdownFinished) return fallback;
+                if (disp.CheckAccess()) return getter();
+                T result = fallback;
+                disp.Invoke(new Action(delegate { try { result = getter(); } catch { } }));
+                return result;
+            }
+            catch { return fallback; }
+        }
+
         private bool HasActiveProAccess()
         {
             string tier = PixelCoreService.ServerLicenseTier;
             if (string.Equals(tier, "pro", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(tier, "admin", StringComparison.OrdinalIgnoreCase))
                 return true;
-            return IsCustomPaidKey(_keyInput != null ? _keyInput.Text : "");
+            string keyText = "";
+            try
+            {
+                var disp = this.Dispatcher;
+                if (disp != null && disp.CheckAccess())
+                    keyText = _keyInput != null ? _keyInput.Text : "";
+                else if (disp != null && !disp.HasShutdownStarted && !disp.HasShutdownFinished)
+                    disp.Invoke(new Action(delegate { keyText = _keyInput != null ? _keyInput.Text : ""; }));
+            }
+            catch { }
+            return IsCustomPaidKey(keyText);
         }
         public static string GetFreeModeSentinelUri() { return "pwp3://free@ai.pixelstore.space:443#PixelTunnel-Free"; }
         private static string GetDefaultClusterHost() { return "ai.pixelstore.space"; }
 
-        public const string APP_VERSION = "1.9.0";
+        public const string APP_VERSION = "2.0.0";
+        public const string IPC_PIPE_NAME = "Local\\PixelTunnel_IPC_v2";
         private const string CORE_EXE_NAME = "pixel-tun-core";
         private const int LOCAL_MIXED_PORT = 17890;
+        private static readonly HashSet<string> LegacyTrialUuids = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "e434aed7-0a9f-449f-81b9-870086cf2d09",
+            "66eda2cf-432e-475b-a5cb-ebbf391e649f",
+            "02d80b07-7824-f8d4-ac3a-e431ea3a8a32"
+        };
         private static int _activeHttpPort = 17890;
         private static int _activeSocksPort = 17891;
+        private static volatile bool _foreign7890UpstreamDead = false;
+        private static long _foreign7890DeadCheckedTicks = 0;
+        private static bool _useSmartPacMode = true;
+        private static bool _optWslBridge = false;
+        private CancellationTokenSource _deepLinkPipeCts;
+        private readonly string _initialDeepLinkUri;
+        private int _pulseTickCounter = 0;
         private bool _isExplicitExit = false;
         private bool _hasShownTrayBalloon = false;
         private int _consecutivePingFailures = 0;
@@ -450,23 +580,20 @@ namespace PixelTunnel
         private ContentControl _diagBtnIconHolder;
         private TextBlock _diagBtnText;
 
-        private Border _diagPanelBorder;
-        private TextBlock _diagSummaryTitle;
-        private TextBlock _diagSummaryBadge;
-        private TextBox _diagOutputBox;
-        private Border _btnAutoFixNow;
-        private Border _btnEmergencyReset;
+        private Border _aiPulseRowBorder;
+        private Ellipse _pulseDotGemini;
+        private TextBlock _pulseTextGemini;
+        private Ellipse _pulseDotClaude;
+        private TextBlock _pulseTextClaude;
+        private Ellipse _pulseDotOpenAi;
+        private TextBlock _pulseTextOpenAi;
         private Border _btnOAuthHelperBorder;
         private TextBlock _btnOAuthHelperText;
         private bool _oauthHelperActive = false;
         private int _oauthHelperSecondsLeft = 0;
         private DispatcherTimer _oauthHelperTimer;
         private string _lastSupportPassport = "";
-        private Border _customPanelBorder;
-        private TextBox _customProxyBox;
-        private TextBox _customDirectBox;
-        private TextBox _customEditorsBox;
-        private TextBlock _customStatusBadge;
+        private string _lastDiagReport = "";
 
         private Process _coreProcess;
         private DispatcherTimer _monitorTimer;
@@ -490,8 +617,9 @@ namespace PixelTunnel
         private static readonly Color ColRed = Color.FromRgb(239, 68, 68);        // #EF4444
         private static readonly Color ColBlue = Color.FromRgb(59, 130, 246);      // #3B82F6
 
-        public MainWindow(bool autoConnect, bool autoDiag)
+        public MainWindow(bool autoConnect, bool autoDiag, string initialDeepLinkUri = null)
         {
+            _initialDeepLinkUri = initialDeepLinkUri;
             _baseDir = AppDomain.CurrentDomain.BaseDirectory;
             string localEngineDir = System.IO.Path.Combine(_baseDir, "engine");
             string localCorePath = System.IO.Path.Combine(localEngineDir, CORE_EXE_NAME + ".exe");
@@ -595,11 +723,19 @@ namespace PixelTunnel
             _monitorTimer.Tick += delegate { MonitorLoop(); };
             _monitorTimer.Start();
 
-            Loaded += delegate { CheckForGitHubUpdateAsync(); };
+            Loaded += delegate
+            {
+                CheckForGitHubUpdateAsync();
+                StartDeepLinkPipeServer();
+                if (!string.IsNullOrEmpty(_initialDeepLinkUri))
+                {
+                    RunOnUiThreadWithPriority(delegate { HandleDeepLinkUri(_initialDeepLinkUri); }, DispatcherPriority.Background);
+                }
+            };
 
             if (autoDiag)
             {
-                Loaded += delegate { RunSmartDiagnosticsAsync(true); };
+                Loaded += delegate { RunSmartDiagnosticsAsync(false, true); };
             }
             else if (autoConnect && !string.IsNullOrWhiteSpace(_keyInput.Text))
             {
@@ -741,17 +877,22 @@ namespace PixelTunnel
 
         private async void PerformSafeInAppUpdateAsync()
         {
-            if (_isUpdatingApp) return;
-            string remoteVer = PixelCoreService.ManifestLatestVersion;
-            string remoteUrl = PixelCoreService.ManifestUpdateUrl;
-            string remoteSha = PixelCoreService.ManifestUpdateSha256;
-            if (string.IsNullOrEmpty(remoteUrl) || string.IsNullOrEmpty(remoteSha)) return;
-
-            _isUpdatingApp = true;
-            if (_updatePillText != null) _updatePillText.Text = "Загрузка v" + remoteVer + "...";
-
+            bool exiting = false;
+            string remoteVer = "";
             try
             {
+                if (_isUpdatingApp) return;
+                remoteVer = PixelCoreService.ManifestLatestVersion;
+                string remoteUrl = PixelCoreService.ManifestUpdateUrl;
+                string remoteSha = PixelCoreService.ManifestUpdateSha256;
+                if (string.IsNullOrEmpty(remoteUrl) || string.IsNullOrEmpty(remoteSha)) return;
+
+                _isUpdatingApp = true;
+                RunOnUiThread(delegate
+                {
+                    if (_updatePillText != null) _updatePillText.Text = "Загрузка v" + remoteVer + "...";
+                });
+
                 string curExe = Process.GetCurrentProcess().MainModule.FileName;
                 bool wasConnected = _isConnected;
                 string tunnelProxy = (_isConnected && IsLocalPortOpen(_activeHttpPort, 120))
@@ -818,20 +959,26 @@ namespace PixelTunnel
 
                 if (!readyToSwap)
                 {
-                    _isUpdatingApp = false;
-                    if (_updatePillText != null) _updatePillText.Text = "⬆ Обновить v" + remoteVer;
-                    SetStatus(ColAmber, "Обновление отменено защитой", errDetail);
+                    RunOnUiThread(delegate
+                    {
+                        if (_updatePillText != null) _updatePillText.Text = "⬆ Обновить v" + remoteVer;
+                        SetStatus(ColAmber, "Обновление отменено защитой", errDetail);
+                    });
                     return;
                 }
 
-                SaveCurrentState();
+                RunOnUiThreadSync(delegate { SaveCurrentState(); });
                 _isExplicitExit = true;
-                if (_trayIcon != null)
+                RunOnUiThreadSync(delegate
                 {
-                    try { _trayIcon.Visible = false; _trayIcon.Dispose(); } catch { }
-                }
+                    if (_trayIcon != null)
+                    {
+                        try { _trayIcon.Visible = false; _trayIcon.Dispose(); } catch { }
+                    }
+                });
                 StopTunnelProcess(false);
 
+                exiting = true;
                 Process.Start(new ProcessStartInfo
                 {
                     FileName = curExe,
@@ -843,75 +990,86 @@ namespace PixelTunnel
             }
             catch (Exception ex)
             {
-                _isUpdatingApp = false;
-                if (_updatePillText != null) _updatePillText.Text = "⬆ Обновить v" + remoteVer;
-                SetStatus(ColAmber, "Ошибка авто-обновления", ex.Message);
+                string errMsg = ex.Message;
+                RunOnUiThread(delegate
+                {
+                    if (_updatePillText != null) _updatePillText.Text = "⬆ Обновить v" + remoteVer;
+                    SetStatus(ColAmber, "Ошибка авто-обновления", errMsg);
+                });
+            }
+            finally
+            {
+                if (!exiting) _isUpdatingApp = false;
             }
         }
 
         private async void CheckForGitHubUpdateAsync()
         {
-            await Task.Run(() =>
+            try
             {
-                try
+                await Task.Run(() =>
                 {
-                    string json = null;
-                    string url = "https://api.github.com/repos/keenfolk1-lgtm/antigravity-unlocker/releases/latest";
-                    string[] proxies = (_isConnected && IsLocalPortOpen(_activeHttpPort, 100))
-                        ? new[] { string.Format("http://127.0.0.1:{0}", _activeHttpPort), null }
-                        : new string[] { null };
-
-                    foreach (string prx in proxies)
+                    try
                     {
-                        try
-                        {
-                            var req = (HttpWebRequest)WebRequest.Create(url);
-                            req.UserAgent = "PixelTunnel/" + APP_VERSION;
-                            req.Timeout = 8000;
-                            req.ReadWriteTimeout = 8000;
-                            req.Proxy = string.IsNullOrEmpty(prx) ? null : new WebProxy(prx);
-                            using (var resp = (HttpWebResponse)req.GetResponse())
-                            using (var sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
-                            {
-                                json = sr.ReadToEnd();
-                            }
-                            if (!string.IsNullOrEmpty(json)) break;
-                        }
-                        catch { }
-                    }
+                        string json = null;
+                        string url = "https://api.github.com/repos/keenfolk1-lgtm/antigravity-unlocker/releases/latest";
+                        string[] proxies = (_isConnected && IsLocalPortOpen(_activeHttpPort, 100))
+                            ? new[] { string.Format("http://127.0.0.1:{0}", _activeHttpPort), null }
+                            : new string[] { null };
 
-                    if (string.IsNullOrEmpty(json)) return;
-                    var mTag = Regex.Match(json, "\"tag_name\"\\s*:\\s*\"v?([^\"]+)\"", RegexOptions.IgnoreCase);
-                    if (mTag.Success)
-                    {
-                        string latestVer = mTag.Groups[1].Value.Trim();
-                        if (!string.IsNullOrEmpty(latestVer) && !string.Equals(latestVer, APP_VERSION, StringComparison.OrdinalIgnoreCase))
+                        foreach (string prx in proxies)
                         {
-                            Version vCur, vNew;
-                            if (Version.TryParse(APP_VERSION.Split('-')[0], out vCur) && Version.TryParse(latestVer.Split('-')[0], out vNew) && vNew > vCur)
+                            try
                             {
-                                Dispatcher.BeginInvoke(new Action(delegate
+                                var req = (HttpWebRequest)WebRequest.Create(url);
+                                req.UserAgent = "PixelTunnel/" + APP_VERSION;
+                                req.Timeout = 8000;
+                                req.ReadWriteTimeout = 8000;
+                                req.Proxy = string.IsNullOrEmpty(prx) ? null : new WebProxy(prx);
+                                using (var resp = (HttpWebResponse)req.GetResponse())
+                                using (var sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
                                 {
-                                    bool hasManifestAutoUpd =
-                                        PixelCoreService.IsNewerVersion(APP_VERSION, PixelCoreService.ManifestLatestVersion) &&
-                                        !string.IsNullOrEmpty(PixelCoreService.ManifestUpdateUrl) &&
-                                        !string.IsNullOrEmpty(PixelCoreService.ManifestUpdateSha256) &&
-                                        PixelCoreService.ManifestUpdateSha256.Trim().Length == 64;
+                                    json = sr.ReadToEnd();
+                                }
+                                if (!string.IsNullOrEmpty(json)) break;
+                            }
+                            catch { }
+                        }
 
-                                    if (!hasManifestAutoUpd && _updatePillBtn != null && _updatePillText != null && !_isUpdatingApp)
+                        if (string.IsNullOrEmpty(json)) return;
+                        var mTag = Regex.Match(json, "\"tag_name\"\\s*:\\s*\"v?([^\"]+)\"", RegexOptions.IgnoreCase);
+                        if (mTag.Success)
+                        {
+                            string latestVer = mTag.Groups[1].Value.Trim();
+                            if (!string.IsNullOrEmpty(latestVer) && !string.Equals(latestVer, APP_VERSION, StringComparison.OrdinalIgnoreCase))
+                            {
+                                Version vCur, vNew;
+                                if (Version.TryParse(APP_VERSION.Split('-')[0], out vCur) && Version.TryParse(latestVer.Split('-')[0], out vNew) && vNew > vCur)
+                                {
+                                    RunOnUiThread(delegate
                                     {
-                                        _githubReleaseUrl = "https://github.com/keenfolk1-lgtm/antigravity-unlocker/releases/latest";
-                                        _updatePillText.Text = "⬆ Доступна v" + latestVer;
-                                        _updatePillBtn.ToolTip = string.Format("Доступен новый релиз PixelTunnel v{0} на GitHub — нажмите, чтобы открыть", latestVer);
-                                        _updatePillBtn.Visibility = Visibility.Visible;
-                                    }
-                                }));
+                                        bool hasManifestAutoUpd =
+                                            PixelCoreService.IsNewerVersion(APP_VERSION, PixelCoreService.ManifestLatestVersion) &&
+                                            !string.IsNullOrEmpty(PixelCoreService.ManifestUpdateUrl) &&
+                                            !string.IsNullOrEmpty(PixelCoreService.ManifestUpdateSha256) &&
+                                            PixelCoreService.ManifestUpdateSha256.Trim().Length == 64;
+
+                                        if (!hasManifestAutoUpd && _updatePillBtn != null && _updatePillText != null && !_isUpdatingApp)
+                                        {
+                                            _githubReleaseUrl = "https://github.com/keenfolk1-lgtm/antigravity-unlocker/releases/latest";
+                                            _updatePillText.Text = "⬆ Доступна v" + latestVer;
+                                            _updatePillBtn.ToolTip = string.Format("Доступен новый релиз PixelTunnel v{0} на GitHub — нажмите, чтобы открыть", latestVer);
+                                            _updatePillBtn.Visibility = Visibility.Visible;
+                                        }
+                                    });
+                                }
                             }
                         }
                     }
-                }
-                catch { }
-            });
+                    catch { }
+                });
+            }
+            catch { }
         }
 
         private static bool IsPixelOrLocalAutoConfig(string val)
@@ -920,6 +1078,227 @@ namespace PixelTunnel
             return val.IndexOf("127.0.0.1", StringComparison.OrdinalIgnoreCase) >= 0 ||
                    val.IndexOf("localhost", StringComparison.OrdinalIgnoreCase) >= 0 ||
                    val.IndexOf("pixel", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static bool IsActivePixelSmartPacUrl(string val)
+        {
+            if (string.IsNullOrEmpty(val) || !_useSmartPacMode) return false;
+            if (!PixelCoreService.IsRunning && !IsLocalPortOpen(_activeHttpPort, 120)) return false;
+            string prefix = string.Format("http://127.0.0.1:{0}/proxy.pac", _activeHttpPort);
+            return val.Trim().StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
+        }
+
+        public static void RegisterPixelTunnelUrlProtocol()
+        {
+            try
+            {
+                string exePath = Process.GetCurrentProcess().MainModule.FileName;
+                if (string.IsNullOrEmpty(exePath)) return;
+                using (var root = Registry.CurrentUser.CreateSubKey(@"Software\Classes\pixeltunnel"))
+                {
+                    if (root != null)
+                    {
+                        root.SetValue("", "URL:PixelTunnel Protocol", RegistryValueKind.String);
+                        root.SetValue("URL Protocol", "", RegistryValueKind.String);
+                        using (var iconKey = root.CreateSubKey("DefaultIcon"))
+                        {
+                            if (iconKey != null) iconKey.SetValue("", "\"" + exePath + "\",0", RegistryValueKind.String);
+                        }
+                        using (var cmdKey = root.CreateSubKey(@"shell\open\command"))
+                        {
+                            if (cmdKey != null) cmdKey.SetValue("", "\"" + exePath + "\" \"%1\"", RegistryValueKind.String);
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
+
+        public static void ApplySavedFlagsForConfigGen(string flags)
+        {
+            if (string.IsNullOrEmpty(flags)) return;
+            _useSmartPacMode = !flags.Contains("PAC=0");
+            _optWslBridge = flags.Contains("WSL=1");
+            var mReg = Regex.Match(flags, @"REG=(auto|nl|us)", RegexOptions.IgnoreCase);
+            if (mReg.Success) _selectedRegion = mReg.Groups[1].Value.ToLowerInvariant();
+        }
+
+        private void StartDeepLinkPipeServer()
+        {
+            try
+            {
+                if (_deepLinkPipeCts != null) return;
+                _deepLinkPipeCts = new CancellationTokenSource();
+                CancellationToken tok = _deepLinkPipeCts.Token;
+                Task.Run(async () =>
+                {
+                    while (!tok.IsCancellationRequested)
+                    {
+                        bool hadErr = false;
+                        try
+                        {
+                            using (var srv = new NamedPipeServerStream(
+                                IPC_PIPE_NAME,
+                                PipeDirection.In,
+                                1,
+                                PipeTransmissionMode.Byte,
+                                PipeOptions.Asynchronous))
+                            {
+                                await Task.Factory.FromAsync(srv.BeginWaitForConnection, srv.EndWaitForConnection, null).ConfigureAwait(false);
+                                using (var sr = new StreamReader(srv, Encoding.UTF8))
+                                {
+                                    string line = await sr.ReadLineAsync().ConfigureAwait(false);
+                                    if (!string.IsNullOrWhiteSpace(line))
+                                    {
+                                        string captured = line.Trim();
+                                        RunOnUiThread(delegate { HandleDeepLinkUri(captured); });
+                                    }
+                                }
+                            }
+                        }
+                        catch
+                        {
+                            hadErr = true;
+                        }
+                        if (hadErr)
+                        {
+                            if (tok.IsCancellationRequested) break;
+                            await Task.Delay(250).ConfigureAwait(false);
+                        }
+                    }
+                });
+            }
+            catch { }
+        }
+
+        private static bool TryExtractActivateKeyFromUri(string rawUri, out string keyVal)
+        {
+            keyVal = "";
+            if (string.IsNullOrWhiteSpace(rawUri)) return false;
+            Uri u;
+            if (!Uri.TryCreate(rawUri.Trim(), UriKind.Absolute, out u)) return false;
+            if (!string.Equals(u.Scheme, "pixeltunnel", StringComparison.OrdinalIgnoreCase)) return false;
+            if (!string.Equals(u.Host, "activate", StringComparison.OrdinalIgnoreCase) &&
+                !u.AbsolutePath.Trim('/').Equals("activate", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            string q = (u.Query ?? "").TrimStart('?');
+            foreach (string part in q.Split(new[] { '&' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                int eq = part.IndexOf('=');
+                if (eq > 0 && string.Equals(part.Substring(0, eq), "key", StringComparison.OrdinalIgnoreCase))
+                {
+                    keyVal = Uri.UnescapeDataString(part.Substring(eq + 1).Replace("+", "%2B")).Trim();
+                    return !string.IsNullOrEmpty(keyVal);
+                }
+            }
+            return false;
+        }
+
+        private static bool IsLegacyOrFreeKey(string candidate)
+        {
+            if (string.IsNullOrWhiteSpace(candidate)) return true;
+            string s = candidate.Trim();
+            if (string.Equals(s, "free", StringComparison.OrdinalIgnoreCase)) return true;
+            if (LegacyTrialUuids.Contains(s)) return true;
+            foreach (string legacy in LegacyTrialUuids)
+            {
+                if (s.IndexOf(legacy, StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            }
+            return s.IndexOf("pwp3://free@", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static bool IsValidProActivationKey(string candidate, out string normalizedSavedKey, out string keyIdentity)
+        {
+            normalizedSavedKey = "";
+            keyIdentity = "";
+            if (string.IsNullOrWhiteSpace(candidate)) return false;
+            string k = candidate.Trim();
+            if (IsLegacyOrFreeKey(k)) return false;
+
+            if (Regex.IsMatch(k, @"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"))
+            {
+                string low = k.ToLowerInvariant();
+                if (LegacyTrialUuids.Contains(low)) return false;
+                normalizedSavedKey = string.Format("pwp4://{0}@ai.pixelstore.space:443#PixelTunnel-PRO", low);
+                keyIdentity = low;
+                return true;
+            }
+
+            if (Regex.IsMatch(k, @"^https://ai\.pixelstore\.space/sub/[A-Za-z0-9_-]{6,64}$", RegexOptions.IgnoreCase))
+            {
+                normalizedSavedKey = k;
+                keyIdentity = k.ToLowerInvariant();
+                return true;
+            }
+
+            var parsed = ParseVlessUri(k);
+            if (parsed != null && !string.IsNullOrEmpty(parsed.Uuid) && !IsLegacyOrFreeKey(parsed.Uuid))
+            {
+                normalizedSavedKey = k;
+                keyIdentity = parsed.Uuid.Trim().ToLowerInvariant();
+                return true;
+            }
+
+            return false;
+        }
+
+        private void HandleDeepLinkUri(string rawUri)
+        {
+            try
+            {
+                Show();
+                if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
+                Activate();
+                Topmost = true;
+                Topmost = false;
+
+                string rawKey;
+                if (!TryExtractActivateKeyFromUri(rawUri, out rawKey))
+                {
+                    MessageBox.Show(this, "Ссылка активации не содержит корректного параметра ?key=.", "PixelTunnel Активация", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return;
+                }
+
+                string normalizedNewKey;
+                string newIdentity;
+                if (!IsValidProActivationKey(rawKey, out normalizedNewKey, out newIdentity))
+                {
+                    MessageBox.Show(this, "Ключ в ссылке не соответствует формату PRO (UUID / vless:// / pwp4:// / sub).", "PixelTunnel Активация", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return;
+                }
+
+                string curText = (_keyInput != null ? _keyInput.Text : "").Trim();
+                string curNorm;
+                string curIdentity;
+                if (IsValidProActivationKey(curText, out curNorm, out curIdentity) &&
+                    !string.Equals(curIdentity, newIdentity, StringComparison.OrdinalIgnoreCase))
+                {
+                    string shortOld = curIdentity.Length > 10 ? (curIdentity.Substring(0, 8) + "...") : curIdentity;
+                    string shortNew = newIdentity.Length > 10 ? (newIdentity.Substring(0, 8) + "...") : newIdentity;
+                    var ans = MessageBox.Show(
+                        this,
+                        string.Format("В PixelTunnel уже сохранён другой PRO-ключ ({0}).\n\nЗаменить его на новый ключ ({1}) и переподключить туннель?", shortOld, shortNew),
+                        "Замена PRO-ключа PixelTunnel",
+                        MessageBoxButton.YesNo,
+                        MessageBoxImage.Question);
+                    if (ans != MessageBoxResult.Yes) return;
+                }
+
+                if (_keyInput != null) _keyInput.Text = normalizedNewKey;
+                SaveCurrentState();
+                OnKeyTextChanged();
+                SetStatus(ColBlue, "Применяется PRO-ключ...", "Ключ получен через pixeltunnel://activate — запускаем туннель");
+                if (!_isBusy)
+                {
+                    if (_isConnected) StopTunnelProcess(false);
+                    StartTunnelAsync();
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "Не удалось обработать ссылку активации: " + ex.Message, "PixelTunnel", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
         }
 
         private static void SetProxyResetRunOnceGuard(bool enable)
@@ -934,7 +1313,7 @@ namespace PixelTunnel
                         {
                             runOnce.SetValue(
                                 "PixelTunnelProxyReset",
-                                "reg add \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\" /v ProxyEnable /t REG_DWORD /d 0 /f",
+                                "cmd /c reg add \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\" /v ProxyEnable /t REG_DWORD /d 0 /f & reg delete \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\" /v AutoConfigURL /f",
                                 RegistryValueKind.String);
                         }
                     }
@@ -957,6 +1336,11 @@ namespace PixelTunnel
         {
             try
             {
+                if (_deepLinkPipeCts != null)
+                {
+                    try { _deepLinkPipeCts.Cancel(); } catch { }
+                    _deepLinkPipeCts = null;
+                }
                 if (_isConnected || PixelCoreService.IsRunning || Process.GetProcessesByName(CORE_EXE_NAME).Length > 0)
                 {
                     StopTunnelProcess(false);
@@ -1212,7 +1596,7 @@ namespace PixelTunnel
                 else
                     _trayIcon.Icon = System.Drawing.Icon.ExtractAssociatedIcon(Process.GetCurrentProcess().MainModule.FileName);
 
-                _trayIcon.Text = "PixelTunnel v" + APP_VERSION + " — PWP-3 Dual-Mux";
+                _trayIcon.Text = "PixelTunnel v" + APP_VERSION + " — PWP-4 Dual-Mux";
                 _trayIcon.Visible = true;
                 _trayIcon.MouseClick += (s, e) =>
                 {
@@ -1232,7 +1616,7 @@ namespace PixelTunnel
 
                 var menu = new System.Windows.Forms.ContextMenuStrip();
                 menu.Items.Add("Открыть PixelTunnel", null, delegate { Show(); WindowState = WindowState.Normal; Activate(); });
-                menu.Items.Add("Запустить / Перезапустить туннель (PWP-3)", null, delegate
+                menu.Items.Add("Запустить / Перезапустить туннель (PWP-4)", null, delegate
                 {
                     Show();
                     WindowState = WindowState.Normal;
@@ -1247,13 +1631,6 @@ namespace PixelTunnel
                 {
                     RelaunchDiscordWithSocksUdpAsync();
                 });
-                menu.Items.Add("\u2795 \u0421\u0432\u043e\u0438 \u0441\u0430\u0439\u0442\u044b, \u0438\u0441\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u044f \u0438 AI-\u0440\u0435\u0434\u0430\u043a\u0442\u043e\u0440\u044b", null, delegate
-                {
-                    Show();
-                    WindowState = WindowState.Normal;
-                    Activate();
-                    _customPanelBorder.Visibility = Visibility.Visible;
-                });
                 menu.Items.Add("🛠️ Починить другие программы (Сбросить прокси из Cursor/Git)", null, delegate
                 {
                     RepairOtherAppsAndCleanLeftovers();
@@ -1262,7 +1639,7 @@ namespace PixelTunnel
                         try { _trayIcon.ShowBalloonTip(2500, "Программы очищены от прокси", "Cursor, VS Code, Git, npm и браузеры работают напрямую • Antigravity под защитой", System.Windows.Forms.ToolTipIcon.Info); } catch { }
                     }
                 });
-                menu.Items.Add("\u0423\u043c\u043d\u0430\u044f \u0434\u0438\u0430\u0433\u043d\u043e\u0441\u0442\u0438\u043a\u0430 \u0438 \u0410\u0432\u0442\u043e-\u0444\u0438\u043a\u0441", null, delegate
+                menu.Items.Add("\u0414\u0438\u0430\u0433\u043d\u043e\u0441\u0442\u0438\u043a\u0430 \u0438 \u0430\u0432\u0442\u043e-\u0444\u0438\u043a\u0441", null, delegate
                 {
                     Show();
                     WindowState = WindowState.Normal;
@@ -1274,7 +1651,7 @@ namespace PixelTunnel
                     Show();
                     WindowState = WindowState.Normal;
                     Activate();
-                    RunEmergencyNetworkResetAsync();
+                    RunEmergencyNetworkResetAsync(true);
                 });
                 menu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
                 menu.Items.Add("\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c \u0438 \u0432\u044b\u0439\u0442\u0438", null, delegate
@@ -1340,7 +1717,7 @@ namespace PixelTunnel
             });
             titleRow.Children.Add(new TextBlock
             {
-                Text = "PWP-3 MUX • v" + APP_VERSION,
+                Text = "uTLS + PWP-4 • v" + APP_VERSION,
                 Foreground = new SolidColorBrush(ColGreen),
                 FontFamily = new FontFamily("Consolas, JetBrains Mono, monospace"),
                 FontSize = 10,
@@ -1525,7 +1902,7 @@ namespace PixelTunnel
 
             _aiTelemetryText = new TextBlock
             {
-                Text = "AI Телеметрия: вход из-под санкций активен • шлюз :17890 (PWP-3) готов",
+                Text = "AI Телеметрия: вход из-под санкций активен • шлюз :17890 (PWP-4) готов",
                 Foreground = new SolidColorBrush(ColText2),
                 FontFamily = new FontFamily("Consolas, JetBrains Mono, monospace"),
                 FontSize = 10.2,
@@ -1570,6 +1947,39 @@ namespace PixelTunnel
 
             _aiTelemetryBorder.Child = telGrid;
             statusOuterStack.Children.Add(_aiTelemetryBorder);
+
+            // Compact Live AI Pulse Row (Gemini • Claude • OpenAI from /__pixelcore/v4/ai-pulse)
+            _aiPulseRowBorder = new Border
+            {
+                Background = new SolidColorBrush(ColBg),
+                BorderBrush = new SolidColorBrush(ColBorder),
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(6),
+                Padding = new Thickness(9, 4, 9, 4),
+                Margin = new Thickness(0, 6, 0, 0),
+                Cursor = Cursors.Hand,
+                ToolTip = "Живой статус AI-шлюзов через туннель (нажмите для обновления)"
+            };
+            var pulseGrid = new Grid();
+            pulseGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            pulseGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            pulseGrid.Children.Add(new TextBlock
+            {
+                Text = "Пульс AI",
+                Foreground = new SolidColorBrush(ColText2),
+                FontSize = 10.2,
+                FontWeight = FontWeights.SemiBold,
+                VerticalAlignment = VerticalAlignment.Center
+            });
+            var pulsePills = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+            pulsePills.Children.Add(BuildAiPulsePill("Gemini", out _pulseDotGemini, out _pulseTextGemini, new Thickness(0, 0, 10, 0)));
+            pulsePills.Children.Add(BuildAiPulsePill("Claude", out _pulseDotClaude, out _pulseTextClaude, new Thickness(0, 0, 10, 0)));
+            pulsePills.Children.Add(BuildAiPulsePill("OpenAI", out _pulseDotOpenAi, out _pulseTextOpenAi, new Thickness(0)));
+            Grid.SetColumn(pulsePills, 1);
+            pulseGrid.Children.Add(pulsePills);
+            _aiPulseRowBorder.Child = pulseGrid;
+            _aiPulseRowBorder.MouseLeftButtonUp += delegate { var unused = RefreshAiPulseUiAsync(true); };
+            statusOuterStack.Children.Add(_aiPulseRowBorder);
 
             // 1-Click Antigravity Pre-Tunnel Leak Guard Banner (Zero .lnk Shortcut Tampering -> 1/64 VT Clean)
             _agLeakGuardBanner = new Border
@@ -1825,10 +2235,6 @@ namespace PixelTunnel
                     UpdateCheckboxVisual(_chkBoxWeb, _chkMarkWeb, _iconBoxWeb, _optSocialWeb, true);
                     SaveCurrentState();
                     TriggerCategoryHotReloadIfConnected();
-                    if (_optSocialWeb)
-                    {
-                        TryOpenTelegramProxy();
-                    }
                 },
                 true,
                 false
@@ -2050,7 +2456,7 @@ namespace PixelTunnel
                 Cursor = Cursors.Hand,
                 RenderTransformOrigin = new Point(0.5, 0.5),
                 RenderTransform = new ScaleTransform(1.0, 1.0),
-                ToolTip = "Проверить соединение, сбросить сеть или сохранить отчёт"
+                ToolTip = "Проверить соединение и автоматически исправить ошибки"
             };
             var diagBtnStack = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
             _diagBtnIconHolder = new ContentControl
@@ -2075,7 +2481,6 @@ namespace PixelTunnel
             _diagBtnBorder.MouseLeave += delegate { _diagBtnBorder.Background = new SolidColorBrush(ColSurface); };
             _diagBtnBorder.MouseLeftButtonUp += delegate
             {
-                if (_isDiagRunning) return;
                 RunSmartDiagnosticsAsync(true);
             };
             Grid.SetColumn(_diagBtnBorder, 2);
@@ -2152,347 +2557,83 @@ namespace PixelTunnel
             };
             rootStack.Children.Add(donateBanner);
 
-            // ====================================================================
-            // 6. EXPANDABLE SMART DIAGNOSTICS & SELF-HEALING DRAWER
-            // ====================================================================
-            _diagPanelBorder = new Border
-            {
-                Background = new SolidColorBrush(ColSurface),
-                BorderBrush = new SolidColorBrush(ColBorderFocus),
-                BorderThickness = new Thickness(1),
-                CornerRadius = new CornerRadius(8),
-                Padding = new Thickness(12, 10, 12, 10),
-                Margin = new Thickness(0, 10, 0, 0),
-                Visibility = Visibility.Collapsed
-            };
-
-            var diagStack = new StackPanel();
-
-            var diagTopGrid = new Grid { Margin = new Thickness(0, 0, 0, 8) };
-            diagTopGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-            diagTopGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            diagTopGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-
-            _diagSummaryTitle = new TextBlock
-            {
-                Text = "ДИАГНОСТИКА И АВТО-ЛЕЧЕНИЕ СЕТИ",
-                Foreground = new SolidColorBrush(ColText1),
-                FontSize = 11,
-                FontWeight = FontWeights.Bold,
-                VerticalAlignment = VerticalAlignment.Center
-            };
-            Grid.SetColumn(_diagSummaryTitle, 0);
-            diagTopGrid.Children.Add(_diagSummaryTitle);
-
-            _diagSummaryBadge = new TextBlock
-            {
-                Text = "ПРОВЕРКА...",
-                Foreground = new SolidColorBrush(ColAmber),
-                FontFamily = new FontFamily("Consolas, monospace"),
-                FontSize = 10.5,
-                FontWeight = FontWeights.Bold,
-                VerticalAlignment = VerticalAlignment.Center,
-                Margin = new Thickness(8, 0, 8, 0)
-            };
-            Grid.SetColumn(_diagSummaryBadge, 1);
-            diagTopGrid.Children.Add(_diagSummaryBadge);
-
-            var closeDiagRow = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
-            closeDiagRow.Children.Add(CreateVectorIcon("M18 6L6 18 M6 6l12 12", ColText2, 9));
-            closeDiagRow.Children.Add(new TextBlock
-            {
-                Text = "Скрыть",
-                Foreground = new SolidColorBrush(ColText2),
-                FontSize = 10.5,
-                Margin = new Thickness(4, 0, 0, 0)
-            });
-            var closeDiagBtn = new Border
-            {
-                Background = Brushes.Transparent,
-                CornerRadius = new CornerRadius(4),
-                Padding = new Thickness(6, 2, 6, 2),
-                Cursor = Cursors.Hand,
-                Child = closeDiagRow
-            };
-            closeDiagBtn.MouseLeftButtonUp += delegate { _diagPanelBorder.Visibility = Visibility.Collapsed; };
-            Grid.SetColumn(closeDiagBtn, 2);
-            diagTopGrid.Children.Add(closeDiagBtn);
-
-            diagStack.Children.Add(diagTopGrid);
-
-            _diagOutputBox = new TextBox
-            {
-                Background = new SolidColorBrush(ColBg),
-                BorderBrush = new SolidColorBrush(ColBorder),
-                BorderThickness = new Thickness(1),
-                Foreground = new SolidColorBrush(ColText1),
-                FontFamily = new FontFamily("Consolas, JetBrains Mono, monospace"),
-                FontSize = 10.8,
-                Padding = new Thickness(10, 8, 10, 8),
-                IsReadOnly = true,
-                TextWrapping = TextWrapping.Wrap,
-                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
-                MaxHeight = 185,
-                MinHeight = 135,
-                Margin = new Thickness(0, 0, 0, 8)
-            };
-            diagStack.Children.Add(_diagOutputBox);
-
-            var diagBtnGrid = new Grid { Margin = new Thickness(0, 0, 0, 0) };
-            diagBtnGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.2, GridUnitType.Star) });
-            diagBtnGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(0.9, GridUnitType.Star) });
-            diagBtnGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.0, GridUnitType.Star) });
-
-            _btnAutoFixNow = CreateSmallActionBtn(
-                "M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z",
-                ColGreen,
-                "Проверить и починить",
-                ColGreen,
-                new Thickness(0, 0, 5, 0),
-                delegate
-                {
-                    if (_isDiagRunning) return;
-                    if (_optDiscordYt && HasActiveProAccess())
-                    {
-                        try { RelaunchDiscordWithSocksUdpAsync(); } catch { }
-                    }
-                    RunSmartDiagnosticsAsync(true);
-                }
-            );
-            Grid.SetColumn(_btnAutoFixNow, 0);
-            diagBtnGrid.Children.Add(_btnAutoFixNow);
-
-            _btnEmergencyReset = CreateSmallActionBtn(
-                "M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8 M3 3v5h5",
-                ColAmber,
-                "Сброс сети",
-                ColAmber,
-                new Thickness(0, 0, 5, 0),
-                delegate { RunEmergencyNetworkResetAsync(); }
-            );
-            Grid.SetColumn(_btnEmergencyReset, 1);
-            diagBtnGrid.Children.Add(_btnEmergencyReset);
-
-            var btnSaveDiagFile = CreateSmallActionBtn(
-                "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4 M7 10l5 5 5-5 M12 15V3",
-                ColBlue,
-                "Сохранить отчёт",
-                ColBorderFocus,
-                new Thickness(0),
-                delegate { SaveDiagnosticReportToDesktop(); }
-            );
-            Grid.SetColumn(btnSaveDiagFile, 2);
-            diagBtnGrid.Children.Add(btnSaveDiagFile);
-
-            diagStack.Children.Add(diagBtnGrid);
-
-            _diagPanelBorder.Child = diagStack;
-            rootStack.Children.Add(_diagPanelBorder);
-
-            // ====================================================================
-            // 7. EXPANDABLE CUSTOM SITES & AI SERVICES DRAWER (HOT-RELOAD)
-            // ====================================================================
-            _customPanelBorder = new Border
-            {
-                Background = new SolidColorBrush(ColSurface),
-                BorderBrush = new SolidColorBrush(ColBorderFocus),
-                BorderThickness = new Thickness(1),
-                CornerRadius = new CornerRadius(8),
-                Padding = new Thickness(12, 10, 12, 10),
-                Margin = new Thickness(0, 10, 0, 0),
-                Visibility = Visibility.Collapsed
-            };
-
-            var customStack = new StackPanel();
-            var customTopGrid = new Grid { Margin = new Thickness(0, 0, 0, 6) };
-            customTopGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-            customTopGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            customTopGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-
-            var customTitle = new TextBlock
-            {
-                Text = "\u0421\u0412\u041e\u0418 \u0421\u0410\u0419\u0422\u042b, \u0418\u0421\u041a\u041b\u042e\u0427\u0415\u041d\u0418\u042f \u0418 AI-\u0420\u0415\u0414\u0410\u041a\u0422\u041e\u0420\u042b",
-                Foreground = new SolidColorBrush(ColText1),
-                FontSize = 11,
-                FontWeight = FontWeights.Bold,
-                VerticalAlignment = VerticalAlignment.Center
-            };
-            Grid.SetColumn(customTitle, 0);
-            customTopGrid.Children.Add(customTitle);
-
-            _customStatusBadge = new TextBlock
-            {
-                Text = "HOT-RELOAD",
-                Foreground = new SolidColorBrush(ColGreen),
-                FontFamily = new FontFamily("Consolas, monospace"),
-                FontSize = 10,
-                FontWeight = FontWeights.Bold,
-                VerticalAlignment = VerticalAlignment.Center,
-                Margin = new Thickness(8, 0, 8, 0)
-            };
-            Grid.SetColumn(_customStatusBadge, 1);
-            customTopGrid.Children.Add(_customStatusBadge);
-
-            var closeCustomRow = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
-            closeCustomRow.Children.Add(CreateVectorIcon("M18 6L6 18 M6 6l12 12", ColText2, 9));
-            closeCustomRow.Children.Add(new TextBlock
-            {
-                Text = "\u0421\u043a\u0440\u044b\u0442\u044c",
-                Foreground = new SolidColorBrush(ColText2),
-                FontSize = 10.5,
-                Margin = new Thickness(4, 0, 0, 0)
-            });
-            var closeCustomBtn = new Border
-            {
-                Background = Brushes.Transparent,
-                CornerRadius = new CornerRadius(4),
-                Padding = new Thickness(6, 2, 6, 2),
-                Cursor = Cursors.Hand,
-                Child = closeCustomRow
-            };
-            closeCustomBtn.MouseLeftButtonUp += delegate { _customPanelBorder.Visibility = Visibility.Collapsed; };
-            Grid.SetColumn(closeCustomBtn, 2);
-            customTopGrid.Children.Add(closeCustomBtn);
-            customStack.Children.Add(customTopGrid);
-
-            customStack.Children.Add(new TextBlock
-            {
-                Text = "\u0412 \u0442\u0443\u043d\u043d\u0435\u043b\u044c (\u0440\u0430\u0437\u0431\u043b\u043e\u043a\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0434\u043e\u043c\u0435\u043d\u044b \u2014 \u0447\u0435\u0440\u0435\u0437 \u0437\u0430\u043f\u044f\u0442\u0443\u044e):",
-                Foreground = new SolidColorBrush(ColText2),
-                FontSize = 10.5,
-                Margin = new Thickness(0, 2, 0, 3)
-            });
-            _customProxyBox = new TextBox
-            {
-                Background = new SolidColorBrush(ColBg),
-                BorderBrush = new SolidColorBrush(ColBorder),
-                BorderThickness = new Thickness(1),
-                Foreground = new SolidColorBrush(ColText1),
-                CaretBrush = Brushes.White,
-                FontFamily = new FontFamily("Consolas, monospace"),
-                FontSize = 11,
-                Padding = new Thickness(8, 5, 8, 5),
-                Margin = new Thickness(0, 0, 0, 6)
-            };
-            customStack.Children.Add(_customProxyBox);
-
-            customStack.Children.Add(new TextBlock
-            {
-                Text = "\u041d\u0430\u043f\u0440\u044f\u043c\u0443\u044e \u0431\u0435\u0437 VPN (\u0438\u0433\u0440\u044b, \u0431\u0430\u043d\u043a\u0438, \u0441\u0432\u043e\u0438 \u0441\u0430\u0439\u0442\u044b \u2014 \u0447\u0435\u0440\u0435\u0437 \u0437\u0430\u043f\u044f\u0442\u0443\u044e):",
-                Foreground = new SolidColorBrush(ColText2),
-                FontSize = 10.5,
-                Margin = new Thickness(0, 0, 0, 3)
-            });
-            _customDirectBox = new TextBox
-            {
-                Background = new SolidColorBrush(ColBg),
-                BorderBrush = new SolidColorBrush(ColBorder),
-                BorderThickness = new Thickness(1),
-                Foreground = new SolidColorBrush(ColText1),
-                CaretBrush = Brushes.White,
-                FontFamily = new FontFamily("Consolas, monospace"),
-                FontSize = 11,
-                Padding = new Thickness(8, 5, 8, 5),
-                Margin = new Thickness(0, 0, 0, 6)
-            };
-            customStack.Children.Add(_customDirectBox);
-
-            customStack.Children.Add(new TextBlock
-            {
-                Text = "AI-\u0440\u0435\u0434\u0430\u043a\u0442\u043e\u0440\u044b \u0434\u043b\u044f \u0430\u0432\u0442\u043e-\u043f\u0430\u0442\u0447\u0430 \u043f\u0440\u043e\u043a\u0441\u0438 \u0438 HTTP/2 (\u043f\u0430\u043f\u043a\u0438 \u0432 %APPDATA%):",
-                Foreground = new SolidColorBrush(ColText2),
-                FontSize = 10.5,
-                Margin = new Thickness(0, 0, 0, 3)
-            });
-            _customEditorsBox = new TextBox
-            {
-                Background = new SolidColorBrush(ColBg),
-                BorderBrush = new SolidColorBrush(ColBorder),
-                BorderThickness = new Thickness(1),
-                Foreground = new SolidColorBrush(ColText1),
-                CaretBrush = Brushes.White,
-                FontFamily = new FontFamily("Consolas, monospace"),
-                FontSize = 11,
-                Padding = new Thickness(8, 5, 8, 5),
-                Margin = new Thickness(0, 0, 0, 8)
-            };
-            customStack.Children.Add(_customEditorsBox);
-
-            var customBtnGrid = new Grid();
-            customBtnGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-            customBtnGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-
-            var btnSaveHotReload = CreateSmallActionBtn(
-                "M20 6L9 17l-5-5",
-                ColGreen,
-                "\u0421\u043e\u0445\u0440\u0430\u043d\u0438\u0442\u044c \u0438 \u043f\u0440\u0438\u043c\u0435\u043d\u0438\u0442\u044c \u043d\u0430 \u043b\u0435\u0442\u0443",
-                ColGreen,
-                new Thickness(0, 0, 6, 0),
-                delegate { SaveAndHotReloadCustomRules(); }
-            );
-            Grid.SetColumn(btnSaveHotReload, 0);
-            customBtnGrid.Children.Add(btnSaveHotReload);
-
-            var btnResetCustom = CreateSmallActionBtn(
-                "M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8 M3 3v5h5",
-                ColText2,
-                "\u0421\u0431\u0440\u043e\u0441 \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e",
-                ColBorderFocus,
-                new Thickness(0),
-                delegate { ResetCustomRulesToDefault(); }
-            );
-            Grid.SetColumn(btnResetCustom, 1);
-            customBtnGrid.Children.Add(btnResetCustom);
-
-            customStack.Children.Add(customBtnGrid);
-            _customPanelBorder.Child = customStack;
-            rootStack.Children.Add(_customPanelBorder);
-
             outerBorder.Child = rootStack;
             Content = outerBorder;
         }
 
-        private Border CreateSmallActionBtn(string iconPath, Color iconColor, string label, Color borderColor, Thickness margin, Action onClick)
+        private UIElement BuildAiPulsePill(string name, out Ellipse dotOut, out TextBlock textOut, Thickness margin)
         {
-            var stack = new StackPanel
+            var sp = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center, Margin = margin };
+            dotOut = new Ellipse
             {
-                Orientation = Orientation.Horizontal,
-                HorizontalAlignment = HorizontalAlignment.Center,
+                Width = 6,
+                Height = 6,
+                Fill = new SolidColorBrush(ColText3),
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(0, 0, 4, 0)
+            };
+            textOut = new TextBlock
+            {
+                Text = name,
+                Foreground = new SolidColorBrush(ColText2),
+                FontFamily = new FontFamily("Consolas, monospace"),
+                FontSize = 10,
                 VerticalAlignment = VerticalAlignment.Center
             };
-            if (!string.IsNullOrEmpty(iconPath))
-            {
-                var ic = CreateVectorIcon(iconPath, iconColor, 11.5);
-                ic.Margin = new Thickness(0, 0, 5, 0);
-                stack.Children.Add(ic);
-            }
-            stack.Children.Add(new TextBlock
-            {
-                Text = label,
-                Foreground = new SolidColorBrush(ColText1),
-                FontSize = 11,
-                FontWeight = FontWeights.SemiBold,
-                VerticalAlignment = VerticalAlignment.Center
-            });
+            sp.Children.Add(dotOut);
+            sp.Children.Add(textOut);
+            return sp;
+        }
 
-            var b = new Border
+        private async Task RefreshAiPulseUiAsync(bool forceRefresh)
+        {
+            if (!_isConnected)
             {
-                Background = new SolidColorBrush(ColBg),
-                BorderBrush = new SolidColorBrush(borderColor),
-                BorderThickness = new Thickness(1),
-                CornerRadius = new CornerRadius(6),
-                Padding = new Thickness(8, 6, 8, 6),
-                Margin = margin,
-                Cursor = Cursors.Hand,
-                RenderTransformOrigin = new Point(0.5, 0.5),
-                RenderTransform = new ScaleTransform(1.0, 1.0),
-                Child = stack
-            };
-            AttachButtonPressAnimation(b);
-            b.MouseEnter += delegate { b.Background = new SolidColorBrush(ColSurfaceHover); };
-            b.MouseLeave += delegate { b.Background = new SolidColorBrush(ColBg); };
-            b.MouseLeftButtonUp += delegate { onClick(); };
-            return b;
+                RunOnUiThread(delegate
+                {
+                    if (_pulseDotGemini == null) return;
+                    SetAiPulsePillState(_pulseDotGemini, _pulseTextGemini, "Gemini", "idle", 0, 0);
+                    SetAiPulsePillState(_pulseDotClaude, _pulseTextClaude, "Claude", "idle", 0, 0);
+                    SetAiPulsePillState(_pulseDotOpenAi, _pulseTextOpenAi, "OpenAI", "idle", 0, 0);
+                });
+                return;
+            }
+            try
+            {
+                string raw = await PixelCoreService.QueryAiPulseV4JsonAsync(forceRefresh).ConfigureAwait(false);
+                var obj = MiniJson.Deserialize(raw) as Dictionary<string, object>;
+                var provs = obj != null ? MiniJson.GetDict(obj, "providers") : null;
+                if (provs == null) return;
+
+                RunOnUiThread(delegate
+                {
+                    if (_pulseDotGemini == null) return;
+                    ApplyProviderPulse(provs, "gemini", "Gemini", _pulseDotGemini, _pulseTextGemini);
+                    ApplyProviderPulse(provs, "claude", "Claude", _pulseDotClaude, _pulseTextClaude);
+                    ApplyProviderPulse(provs, "openai", "OpenAI", _pulseDotOpenAi, _pulseTextOpenAi);
+                });
+            }
+            catch { }
+        }
+
+        private void ApplyProviderPulse(Dictionary<string, object> provs, string key, string label, Ellipse dot, TextBlock tb)
+        {
+            var d = MiniJson.GetDict(provs, key);
+            string st = d != null ? (MiniJson.GetStr(d, "status") ?? "down") : "down";
+            int ms = d != null ? MiniJson.GetInt(d, "latency_ms", 0) : 0;
+            int code = d != null ? MiniJson.GetInt(d, "http_code", 0) : 0;
+            SetAiPulsePillState(dot, tb, label, st, code, ms);
+        }
+
+        private void SetAiPulsePillState(Ellipse dot, TextBlock tb, string label, string status, int httpCode, int ms)
+        {
+            if (dot == null || tb == null) return;
+            Color c = (status == "ok") ? ColGreen : ((status == "degraded") ? ColAmber : ((status == "down") ? ColRed : ColText3));
+            dot.Fill = new SolidColorBrush(c);
+            tb.Foreground = new SolidColorBrush(status == "idle" ? ColText3 : ColText1);
+            tb.ToolTip = status == "idle"
+                ? (label + ": туннель отключён")
+                : string.Format("{0}: {1} (HTTP {2}, {3} мс)", label, status.ToUpperInvariant(), httpCode, ms);
         }
 
         private TextBlock CreateSectionHeader(string text)
@@ -3038,59 +3179,6 @@ namespace PixelTunnel
             catch { return "7F8A9C1E"; }
         }
 
-        private async void TryOpenTelegramProxy()
-        {
-            try
-            {
-                if (!_isConnected)
-                {
-                    int plannedPort = _activeSocksPort > 0 ? _activeSocksPort : (LOCAL_MIXED_PORT + 1);
-                    var connectPrompt = MessageBox.Show(
-                        this,
-                        string.Format("Сейчас туннель не подключён — локальный прокси 127.0.0.1:{0} пока не активен.\n\nЗапустить туннель сейчас и затем открыть настройку прокси в Telegram Desktop?", plannedPort),
-                        "Telegram Proxy — запуск туннеля",
-                        MessageBoxButton.YesNo,
-                        MessageBoxImage.Question);
-                    if (connectPrompt == MessageBoxResult.Yes)
-                    {
-                        await StartTunnelInternalAsync();
-                        if (!_isConnected) return;
-                    }
-                    else
-                    {
-                        return;
-                    }
-                }
-
-                int socksPort = _activeSocksPort > 0 ? _activeSocksPort : (LOCAL_MIXED_PORT + 1);
-                var tgRes = MessageBox.Show(
-                    this,
-                    string.Format("Подключить Telegram Desktop к туннелю PixelTunnel (SOCKS5 127.0.0.1:{0})?\n\nОткроется окно Telegram с кнопкой «Включить прокси».", socksPort),
-                    "Telegram Proxy — 1 клик",
-                    MessageBoxButton.YesNo,
-                    MessageBoxImage.Question);
-                if (tgRes != MessageBoxResult.Yes) return;
-
-                string tgUrl = string.Format("tg://socks?server=127.0.0.1&port={0}", socksPort);
-                try
-                {
-                    using (var p = Process.Start(new ProcessStartInfo(tgUrl) { UseShellExecute = true })) { }
-                }
-                catch
-                {
-                    string manualSettings = string.Format("SOCKS5 127.0.0.1:{0}", socksPort);
-                    try { Clipboard.SetText(manualSettings); } catch { }
-                    MessageBox.Show(
-                        this,
-                        string.Format("Не удалось автоматически открыть tg:// (Telegram Desktop не установлен или схема tg:// не зарегистрирована).\n\nВведите настройки прокси вручную в Telegram Desktop:\n• Тип: SOCKS5\n• Сервер: 127.0.0.1\n• Порт: {0}\n\nСкопировано в буфер обмена: {1}", socksPort, manualSettings),
-                        "Ручная настройка Telegram Proxy",
-                        MessageBoxButton.OK,
-                        MessageBoxImage.Information);
-                }
-            }
-            catch { }
-        }
-
         private string EnsureAutoTrialKeyProvisioned(out int daysRemaining)
         {
             daysRemaining = 9999;
@@ -3498,6 +3586,8 @@ namespace PixelTunnel
                             _optCursorAi = flags.Contains("AI=1");
                             _optDiscordYt = flags.Contains("MEDIA=1");
                             _optSocialWeb = flags.Contains("WEB=1");
+                            _useSmartPacMode = !flags.Contains("PAC=0");
+                            _optWslBridge = flags.Contains("WSL=1");
                             var mReg = Regex.Match(flags, @"REG=(auto|nl|us)", RegexOptions.IgnoreCase);
                             if (mReg.Success)
                             {
@@ -3514,6 +3604,8 @@ namespace PixelTunnel
                             _optCursorAi = false;
                             _optDiscordYt = false;
                             _optSocialWeb = false;
+                            _useSmartPacMode = true;
+                            _optWslBridge = false;
                             migratedToV2 = true;
                         }
                         _optMcpTerminal = _optAntigravity;
@@ -3528,7 +3620,6 @@ namespace PixelTunnel
                     }
                 }
 
-                LoadCustomRulesIntoUi();
                 int daysLeft;
                 string autoTrialKey = EnsureAutoTrialKeyProvisioned(out daysLeft);
                 string curLoadedKey = _keyInput.Text ?? "";
@@ -3872,16 +3963,19 @@ namespace PixelTunnel
 
         private void SaveCurrentState()
         {
+            string savedKey = ReadFromUiThread(() => _keyInput != null ? (_keyInput.Text ?? "").Trim() : "", "");
             string[] data = new[]
             {
-                (_keyInput.Text ?? "").Trim(),
-                string.Format("V2=1;AG={0};MCP={1};AI={2};MEDIA={3};WEB={4};REG={5}",
+                savedKey,
+                string.Format("V2=1;AG={0};MCP={1};AI={2};MEDIA={3};WEB={4};REG={5};PAC={6};WSL={7}",
                     _optAntigravity ? 1 : 0,
                     _optMcpTerminal ? 1 : 0,
                     _optCursorAi ? 1 : 0,
                     _optDiscordYt ? 1 : 0,
                     _optSocialWeb ? 1 : 0,
-                    string.IsNullOrEmpty(_selectedRegion) ? "auto" : _selectedRegion)
+                    string.IsNullOrEmpty(_selectedRegion) ? "auto" : _selectedRegion,
+                    _useSmartPacMode ? 1 : 0,
+                    _optWslBridge ? 1 : 0)
             };
             try { File.WriteAllLines(_savedKeyPath, data, Encoding.UTF8); } catch { }
             try { File.WriteAllLines(GetFallbackSavedKeyPath(), data, Encoding.UTF8); } catch { }
@@ -3960,7 +4054,7 @@ namespace PixelTunnel
             }
             catch { }
 
-            // 2. Clean WPAD AutoConfigURL hijack if present (only local/pixel entries)
+            // 2. Clean WPAD AutoConfigURL hijack if present (only stale/unwanted local entries — keep active Smart PAC!)
             try
             {
                 using (var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Internet Settings", true))
@@ -3968,10 +4062,10 @@ namespace PixelTunnel
                     if (key != null && key.GetValue("AutoConfigURL", null) != null)
                     {
                         string wpad = Convert.ToString(key.GetValue("AutoConfigURL", ""));
-                        if (IsPixelOrLocalAutoConfig(wpad))
+                        if (IsPixelOrLocalAutoConfig(wpad) && !IsActivePixelSmartPacUrl(wpad))
                         {
                             key.DeleteValue("AutoConfigURL", false);
-                            fixedItems.Add(string.Format("Удалён перехват WPAD AutoConfigURL ({0})", wpad));
+                            fixedItems.Add(string.Format("Удалён устаревший WPAD AutoConfigURL ({0})", wpad));
                         }
                     }
                 }
@@ -4155,6 +4249,11 @@ namespace PixelTunnel
                 bool hasAuthErr = recentTail.IndexOf("UNAUTHENTICATED", StringComparison.OrdinalIgnoreCase) >= 0 ||
                                   recentTail.IndexOf("invalid_grant", StringComparison.OrdinalIgnoreCase) >= 0;
 
+                bool hasNetTimeout = recentTail.IndexOf("TLS handshake timeout", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                     recentTail.IndexOf("context deadline exceeded", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                     recentTail.IndexOf("connection refused", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                     recentTail.IndexOf("actively refused", StringComparison.OrdinalIgnoreCase) >= 0;
+
                 if (hasRegionErr && minsAgo < 10)
                 {
                     dotColor = ColAmber;
@@ -4172,6 +4271,12 @@ namespace PixelTunnel
                     dotColor = ColAmber;
                     statusBanner = "Сессия Google в IDE истекла (401) • Перезайдите в аккаунт в Antigravity";
                     diagLines.Add("  ⚠ [ЛОГ ANTIGRAVITY] Токен авторизации устарел (401 Unauthenticated). Перезайдите в аккаунт Google внутри Antigravity IDE.");
+                }
+                else if (hasNetTimeout && minsAgo < 5)
+                {
+                    dotColor = ColRed;
+                    statusBanner = string.Format("Таймаут сети в Antigravity ({0}) • Нажмите «Проверить и починить»", recency);
+                    diagLines.Add("  ✗ [ТАЙМАУТ СЕТИ В IDE] В логе language_server зафиксирован TLS handshake timeout / обрыв связи с Google (" + recency + "). Нажмите «Проверить и починить» для перевода IDE на рабочий маршрут.");
                 }
                 else
                 {
@@ -4285,16 +4390,22 @@ namespace PixelTunnel
                 string agExe = DiscoverAntigravityExePath();
                 if (string.IsNullOrEmpty(agExe) || !File.Exists(agExe))
                 {
-                    SetStatus(ColAmber, "Antigravity.exe не найден", "Запустите Antigravity IDE один раз вручную, чтобы определить путь установки.");
+                    RunOnUiThread(delegate
+                    {
+                        SetStatus(ColAmber, "Antigravity.exe не найден", "Запустите Antigravity IDE один раз вручную, чтобы определить путь установки.");
+                    });
                     return;
                 }
 
-                if (_agLeakGuardBanner != null) _agLeakGuardBanner.Visibility = Visibility.Collapsed;
-                if (_aiTelemetryText != null)
+                RunOnUiThread(delegate
                 {
-                    _aiTelemetryDot.Fill = new SolidColorBrush(ColAmber);
-                    _aiTelemetryText.Text = "Мягкий перезапуск Antigravity внутри туннеля PWP-3...";
-                }
+                    if (_agLeakGuardBanner != null) _agLeakGuardBanner.Visibility = Visibility.Collapsed;
+                    if (_aiTelemetryText != null)
+                    {
+                        if (_aiTelemetryDot != null) _aiTelemetryDot.Fill = new SolidColorBrush(ColAmber);
+                        _aiTelemetryText.Text = "Мягкий перезапуск Antigravity внутри туннеля PWP-3...";
+                    }
+                });
 
                 int port = _activeHttpPort;
                 await Task.Run(() =>
@@ -4347,20 +4458,27 @@ namespace PixelTunnel
 
                 _agRelaunchedForPort = port;
                 _agBannerDismissed = true;
-                SetStatus(
-                    ColGreen,
-                    "Antigravity перезапущен в защищённом туннеле",
-                    string.Format("Шлюз :{0} (PWP-3 0-RTT) + защита от утечек QUIC/WebRTC активны", port)
-                );
-                if (_aiTelemetryText != null)
+                RunOnUiThread(delegate
                 {
-                    _aiTelemetryDot.Fill = new SolidColorBrush(ColGreen);
-                    _aiTelemetryText.Text = string.Format("Antigravity IDE запущен с AG_LS_PROXY=:{0} и --disable-quic [OK]", port);
-                }
+                    SetStatus(
+                        ColGreen,
+                        "Antigravity перезапущен в защищённом туннеле",
+                        string.Format("Шлюз :{0} (PWP-3 0-RTT) + защита от утечек QUIC/WebRTC активны", port)
+                    );
+                    if (_aiTelemetryText != null)
+                    {
+                        if (_aiTelemetryDot != null) _aiTelemetryDot.Fill = new SolidColorBrush(ColGreen);
+                        _aiTelemetryText.Text = string.Format("Antigravity IDE запущен с AG_LS_PROXY=:{0} и --disable-quic [OK]", port);
+                    }
+                });
             }
             catch (Exception ex)
             {
-                SetStatus(ColAmber, "Не удалось перезапустить Antigravity", ex.Message);
+                string errMsg = ex.Message;
+                RunOnUiThread(delegate
+                {
+                    SetStatus(ColAmber, "Не удалось перезапустить Antigravity", errMsg);
+                });
             }
         }
 
@@ -4371,7 +4489,10 @@ namespace PixelTunnel
                 if (!_optDiscordYt)
                 {
                     _optDiscordYt = true;
-                    UpdateCheckboxVisual(_chkBoxMedia, _chkMarkMedia, _iconBoxMedia, true, true);
+                    RunOnUiThread(delegate
+                    {
+                        UpdateCheckboxVisual(_chkBoxMedia, _chkMarkMedia, _iconBoxMedia, true, true);
+                    });
                     SaveCurrentState();
                     if (_isConnected)
                     {
@@ -4408,16 +4529,22 @@ namespace PixelTunnel
 
                 if (string.IsNullOrEmpty(updateExe))
                 {
-                    SetStatus(ColAmber, "Клиент Discord не найден", "Установите десктопный Discord в стандартную папку AppData\\Local\\Discord.");
+                    RunOnUiThread(delegate
+                    {
+                        SetStatus(ColAmber, "Клиент Discord не найден", "Установите десктопный Discord в стандартную папку AppData\\Local\\Discord.");
+                    });
                     return;
                 }
 
                 int socksPort = _activeSocksPort;
-                if (_aiTelemetryText != null)
+                RunOnUiThread(delegate
                 {
-                    _aiTelemetryDot.Fill = new SolidColorBrush(ColBlue);
-                    _aiTelemetryText.Text = string.Format("Перезапуск Discord через SOCKS5 UDP ASSOCIATE (127.0.0.1:{0})...", socksPort);
-                }
+                    if (_aiTelemetryText != null)
+                    {
+                        if (_aiTelemetryDot != null) _aiTelemetryDot.Fill = new SolidColorBrush(ColBlue);
+                        _aiTelemetryText.Text = string.Format("Перезапуск Discord через SOCKS5 UDP ASSOCIATE (127.0.0.1:{0})...", socksPort);
+                    }
+                });
 
                 await Task.Run(() =>
                 {
@@ -4438,23 +4565,30 @@ namespace PixelTunnel
                         WorkingDirectory = System.IO.Path.GetDirectoryName(updateExe),
                         UseShellExecute = false
                     };
-                    Process.Start(psi);
+                    using (var proc = Process.Start(psi)) { }
                 });
 
-                SetStatus(
-                    ColGreen,
-                    "Discord запущен с поддержкой голоса (SOCKS5 UDP)",
-                    string.Format("Голосовые каналы и стримы идут через PWP-3 UDP-шлюз 127.0.0.1:{0} без драйвера Wintun", socksPort)
-                );
-                if (_aiTelemetryText != null)
+                RunOnUiThread(delegate
                 {
-                    _aiTelemetryDot.Fill = new SolidColorBrush(ColGreen);
-                    _aiTelemetryText.Text = string.Format("Discord UDP активен на 127.0.0.1:{0} • Голос и стрим работают без Wintun", socksPort);
-                }
+                    SetStatus(
+                        ColGreen,
+                        "Discord запущен с поддержкой голоса (SOCKS5 UDP)",
+                        string.Format("Голосовые каналы и стримы идут через PWP-3 UDP-шлюз 127.0.0.1:{0} без драйвера Wintun", socksPort)
+                    );
+                    if (_aiTelemetryText != null)
+                    {
+                        if (_aiTelemetryDot != null) _aiTelemetryDot.Fill = new SolidColorBrush(ColGreen);
+                        _aiTelemetryText.Text = string.Format("Discord UDP активен на 127.0.0.1:{0} • Голос и стрим работают без Wintun", socksPort);
+                    }
+                });
             }
             catch (Exception ex)
             {
-                SetStatus(ColAmber, "Ошибка запуска Discord UDP", ex.Message);
+                string errMsg = ex.Message;
+                RunOnUiThread(delegate
+                {
+                    SetStatus(ColAmber, "Ошибка запуска Discord UDP", errMsg);
+                });
             }
         }
 
@@ -5180,28 +5314,72 @@ namespace PixelTunnel
             return InsertPropIntoJsonObject(json, propKeyVal, "  ");
         }
 
+        private static string BuildSmartPacUrl()
+        {
+            return string.Format("http://127.0.0.1:{0}/proxy.pac?r={1}", _activeHttpPort, Math.Max(1, PixelCoreService.ActivePacRevision));
+        }
+
+        private static bool ShouldEnableBrowserProxy()
+        {
+            return _useSmartPacMode || _optMcpTerminal; // overridden cleanly below via instance helper
+        }
+
+        private bool ShouldEnableSystemWideBrowserProxy()
+        {
+            return _useSmartPacMode || _optCursorAi || _optDiscordYt || _optSocialWeb || _oauthHelperActive;
+        }
+
+        private void ApplyConnectedProxyPolicy()
+        {
+            if (ShouldEnableSystemWideBrowserProxy())
+            {
+                EnableSystemProxy();
+            }
+            else
+            {
+                DisableOrRestoreSystemProxy();
+                string proxyUrl = string.Format("http://127.0.0.1:{0}", _activeHttpPort);
+                Environment.SetEnvironmentVariable("AG_LS_PROXY", proxyUrl, EnvironmentVariableTarget.User);
+                Environment.SetEnvironmentVariable("AG_LS_PROXY", proxyUrl, EnvironmentVariableTarget.Process);
+                BroadcastEnvironmentChange();
+            }
+        }
+
         private static void EnableSystemProxy()
         {
             try
             {
                 string proxySrv = string.Format("127.0.0.1:{0}", _activeHttpPort);
                 string proxyOvr = BuildEffectiveProxyOverride();
+                string pacUrl = BuildSmartPacUrl();
+
                 using (var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Internet Settings", true))
                 {
                     if (key != null)
                     {
-                        key.SetValue("ProxyEnable", 1, RegistryValueKind.DWord);
-                        key.SetValue("ProxyServer", proxySrv, RegistryValueKind.String);
-                        key.SetValue("ProxyOverride", proxyOvr, RegistryValueKind.String);
-                        object autoCfgObj = key.GetValue("AutoConfigURL", null);
-                        if (autoCfgObj != null && IsPixelOrLocalAutoConfig(Convert.ToString(autoCfgObj)))
+                        if (_useSmartPacMode)
                         {
-                            key.DeleteValue("AutoConfigURL", false);
+                            key.SetValue("ProxyEnable", 0, RegistryValueKind.DWord);
+                            key.SetValue("AutoConfigURL", pacUrl, RegistryValueKind.String);
+                        }
+                        else
+                        {
+                            key.SetValue("ProxyEnable", 1, RegistryValueKind.DWord);
+                            key.SetValue("ProxyServer", proxySrv, RegistryValueKind.String);
+                            key.SetValue("ProxyOverride", proxyOvr, RegistryValueKind.String);
+                            object autoCfgObj = key.GetValue("AutoConfigURL", null);
+                            if (autoCfgObj != null && IsPixelOrLocalAutoConfig(Convert.ToString(autoCfgObj)))
+                            {
+                                key.DeleteValue("AutoConfigURL", false);
+                            }
                         }
                     }
                 }
                 SetProxyResetRunOnceGuard(true);
-                ApplyWinInetPerConnectionProxy(true, proxySrv, proxyOvr);
+                if (_useSmartPacMode)
+                    ApplyWinInetPerConnectionProxy(true, "", "", pacUrl);
+                else
+                    ApplyWinInetPerConnectionProxy(true, proxySrv, proxyOvr, "");
 
                 PurgeGlobalCliProxyEnvVars();
                 string proxyUrl = string.Format("http://127.0.0.1:{0}", _activeHttpPort);
@@ -5212,16 +5390,177 @@ namespace PixelTunnel
             catch { }
         }
 
+        private static void UpdateForeign7890DeadState(bool isDead)
+        {
+            _foreign7890UpstreamDead = isDead;
+            Interlocked.Exchange(ref _foreign7890DeadCheckedTicks, DateTime.UtcNow.Ticks);
+        }
+
+        private static bool IsForeign7890CachedDead()
+        {
+            if (!_foreign7890UpstreamDead) return false;
+            long checkedTicks = Interlocked.Read(ref _foreign7890DeadCheckedTicks);
+            if (checkedTicks <= 0) return false;
+            return (DateTime.UtcNow.Ticks - checkedTicks) < TimeSpan.FromSeconds(15).Ticks;
+        }
+
+        private static int TryExtractLoopbackProxyPort(string proxySpec)
+        {
+            if (string.IsNullOrWhiteSpace(proxySpec)) return 0;
+            try
+            {
+                string[] parts = proxySpec.Split(';');
+                foreach (string rawPart in parts)
+                {
+                    string part = rawPart.Trim();
+                    if (part.Length == 0) continue;
+                    int eq = part.IndexOf('=');
+                    if (eq >= 0) part = part.Substring(eq + 1).Trim();
+                    part = Regex.Replace(part, "^https?://", "", RegexOptions.IgnoreCase);
+                    int slash = part.IndexOf('/');
+                    if (slash >= 0) part = part.Substring(0, slash);
+                    if (part.StartsWith("127.0.0.1:", StringComparison.OrdinalIgnoreCase) ||
+                        part.StartsWith("localhost:", StringComparison.OrdinalIgnoreCase))
+                    {
+                        int col = part.LastIndexOf(':');
+                        int port;
+                        if (col >= 0 && int.TryParse(part.Substring(col + 1), out port) && port > 0 && port <= 65535)
+                        {
+                            return port;
+                        }
+                    }
+                }
+            }
+            catch { }
+            return 0;
+        }
+
+        /// <summary>
+        /// Probes a local proxy (e.g., foreign 127.0.0.1:7890) for a working upstream TLS path
+        /// within a short timeout so a listening blackhole proxy is detected immediately.
+        /// </summary>
+        private static bool ProbeLocalProxyUpstreamHealthy(int port, int timeoutMs = 1800)
+        {
+            if (port <= 0 || port > 65535) return false;
+            int budgetMs = Math.Max(400, timeoutMs);
+            TcpClient tcp = new TcpClient();
+            try
+            {
+                tcp.NoDelay = true;
+                tcp.ReceiveTimeout = budgetMs;
+                tcp.SendTimeout = budgetMs;
+
+                using (var cts = new CancellationTokenSource(budgetMs))
+                using (cts.Token.Register(delegate { try { tcp.Close(); } catch { } }))
+                {
+                    IAsyncResult ar = tcp.BeginConnect("127.0.0.1", port, null, null);
+                    WaitHandle wh = ar.AsyncWaitHandle;
+                    try
+                    {
+                        if (!wh.WaitOne(Math.Min(budgetMs, 500)))
+                        {
+                            try { tcp.Close(); } catch { }
+                            return false;
+                        }
+                        tcp.EndConnect(ar);
+                    }
+                    finally
+                    {
+                        try { wh.Close(); } catch { }
+                    }
+
+                    NetworkStream ns = tcp.GetStream();
+                    ns.ReadTimeout = budgetMs;
+                    ns.WriteTimeout = budgetMs;
+
+                    byte[] req = Encoding.ASCII.GetBytes(
+                        "CONNECT daily-cloudcode-pa.googleapis.com:443 HTTP/1.1\r\n" +
+                        "Host: daily-cloudcode-pa.googleapis.com:443\r\n" +
+                        "Proxy-Connection: keep-alive\r\n\r\n");
+                    ns.Write(req, 0, req.Length);
+                    ns.Flush();
+
+                    byte[] hdrBuf = new byte[2048];
+                    int total = 0;
+                    bool gotHdrEnd = false;
+                    while (total < hdrBuf.Length)
+                    {
+                        int n = ns.Read(hdrBuf, total, hdrBuf.Length - total);
+                        if (n <= 0) break;
+                        total += n;
+                        string soFar = Encoding.ASCII.GetString(hdrBuf, 0, total);
+                        if (soFar.IndexOf("\r\n\r\n", StringComparison.Ordinal) >= 0)
+                        {
+                            gotHdrEnd = true;
+                            break;
+                        }
+                    }
+
+                    if (!gotHdrEnd || total < 12) return false;
+                    string statusText = Encoding.ASCII.GetString(hdrBuf, 0, total);
+                    int lineEnd = statusText.IndexOf('\n');
+                    string statusLine = lineEnd >= 0 ? statusText.Substring(0, lineEnd).Trim() : statusText.Trim();
+                    if (!Regex.IsMatch(statusLine, @"^HTTP/\d\.\d\s+200\b", RegexOptions.IgnoreCase))
+                    {
+                        return false;
+                    }
+
+                    using (var ssl = new SslStream(ns, true, delegate { return true; }))
+                    {
+                        ssl.ReadTimeout = budgetMs;
+                        ssl.WriteTimeout = budgetMs;
+                        ssl.AuthenticateAsClient("daily-cloudcode-pa.googleapis.com");
+                    }
+                    return true;
+                }
+            }
+            catch
+            {
+                return false;
+            }
+            finally
+            {
+                try { tcp.Close(); } catch { }
+                try { ((IDisposable)tcp).Dispose(); } catch { }
+            }
+        }
+
         private static void DisableOrRestoreSystemProxy()
         {
             try
             {
-                bool has7890 = IsLocalPortOpen(7890, 150);
+                bool has7890 = _activeHttpPort != 7890 && IsLocalPortOpen(7890, 150);
+                if (has7890)
+                {
+                    if (IsForeign7890CachedDead())
+                    {
+                        has7890 = false;
+                    }
+                    else
+                    {
+                        bool upstreamOk = ProbeLocalProxyUpstreamHealthy(7890, 1600);
+                        UpdateForeign7890DeadState(!upstreamOk);
+                        if (!upstreamOk)
+                        {
+                            has7890 = false;
+                        }
+                    }
+                }
+                else
+                {
+                    UpdateForeign7890DeadState(false);
+                }
+
                 string proxyOvr = BuildEffectiveProxyOverride();
                 using (var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Internet Settings", true))
                 {
                     if (key != null)
                     {
+                        object autoCfgObj = key.GetValue("AutoConfigURL", null);
+                        if (autoCfgObj != null && IsPixelOrLocalAutoConfig(Convert.ToString(autoCfgObj)))
+                        {
+                            key.DeleteValue("AutoConfigURL", false);
+                        }
                         if (has7890)
                         {
                             key.SetValue("ProxyEnable", 1, RegistryValueKind.DWord);
@@ -5231,10 +5570,15 @@ namespace PixelTunnel
                         else
                         {
                             key.SetValue("ProxyEnable", 0, RegistryValueKind.DWord);
+                            string existingSrv = Convert.ToString(key.GetValue("ProxyServer", ""));
+                            if (TryExtractLoopbackProxyPort(existingSrv) == 7890)
+                            {
+                                key.DeleteValue("ProxyServer", false);
+                            }
                         }
                     }
                 }
-                ApplyWinInetPerConnectionProxy(has7890, has7890 ? "127.0.0.1:7890" : "", has7890 ? proxyOvr : "");
+                ApplyWinInetPerConnectionProxy(has7890, has7890 ? "127.0.0.1:7890" : "", has7890 ? proxyOvr : "", "");
                 SetProxyResetRunOnceGuard(false);
 
                 PurgeGlobalCliProxyEnvVars();
@@ -5354,43 +5698,61 @@ namespace PixelTunnel
         // ====================================================================
         private async void StartTunnelAsync()
         {
-            await StartTunnelInternalAsync();
+            try
+            {
+                await StartTunnelInternalAsync();
+            }
+            catch (Exception ex)
+            {
+                string errMsg = ex.Message;
+                StopTunnelProcess(false);
+                RunOnUiThread(delegate
+                {
+                    SetStatus(ColRed, "Ошибка запуска (Прямой интернет сохранён)", errMsg);
+                    ResetButtonState(false);
+                });
+            }
         }
 
         private async Task StartTunnelInternalAsync()
         {
-            string rawKey = (_keyInput.Text ?? "").Trim();
-            if (string.IsNullOrEmpty(rawKey))
-            {
-                int dLeft;
-                rawKey = EnsureAutoTrialKeyProvisioned(out dLeft);
-                _keyInput.Text = rawKey;
-            }
-
-            if (!_optAntigravity && !_optCursorAi && !_optDiscordYt && !_optSocialWeb)
-            {
-                SetStatus(ColAmber, "Выберите хотя бы одну категорию", "Отметьте Antigravity IDE или другие сервисы для маршрутизации.");
-                return;
-            }
-
-            if (!IsAdministrator() && !_preferSafeProxyMode)
-            {
-                RelaunchAsAdmin("--autoconnect");
-                if (!_preferSafeProxyMode) return;
-            }
-
-            SaveCurrentState();
-            _isBusy = true;
-            _actionBtnText.Text = "Подключение...";
-            if (_actionBtnIconHolder != null)
-            {
-                _actionBtnIconHolder.Content = CreateSpinningIcon(ColBg, 14);
-            }
-
-            SetStatus(ColAmber, "Запуск и проверка канала...", "Проверка портов, остановка конфликтов и тест сквозного соединения...");
-
             try
             {
+                string rawKey = ReadFromUiThread(() => _keyInput != null ? (_keyInput.Text ?? "").Trim() : "", "");
+                if (string.IsNullOrEmpty(rawKey))
+                {
+                    int dLeft;
+                    rawKey = EnsureAutoTrialKeyProvisioned(out dLeft);
+                    RunOnUiThreadSync(delegate { if (_keyInput != null) _keyInput.Text = rawKey; });
+                }
+
+                if (!_optAntigravity && !_optCursorAi && !_optDiscordYt && !_optSocialWeb)
+                {
+                    RunOnUiThread(delegate
+                    {
+                        SetStatus(ColAmber, "Выберите хотя бы одну категорию", "Отметьте Antigravity IDE или другие сервисы для маршрутизации.");
+                    });
+                    return;
+                }
+
+                if (!IsAdministrator() && !_preferSafeProxyMode)
+                {
+                    RunOnUiThreadSync(delegate { RelaunchAsAdmin("--autoconnect"); });
+                    if (!_preferSafeProxyMode) return;
+                }
+
+                SaveCurrentState();
+                _isBusy = true;
+                RunOnUiThread(delegate
+                {
+                    if (_actionBtnText != null) _actionBtnText.Text = "Подключение...";
+                    if (_actionBtnIconHolder != null)
+                    {
+                        _actionBtnIconHolder.Content = CreateSpinningIcon(ColBg, 14);
+                    }
+                    SetStatus(ColAmber, "Запуск и проверка канала...", "Проверка портов, остановка конфликтов и тест сквозного соединения...");
+                });
+
                 string vlessUri = rawKey;
                 if (rawKey.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
                     rawKey.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
@@ -5398,8 +5760,11 @@ namespace PixelTunnel
                     vlessUri = await Task.Run(() => FetchVlessFromSubscription(rawKey));
                     if (string.IsNullOrEmpty(vlessUri))
                     {
-                        SetStatus(ColRed, "Не удалось загрузить подписку", "Проверьте интернет или вставьте прямой ключ vless:// из бота.");
-                        ResetButtonState(false);
+                        RunOnUiThread(delegate
+                        {
+                            SetStatus(ColRed, "Не удалось загрузить подписку", "Проверьте интернет или вставьте прямой ключ vless:// из бота.");
+                            ResetButtonState(false);
+                        });
                         return;
                     }
                 }
@@ -5408,16 +5773,18 @@ namespace PixelTunnel
                 bool isFreePwp3 = node != null && string.Equals(node.TransportType, "pwp3", StringComparison.OrdinalIgnoreCase);
                 if (node == null || string.IsNullOrEmpty(node.Server) || (!isFreePwp3 && string.IsNullOrEmpty(node.Uuid)))
                 {
-                    SetStatus(ColRed, "Ошибка чтения ключа", "Проверьте, что скопировали полный ключ vless:// из Telegram-\u0431\u043e\u0442\u0435.");
-                    ResetButtonState(false);
+                    RunOnUiThread(delegate
+                    {
+                        SetStatus(ColRed, "Ошибка чтения ключа", "Проверьте, что скопировали полный ключ vless:// из Telegram-\u0431\u043e\u0442\u0430.");
+                        ResetButtonState(false);
+                    });
                     return;
                 }
 
                 _activeNode = node;
 
                 int pingMs = await Task.Run(() => MeasureTcpPing(node.Server, node.Port));
-                bool isClusterHost = string.Equals(node.Server, GetDefaultClusterHost(), StringComparison.OrdinalIgnoreCase) ||
-                                     string.Equals(node.Server, "201.34.152.97", StringComparison.OrdinalIgnoreCase);
+                bool isClusterHost = IsClusterHost(node.Server);
                 if (pingMs < 0 && isClusterHost)
                 {
                     pingMs = await Task.Run(() => MeasureTcpPing(node.Server, 443));
@@ -5430,8 +5797,11 @@ namespace PixelTunnel
 
                 if (pingMs < 0 && isCustomKey)
                 {
-                    SetStatus(ColRed, "Сервер недоступен", string.Format("Нет ответа от {0}:{1}. Нажмите «Умная диагностика».", node.Server, node.Port));
-                    ResetButtonState(false);
+                    RunOnUiThread(delegate
+                    {
+                        SetStatus(ColRed, "Сервер недоступен", string.Format("Нет ответа от {0}:{1}. Нажмите «Диагностика».", node.Server, node.Port));
+                        ResetButtonState(false);
+                    });
                     return;
                 }
 
@@ -5446,6 +5816,7 @@ namespace PixelTunnel
                 {
                     StopConflictingVpnAndApplyFixes();
                     portRelocationNote = EnsureAvailableLocalPorts();
+                    EnsureManifestSecretsForConfig(3500);
 
                     string jsonConfig = BuildSingBoxConfig(node, _optAntigravity, _optCursorAi, _optDiscordYt, _optSocialWeb, false);
                     ApplyAndStartCoreConfig(jsonConfig);
@@ -5475,8 +5846,11 @@ namespace PixelTunnel
                 if (!string.IsNullOrEmpty(licError))
                 {
                     StopTunnelProcess(false);
-                    ApplyLicenseErrorToUi(licError);
-                    ResetButtonState(false);
+                    RunOnUiThread(delegate
+                    {
+                        ApplyLicenseErrorToUi(licError);
+                        ResetButtonState(false);
+                    });
                     return;
                 }
 
@@ -5484,20 +5858,7 @@ namespace PixelTunnel
 
                 if ((PixelCoreService.IsRunning || (_coreProcess != null && !_coreProcess.HasExited)) && IsLocalPortOpen(_activeHttpPort, 250) && finalTunnelOk)
                 {
-                    if (_optCursorAi || _optDiscordYt || _optSocialWeb)
-                    {
-                        EnableSystemProxy();
-                    }
-                    else
-                    {
-                        // "Only Antigravity IDE" mode: do NOT hijack Windows system-wide proxy!
-                        // Only set AG_LS_PROXY and IDE settings so browsers/games/apps stay 100% direct.
-                        DisableOrRestoreSystemProxy();
-                        string proxyUrl = string.Format("http://127.0.0.1:{0}", _activeHttpPort);
-                        Environment.SetEnvironmentVariable("AG_LS_PROXY", proxyUrl, EnvironmentVariableTarget.User);
-                        Environment.SetEnvironmentVariable("AG_LS_PROXY", proxyUrl, EnvironmentVariableTarget.Process);
-                        BroadcastEnvironmentChange();
-                    }
+                    ApplyConnectedProxyPolicy();
                     FlushWindowsDnsCache();
                     await Task.Run(() =>
                     {
@@ -5508,27 +5869,34 @@ namespace PixelTunnel
 
                     _isConnected = true;
                     _tunnelConnectedUtc = DateTime.UtcNow;
+                    var unusedPulseOnConn = RefreshAiPulseUiAsync(true);
                     _agBannerDismissed = false;
                     int shownMs = PixelCoreService.ActiveNodeLatencyMs > 0 ? PixelCoreService.ActiveNodeLatencyMs : (pingMs > 0 ? pingMs : 28);
                     string regTag = string.Equals(_selectedRegion, "us", StringComparison.OrdinalIgnoreCase) && PixelCoreService.IsRegionAvailable("us") ? "US" : "NL";
-                    _pingLabel.Text = string.Format("{0} • {1} мс", regTag, shownMs);
-                    _pingLabel.Foreground = new SolidColorBrush(ColGreen);
-
-                    string modeBadge = string.Format("PWP-3 Dual-Mux :{0}", _activeHttpPort);
+                    string modeBadge = string.Format("{0} :{1}", PixelCoreService.UsingGoEngine ? "Go uTLS Chrome" : "PWP-3 Dual-Mux", _activeHttpPort);
                     string codeShown = IsHttpCodeHealthy(agHttpCode) ? agHttpCode : gstaticCode;
 
-                    SetStatus(
-                        ColGreen,
-                        "Туннель активен • PWP-3 0-RTT & Вход из-под санкций",
-                        string.Format("{0} • CloudCode HTTP {1} [OK] • Сайты .RU напрямую", modeBadge, codeShown)
-                    );
-                    ResetButtonState(true);
-                    UpdateLicenseHintFromServer();
-                    CheckSignedManifestUpdateUi();
-                    RefreshAiTelemetryBanner();
-                    CheckAntigravityPreTunnelState();
+                    RunOnUiThread(delegate
+                    {
+                        if (_pingLabel != null)
+                        {
+                            _pingLabel.Text = string.Format("{0} • {1} мс", regTag, shownMs);
+                            _pingLabel.Foreground = new SolidColorBrush(ColGreen);
+                        }
 
-                    Task.Run(async delegate
+                        SetStatus(
+                            ColGreen,
+                            "Туннель активен • PWP-3 0-RTT & Вход из-под санкций",
+                            string.Format("{0} • CloudCode HTTP {1} [OK] • Сайты .RU напрямую", modeBadge, codeShown)
+                        );
+                        ResetButtonState(true);
+                        UpdateLicenseHintFromServer();
+                        CheckSignedManifestUpdateUi();
+                        RefreshAiTelemetryBanner();
+                        CheckAntigravityPreTunnelState();
+                    });
+
+                    var unusedBgManifest = Task.Run(async delegate
                     {
                         try
                         {
@@ -5536,7 +5904,7 @@ namespace PixelTunnel
                             if (_isConnected)
                             {
                                 CheckForGitHubUpdateAsync();
-                                Dispatcher.BeginInvoke(new Action(delegate { CheckSignedManifestUpdateUi(); }));
+                                RunOnUiThread(delegate { CheckSignedManifestUpdateUi(); });
                             }
                         }
                         catch { }
@@ -5545,20 +5913,48 @@ namespace PixelTunnel
                 else
                 {
                     // ZERO-BLACKHOLE GUARD: Never leave a broken tunnel or proxy active!
+                    string goReason = PixelCoreService.GoEngineFallbackReason;
+                    string connErr = PixelCoreService.LastConnectError;
+                    bool localPortUp = IsLocalPortOpen(_activeHttpPort, 100);
                     StopTunnelProcess(false);
-                    SetStatus(
-                        ColRed,
-                        "Туннель не пропускает трафик (Сеть сохранена)",
-                        "Прямой интернет не затронут. Нажмите «Умная диагностика» для авто-исправления."
-                    );
-                    ResetButtonState(false);
+
+                    string failTitle;
+                    string failSub;
+                    if (!localPortUp)
+                    {
+                        failTitle = "Не удалось запустить локальный шлюз";
+                        failSub = !string.IsNullOrEmpty(goReason)
+                            ? string.Format("Причина: {0}. Прямой интернет сохранён.", goReason)
+                            : "Ядро не открыло локальный порт. Нажмите «Диагностика» для проверки.";
+                    }
+                    else if (!string.IsNullOrEmpty(connErr) || !string.IsNullOrEmpty(goReason))
+                    {
+                        string detail = !string.IsNullOrEmpty(connErr) ? connErr : goReason;
+                        failTitle = "Туннель не пропускает трафик (Сеть сохранена)";
+                        failSub = string.Format("Причина: {0}. Нажмите «Диагностика» для авто-исправления.", detail);
+                    }
+                    else
+                    {
+                        failTitle = "Туннель не пропускает трафик (Сеть сохранена)";
+                        failSub = "Прямой интернет не затронут. Нажмите «Диагностика» для авто-исправления.";
+                    }
+
+                    RunOnUiThread(delegate
+                    {
+                        SetStatus(ColRed, failTitle, failSub);
+                        ResetButtonState(false);
+                    });
                 }
             }
             catch (Exception ex)
             {
+                string errMsg = ex.Message;
                 StopTunnelProcess(false);
-                SetStatus(ColRed, "Ошибка запуска (Прямой интернет сохранён)", ex.Message);
-                ResetButtonState(false);
+                RunOnUiThread(delegate
+                {
+                    SetStatus(ColRed, "Ошибка запуска (Прямой интернет сохранён)", errMsg);
+                    ResetButtonState(false);
+                });
             }
         }
 
@@ -5594,15 +5990,14 @@ namespace PixelTunnel
                 File.WriteAllText(_activeConfigPath, jsonConfig, new UTF8Encoding(false));
             }
             catch { }
-            PixelCoreService.StartServiceFromJson(jsonConfig);
+            PixelCoreService.StartServiceFromJson(jsonConfig, _activeConfigPath);
         }
 
         private void StopTunnelProcess(bool updateUi = true)
         {
-            if (_oauthHelperActive)
-            {
-                StopGoogleOAuthHelperMode(true);
-            }
+            bool wasOAuthHelperActive = _oauthHelperActive;
+            _oauthHelperActive = false;
+
             DisableOrRestoreSystemProxy();
             PixelCoreService.StopService();
 
@@ -5620,20 +6015,34 @@ namespace PixelTunnel
 
             _coreProcess = null;
             _isConnected = false;
-            if (_agLeakGuardBanner != null) _agLeakGuardBanner.Visibility = Visibility.Collapsed;
 
-            if (updateUi)
+            RunOnUiThread(delegate
             {
-                ResetButtonState(false);
-                _pingLabel.Text = "PWP-3 MUX";
-                _pingLabel.Foreground = new SolidColorBrush(ColText3);
-                SetStatus(ColText3, "Туннель остановлен", "Бесплатный анлокер готов • Нажмите «Запустить туннель» или «Умная диагностика»");
-                RefreshAiTelemetryBanner();
-            }
+                if (wasOAuthHelperActive)
+                {
+                    if (_oauthHelperTimer != null)
+                    {
+                        try { _oauthHelperTimer.Stop(); } catch { }
+                    }
+                    if (_btnOAuthHelperText != null) _btnOAuthHelperText.Text = "Вход в Google (90с)";
+                    if (_btnOAuthHelperBorder != null) _btnOAuthHelperBorder.BorderBrush = new SolidColorBrush(ColBlue);
+                }
+                if (_agLeakGuardBanner != null) _agLeakGuardBanner.Visibility = Visibility.Collapsed;
+
+                if (updateUi)
+                {
+                    ResetButtonState(false);
+                    _pingLabel.Text = "PWP-3 MUX";
+                    _pingLabel.Foreground = new SolidColorBrush(ColText3);
+                    SetStatus(ColText3, "Туннель остановлен", "Бесплатный анлокер готов • Нажмите «Запустить туннель» или «Умная диагностика»");
+                    RefreshAiTelemetryBanner();
+                }
+            });
+            var unusedPulseStop = RefreshAiPulseUiAsync(false);
         }
 
         // ====================================================================
-        // SMART DIAGNOSTICS v3.0 HELPERS: HOSTS DOCTOR, OAUTH GUARD & PASSPORT
+        // SMART DIAGNOSTICS HELPERS: HOSTS DOCTOR, OAUTH GUARD & PASSPORT
         // ====================================================================
         public static List<string> ScanAndHealPoisonedHostsFile(string customHostsPath, bool attemptAutoComment, out int poisonedCount, out bool healedByWrite)
         {
@@ -5740,79 +6149,101 @@ namespace PixelTunnel
 
         private async void ToggleGoogleOAuthHelperModeAsync()
         {
-            if (_oauthHelperActive)
+            try
             {
-                StopGoogleOAuthHelperMode(false);
-                return;
-            }
-
-            if (!_isConnected && !_isBusy)
-            {
-                await StartTunnelInternalAsync();
-                if (!_isConnected) return;
-            }
-
-            _oauthHelperActive = true;
-            _oauthHelperSecondsLeft = 90;
-
-            await Task.Run(() =>
-            {
-                try
-                {
-                    if (_activeNode != null)
-                    {
-                        // На 90 сек включаем маршрутизацию браузера для Google OAuth с жёстким исключением 127.0.0.1 / localhost
-                        string oauthCfg = BuildSingBoxConfig(_activeNode, true, _optCursorAi, _optDiscordYt, true, false);
-                        ApplyAndStartCoreConfig(oauthCfg);
-                    }
-                    EnableSystemProxy();
-                    FlushWindowsDnsCache();
-                }
-                catch { }
-            });
-
-            if (_btnOAuthHelperText != null) _btnOAuthHelperText.Text = "Вход активен (90с)";
-            if (_btnOAuthHelperBorder != null) _btnOAuthHelperBorder.BorderBrush = new SolidColorBrush(ColGreen);
-
-            SetStatus(
-                ColGreen,
-                "🔑 Режим входа в Google активен (90 сек)",
-                "Нажмите Sign in в Antigravity — браузер войдёт через Нидерланды, а возврат 127.0.0.1 придёт прямо в IDE!"
-            );
-
-            if (_oauthHelperTimer != null) _oauthHelperTimer.Stop();
-            _oauthHelperTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1.0) };
-            _oauthHelperTimer.Tick += delegate
-            {
-                if (!_oauthHelperActive)
-                {
-                    _oauthHelperTimer.Stop();
-                    return;
-                }
-                _oauthHelperSecondsLeft--;
-                if (_oauthHelperSecondsLeft <= 0)
+                if (_oauthHelperActive)
                 {
                     StopGoogleOAuthHelperMode(false);
+                    return;
                 }
-                else
+
+                if (!_isConnected && !_isBusy)
                 {
-                    if (_btnOAuthHelperText != null)
-                        _btnOAuthHelperText.Text = string.Format("Вход активен ({0}с)", _oauthHelperSecondsLeft);
+                    await StartTunnelInternalAsync();
+                    if (!_isConnected) return;
                 }
-            };
-            _oauthHelperTimer.Start();
+
+                _oauthHelperActive = true;
+                _oauthHelperSecondsLeft = 90;
+
+                await Task.Run(() =>
+                {
+                    try
+                    {
+                        if (_activeNode != null)
+                        {
+                            // На 90 сек включаем маршрутизацию браузера для Google OAuth с жёстким исключением 127.0.0.1 / localhost
+                            string oauthCfg = BuildSingBoxConfig(_activeNode, true, _optCursorAi, _optDiscordYt, true, false);
+                            ApplyAndStartCoreConfig(oauthCfg);
+                        }
+                        EnableSystemProxy();
+                        FlushWindowsDnsCache();
+                    }
+                    catch { }
+                });
+
+                RunOnUiThread(delegate
+                {
+                    if (_btnOAuthHelperText != null) _btnOAuthHelperText.Text = "Вход активен (90с)";
+                    if (_btnOAuthHelperBorder != null) _btnOAuthHelperBorder.BorderBrush = new SolidColorBrush(ColGreen);
+
+                    SetStatus(
+                        ColGreen,
+                        "🔑 Режим входа в Google активен (90 сек)",
+                        "Нажмите Sign in в Antigravity — браузер войдёт через Нидерланды, а возврат 127.0.0.1 придёт прямо в IDE!"
+                    );
+
+                    if (_oauthHelperTimer != null) _oauthHelperTimer.Stop();
+                    _oauthHelperTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1.0) };
+                    _oauthHelperTimer.Tick += delegate
+                    {
+                        try
+                        {
+                            if (!_oauthHelperActive)
+                            {
+                                if (_oauthHelperTimer != null) _oauthHelperTimer.Stop();
+                                return;
+                            }
+                            _oauthHelperSecondsLeft--;
+                            if (_oauthHelperSecondsLeft <= 0)
+                            {
+                                StopGoogleOAuthHelperMode(false);
+                            }
+                            else
+                            {
+                                if (_btnOAuthHelperText != null)
+                                    _btnOAuthHelperText.Text = string.Format("Вход активен ({0}с)", _oauthHelperSecondsLeft);
+                            }
+                        }
+                        catch { }
+                    };
+                    _oauthHelperTimer.Start();
+                });
+            }
+            catch (Exception ex)
+            {
+                _oauthHelperActive = false;
+                string errMsg = ex.Message;
+                RunOnUiThread(delegate
+                {
+                    SetStatus(ColAmber, "Не удалось включить режим входа Google", errMsg);
+                });
+            }
         }
 
         private void StopGoogleOAuthHelperMode(bool silent)
         {
             _oauthHelperActive = false;
-            if (_oauthHelperTimer != null)
+            RunOnUiThread(delegate
             {
-                try { _oauthHelperTimer.Stop(); } catch { }
-            }
+                if (_oauthHelperTimer != null)
+                {
+                    try { _oauthHelperTimer.Stop(); } catch { }
+                }
 
-            if (_btnOAuthHelperText != null) _btnOAuthHelperText.Text = "Вход в Google (90с)";
-            if (_btnOAuthHelperBorder != null) _btnOAuthHelperBorder.BorderBrush = new SolidColorBrush(ColBlue);
+                if (_btnOAuthHelperText != null) _btnOAuthHelperText.Text = "Вход в Google (90с)";
+                if (_btnOAuthHelperBorder != null) _btnOAuthHelperBorder.BorderBrush = new SolidColorBrush(ColBlue);
+            });
 
             if (_isConnected && _activeNode != null && !silent)
             {
@@ -5822,26 +6253,20 @@ namespace PixelTunnel
                     {
                         string normalCfg = BuildSingBoxConfig(_activeNode, _optAntigravity, _optCursorAi, _optDiscordYt, _optSocialWeb, false);
                         ApplyAndStartCoreConfig(normalCfg);
-                        if (_optCursorAi || _optDiscordYt || _optSocialWeb)
-                            EnableSystemProxy();
-                        else
-                        {
-                            DisableOrRestoreSystemProxy();
-                            string pUrl = string.Format("http://127.0.0.1:{0}", _activeHttpPort);
-                            Environment.SetEnvironmentVariable("AG_LS_PROXY", pUrl, EnvironmentVariableTarget.User);
-                            Environment.SetEnvironmentVariable("AG_LS_PROXY", pUrl, EnvironmentVariableTarget.Process);
-                            BroadcastEnvironmentChange();
-                        }
+                        ApplyConnectedProxyPolicy();
                         HealAiEditorsAndServices(true, false, _optAntigravity, _optCursorAi, _optDiscordYt, _optSocialWeb);
                     }
                     catch { }
                 });
 
-                SetStatus(
-                    ColGreen,
-                    "Изолированный режим восстановлен",
-                    string.Format("Вход в Google завершён • Туннель :{0} работает только для выбранных категорий", _activeHttpPort)
-                );
+                RunOnUiThread(delegate
+                {
+                    SetStatus(
+                        ColGreen,
+                        "Изолированный режим восстановлен",
+                        string.Format("Вход в Google завершён • Туннель :{0} работает только для выбранных категорий", _activeHttpPort)
+                    );
+                });
             }
         }
 
@@ -5927,21 +6352,12 @@ namespace PixelTunnel
         }
 
         // ====================================================================
-        // SMART DIAGNOSTICS v3.0 & SELF-HEALING ENGINE ("АВТО-ДОКТОР КЛИЕНТА")
+        // SMART DIAGNOSTICS & SELF-HEALING ENGINE ("АВТО-ДОКТОР КЛИЕНТА")
         // ====================================================================
-        private async void RunSmartDiagnosticsAsync(bool autoFix)
+        private async void RunSmartDiagnosticsAsync(bool autoFix, bool isAutoDiagCli = false)
         {
             if (_isDiagRunning) return;
             _isDiagRunning = true;
-            AnimateDrawerOpen(_diagPanelBorder);
-            _diagBtnText.Text = "Проверка...";
-            if (_diagBtnIconHolder != null)
-            {
-                _diagBtnIconHolder.Content = CreateSpinningIcon(ColBlue, 13);
-            }
-            _diagSummaryBadge.Text = "ДОКТОР СЕТИ 3.0...";
-            _diagSummaryBadge.Foreground = new SolidColorBrush(ColAmber);
-            _diagOutputBox.Text = ">> Запуск Умной диагностики 3.0 (9 уровней проверки + Авто-лечение проблем клиента)...\r\n";
 
             int issuesFound = 0;
             int issuesFixed = 0;
@@ -5957,13 +6373,28 @@ namespace PixelTunnel
             string diagYaCode = "000";
             string diagThirdPartyTun = "";
             bool diagLsPatched = false;
+            string diagGoReason = "";
+            string diagLicErrSummary = "";
 
             try
             {
+                RunOnUiThread(delegate
+                {
+                    if (_diagBtnText != null) _diagBtnText.Text = "Проверка...";
+                    if (_diagBtnIconHolder != null)
+                    {
+                        _diagBtnIconHolder.Content = CreateSpinningIcon(ColBlue, 13);
+                    }
+                    if (!_isConnected)
+                    {
+                        SetStatus(ColBlue, "Диагностика и проверка сети...", "Проверяем соединение, узлы и настройки...");
+                    }
+                });
+
                 await Task.Run(() =>
                 {
                     var sw = Stopwatch.StartNew();
-                    report.AppendLine("╔══ УМНАЯ ДИАГНОСТИКА 3.0 И АВТО-ДОКТОР PIXELTUNNEL ══╗");
+                    report.AppendLine("╔══ ДИАГНОСТИКА И АВТО-ДОКТОР PIXELTUNNEL ══╗");
 
                 // ----------------------------------------------------------------
                 // 1. CHECK DIRECT ISP INTERNET & POISONED HOSTS FILE
@@ -6106,16 +6537,21 @@ namespace PixelTunnel
                         if (key != null)
                         {
                             object wpadObj = key.GetValue("AutoConfigURL", null);
-                            if (wpadObj != null && IsPixelOrLocalAutoConfig(Convert.ToString(wpadObj)))
+                            string wpadStr = Convert.ToString(wpadObj);
+                            if (wpadObj != null && IsActivePixelSmartPacUrl(wpadStr))
+                            {
+                                report.AppendLine("  ✓ [OK] Smart PAC активен (" + wpadStr + ")");
+                            }
+                            else if (wpadObj != null && IsPixelOrLocalAutoConfig(wpadStr))
                             {
                                 issuesFound++;
-                                report.AppendLine("  ✗ [ПРОБЛЕМА] Обнаружен перехват WPAD AutoConfigURL: " + Convert.ToString(wpadObj));
+                                report.AppendLine("  ✗ [ПРОБЛЕМА] Обнаружен устаревший WPAD/PAC AutoConfigURL: " + wpadStr);
                                 if (autoFix)
                                 {
                                     key.DeleteValue("AutoConfigURL", false);
                                     RefreshWinInet();
                                     issuesFixed++;
-                                    report.AppendLine("  ⚡ [АВТО-ФИКС] WPAD AutoConfigURL удалён из реестра.");
+                                    report.AppendLine("  ⚡ [АВТО-ФИКС] Устаревший AutoConfigURL удалён из реестра.");
                                 }
                             }
 
@@ -6123,13 +6559,23 @@ namespace PixelTunnel
                             string proxySrv = Convert.ToString(key.GetValue("ProxyServer", ""));
                             string proxyOvr = Convert.ToString(key.GetValue("ProxyOverride", ""));
 
+                            bool checkedForeign7890 = false;
+                            bool foreign7890Dead = false;
+
                             if (proxyEn == 1 && !string.IsNullOrEmpty(proxySrv))
                             {
-                                int pPort = 0;
-                                if (proxySrv.StartsWith("127.0.0.1:", StringComparison.OrdinalIgnoreCase))
-                                    int.TryParse(proxySrv.Substring("127.0.0.1:".Length), out pPort);
-
+                                int pPort = TryExtractLoopbackProxyPort(proxySrv);
                                 bool portAlive = pPort > 0 && IsLocalPortOpen(pPort, 200);
+                                bool foreign7890Blocked = false;
+                                if (portAlive && pPort == 7890 && pPort != _activeHttpPort)
+                                {
+                                    bool upstreamOk = ProbeLocalProxyUpstreamHealthy(7890, 1800);
+                                    checkedForeign7890 = true;
+                                    foreign7890Dead = !upstreamOk;
+                                    UpdateForeign7890DeadState(foreign7890Dead);
+                                    foreign7890Blocked = !upstreamOk;
+                                }
+
                                 if (!portAlive)
                                 {
                                     issuesFound++;
@@ -6137,9 +6583,23 @@ namespace PixelTunnel
                                     if (autoFix)
                                     {
                                         key.SetValue("ProxyEnable", 0, RegistryValueKind.DWord);
+                                        if (pPort == 7890) key.DeleteValue("ProxyServer", false);
                                         ApplyWinInetPerConnectionProxy(false, "", "");
                                         issuesFixed++;
                                         report.AppendLine("  ⚡ [АВТО-ФИКС] Мёртвый системный прокси отключён -> Браузеры разблокированы!");
+                                    }
+                                }
+                                else if (foreign7890Blocked)
+                                {
+                                    issuesFound++;
+                                    report.AppendLine(string.Format("  ✗ [ПРОБЛЕМА UPSTREAM] Чужой локальный прокси {0} слушает порт 7890, но его upstream МЁРТВ (таймаут TLS/CONNECT)!", proxySrv));
+                                    if (autoFix)
+                                    {
+                                        key.SetValue("ProxyEnable", 0, RegistryValueKind.DWord);
+                                        key.DeleteValue("ProxyServer", false);
+                                        ApplyWinInetPerConnectionProxy(false, "", "");
+                                        issuesFixed++;
+                                        report.AppendLine("  ⚡ [АВТО-ФИКС] Нерабочий сторонний прокси 127.0.0.1:7890 очищен из системного прокси Windows -> Сеть разблокирована!");
                                     }
                                 }
                                 else
@@ -6166,15 +6626,35 @@ namespace PixelTunnel
                             }
 
                             string agLs = Environment.GetEnvironmentVariable("AG_LS_PROXY", EnvironmentVariableTarget.User);
+                            if (string.IsNullOrEmpty(agLs))
+                            {
+                                agLs = Environment.GetEnvironmentVariable("AG_LS_PROXY", EnvironmentVariableTarget.Process);
+                            }
                             if (!string.IsNullOrEmpty(agLs))
                             {
-                                int agPort = 0;
-                                if (agLs.Contains(":"))
+                                int agPort = TryExtractLoopbackProxyPort(agLs);
+                                if (agPort <= 0 && agLs.Contains(":"))
                                 {
                                     int col = agLs.LastIndexOf(':');
                                     int.TryParse(agLs.Substring(col + 1).TrimEnd('/'), out agPort);
                                 }
-                                if (agPort > 0 && !IsLocalPortOpen(agPort, 150))
+                                bool agPortOpen = agPort > 0 && IsLocalPortOpen(agPort, 150);
+                                bool agForeign7890Dead = false;
+                                if (agPortOpen && agPort == 7890 && agPort != _activeHttpPort)
+                                {
+                                    if (checkedForeign7890)
+                                    {
+                                        agForeign7890Dead = foreign7890Dead;
+                                    }
+                                    else
+                                    {
+                                        bool agUpstreamOk = ProbeLocalProxyUpstreamHealthy(7890, 1800);
+                                        agForeign7890Dead = !agUpstreamOk;
+                                        UpdateForeign7890DeadState(agForeign7890Dead);
+                                    }
+                                }
+
+                                if (agPort > 0 && !agPortOpen)
                                 {
                                     issuesFound++;
                                     report.AppendLine(string.Format("  ✗ [ПРОБЛЕМА АНТИГРАВИТИ] AG_LS_PROXY указывает на мёртвый порт {0} ({1})!", agPort, agLs));
@@ -6189,6 +6669,32 @@ namespace PixelTunnel
                                         foreach (var p in Process.GetProcessesByName("language_server_windows_x64")) { try { p.Kill(); } catch { } }
                                         issuesFixed++;
                                         report.AppendLine(string.Format("  ⚡ [АВТО-ФИКС] AG_LS_PROXY перенаправлен на {0} + перезапущен language_server -> Модели разблокированы!", pUrl));
+                                    }
+                                }
+                                else if (agForeign7890Dead)
+                                {
+                                    issuesFound++;
+                                    report.AppendLine(string.Format("  ✗ [ПРОБЛЕМА АНТИГРАВИТИ] AG_LS_PROXY указывает на чужой прокси {0}, но upstream порта 7890 МЁРТВ (language_server ловит таймаут TLS)!", agLs));
+                                    if (autoFix)
+                                    {
+                                        if (_activeHttpPort != 7890 && IsLocalPortOpen(_activeHttpPort, 150))
+                                        {
+                                            string pUrl = string.Format("http://127.0.0.1:{0}", _activeHttpPort);
+                                            Environment.SetEnvironmentVariable("AG_LS_PROXY", pUrl, EnvironmentVariableTarget.User);
+                                            Environment.SetEnvironmentVariable("AG_LS_PROXY", pUrl, EnvironmentVariableTarget.Process);
+                                            report.AppendLine(string.Format("  ⚡ [АВТО-ФИКС] Битый :7890 удалён из AG_LS_PROXY -> перенаправлен на {0} + перезапущен language_server!", pUrl));
+                                        }
+                                        else
+                                        {
+                                            Environment.SetEnvironmentVariable("AG_LS_PROXY", null, EnvironmentVariableTarget.User);
+                                            Environment.SetEnvironmentVariable("AG_LS_PROXY", null, EnvironmentVariableTarget.Process);
+                                            report.AppendLine("  ⚡ [АВТО-ФИКС] Битый сторонний AG_LS_PROXY (127.0.0.1:7890) очищен + перезапущен language_server!");
+                                        }
+                                        PurgeGlobalCliProxyEnvVars();
+                                        BroadcastEnvironmentChange();
+                                        foreach (var p in Process.GetProcessesByName("language_server")) { try { p.Kill(); } catch { } }
+                                        foreach (var p in Process.GetProcessesByName("language_server_windows_x64")) { try { p.Kill(); } catch { } }
+                                        issuesFixed++;
                                     }
                                 }
                                 else
@@ -6245,8 +6751,9 @@ namespace PixelTunnel
                 // ----------------------------------------------------------------
                 AppendDiagLive(report, "\r\n[5/9] Турбо-бенчмарк матрицы узлов PWP-3 и Anti-DPI Shield v2 (36 КБ ТСПУ):");
                 string rawKey = "";
-                Dispatcher.Invoke(new Action(delegate
+                RunOnUiThreadSync(delegate
                 {
+                    if (_keyInput == null) return;
                     rawKey = (_keyInput.Text ?? "").Trim();
                     if (string.IsNullOrEmpty(rawKey))
                     {
@@ -6254,7 +6761,12 @@ namespace PixelTunnel
                         rawKey = EnsureAutoTrialKeyProvisioned(out dLeft);
                         _keyInput.Text = rawKey;
                     }
-                }));
+                });
+                if (string.IsNullOrEmpty(rawKey))
+                {
+                    int dLeft;
+                    rawKey = EnsureAutoTrialKeyProvisioned(out dLeft);
+                }
 
                 VlessNode node = null;
                 string resolvedUri = rawKey;
@@ -6388,7 +6900,7 @@ namespace PixelTunnel
                 // 9. LIVE END-TO-END TUNNEL TEST & SUPPORT PASSPORT GENERATION
                 // ----------------------------------------------------------------
                 AppendDiagLive(report, "\r\n[9/9] Сквозной боевой тест туннеля (CloudCode + Gemini + OAuth2 + РФ):");
-                if (node != null && !string.IsNullOrEmpty(node.Server) && autoFix)
+                if (node != null && !string.IsNullOrEmpty(node.Server))
                 {
                     string proxyUrl = string.Format("http://127.0.0.1:{0}", _activeHttpPort);
                     bool portOpen = IsLocalPortOpen(_activeHttpPort, 200);
@@ -6400,7 +6912,7 @@ namespace PixelTunnel
                     string spCode = portOpen ? RunHttpProbe("https://open.spotify.com", proxyUrl, 5) : "000";
                     string yaCode = RunHttpProbe("https://ya.ru", "", 4);
 
-                    if (!portOpen || !coreAlive || (!IsHttpCodeHealthy(agCode) && !IsHttpCodeHealthy(gemCode)) || !IsHttpCodeHealthy(yaCode))
+                    if (autoFix && (!portOpen || !coreAlive || (!IsHttpCodeHealthy(agCode) && !IsHttpCodeHealthy(gemCode)) || !IsHttpCodeHealthy(yaCode)))
                     {
                         issuesFound++;
                         AppendDiagLive(report, "  ↻ Авто-поднятие мультиплексного туннеля PWP-3 на лучшем узле...");
@@ -6462,35 +6974,32 @@ namespace PixelTunnel
 
                         if (IsHttpCodeHealthy(agCode) || IsHttpCodeHealthy(gemCode))
                         {
-                            if (_optCursorAi || _optDiscordYt || _optSocialWeb || _oauthHelperActive)
-                            {
-                                EnableSystemProxy();
-                            }
-                            else
-                            {
-                                DisableOrRestoreSystemProxy();
-                                Environment.SetEnvironmentVariable("AG_LS_PROXY", proxyUrl, EnvironmentVariableTarget.User);
-                                Environment.SetEnvironmentVariable("AG_LS_PROXY", proxyUrl, EnvironmentVariableTarget.Process);
-                                BroadcastEnvironmentChange();
-                            }
+                            ApplyConnectedProxyPolicy();
                             FlushWindowsDnsCache();
                             HealAiEditorsAndServices(true, false, _optAntigravity, _optCursorAi, _optDiscordYt, _optSocialWeb);
                             issuesFixed++;
                             report.AppendLine(string.Format("  ⚡ [АВТО-ФИКС УСПЕШЕН] Туннель поднят! CloudCode: HTTP {0} [OK], Gemini: HTTP {1} [OK], OAuth2: HTTP {2} [OK], РФ (ya.ru): HTTP {3} [OK]", agCode, gemCode, oauthCode, yaCode));
-                            Dispatcher.Invoke(new Action(delegate
+                            RunOnUiThreadSync(delegate
                             {
                                 _isConnected = true;
                                 _tunnelConnectedUtc = DateTime.UtcNow;
-                                _pingLabel.Text = "HEALED • OK";
-                                _pingLabel.Foreground = new SolidColorBrush(ColGreen);
+                                if (_pingLabel != null)
+                                {
+                                    _pingLabel.Text = "HEALED • OK";
+                                    _pingLabel.Foreground = new SolidColorBrush(ColGreen);
+                                }
                                 SetStatus(ColGreen, "Туннель вылечен и активен", string.Format("PWP-3 Шлюз :{0} ({1}) • CloudCode HTTP {2} [OK] • Сайты .RU напрямую", _activeHttpPort, PixelCoreService.ActiveNodeName ?? "NL", agCode));
                                 ResetButtonState(true);
                                 UpdateLicenseHintFromServer();
-                            }));
+                            });
                         }
                         else
                         {
                             string diagLicErr = PixelCoreService.LastLicenseError;
+                            diagLicErrSummary = diagLicErr;
+                            diagGoReason = !string.IsNullOrEmpty(PixelCoreService.LastConnectError)
+                                ? PixelCoreService.LastConnectError
+                                : PixelCoreService.GoEngineFallbackReason;
                             StopTunnelProcess(false);
                             report.AppendLine("  ✗ [ВНИМАНИЕ] Зарубежный узел не пропускает трафик. Системный прокси автоматически ОТКЛЮЧЁН для сохранения прямого интернета.");
                             if (!string.IsNullOrEmpty(diagLicErr))
@@ -6499,16 +7008,16 @@ namespace PixelTunnel
                             }
                             else
                             {
-                                report.AppendLine("  💡 [СОВЕТ] Нажмите «Код для поддержки» ниже и отправьте его в " + GetTelegramBotHandle());
+                                report.AppendLine("  💡 [СОВЕТ] Сохраните отчёт (PixelTunnel_Report.txt) — вся диагностика хранится локально.");
                             }
-                            Dispatcher.Invoke(new Action(delegate
+                            RunOnUiThreadSync(delegate
                             {
                                 ResetButtonState(false);
                                 if (!ApplyLicenseErrorToUi(diagLicErr))
                                 {
                                     SetStatus(ColAmber, "Прямой интернет защищён (Нужен свежий ключ)", "Туннель отключён, чтобы не блокировать сеть. Возьмите новый ключ в боте.");
                                 }
-                            }));
+                            });
                         }
                     }
                     else
@@ -6519,26 +7028,16 @@ namespace PixelTunnel
                         diagYaCode = yaCode;
 
                         _activeNode = node;
-                        if (_optCursorAi || _optDiscordYt || _optSocialWeb || _oauthHelperActive)
-                        {
-                            EnableSystemProxy();
-                        }
-                        else
-                        {
-                            DisableOrRestoreSystemProxy();
-                            Environment.SetEnvironmentVariable("AG_LS_PROXY", proxyUrl, EnvironmentVariableTarget.User);
-                            Environment.SetEnvironmentVariable("AG_LS_PROXY", proxyUrl, EnvironmentVariableTarget.Process);
-                            BroadcastEnvironmentChange();
-                        }
+                        ApplyConnectedProxyPolicy();
                         FlushWindowsDnsCache();
                         HealAiEditorsAndServices(true, false, _optAntigravity, _optCursorAi, _optDiscordYt, _optSocialWeb);
-                        Dispatcher.Invoke(new Action(delegate
+                        RunOnUiThreadSync(delegate
                         {
                             _isConnected = true;
                             SetStatus(ColGreen, "Туннель активен • Antigravity разблокирован", string.Format("PWP-3 Шлюз :{0} ({1}) • CloudCode HTTP {2} [OK] • Сайты .RU напрямую", _activeHttpPort, PixelCoreService.ActiveNodeName ?? "NL", agCode));
                             ResetButtonState(true);
                             UpdateLicenseHintFromServer();
-                        }));
+                        });
                         report.AppendLine(string.Format("  ✓ [OK] Все каналы работают идеально! CloudCode: HTTP {0} [OK], Gemini: HTTP {1} [OK], OAuth2: HTTP {2} [OK], РФ (ya.ru): HTTP {3} [OK]", agCode, gemCode, oauthCode, yaCode));
                     }
                 }
@@ -6549,8 +7048,7 @@ namespace PixelTunnel
                     diagThirdPartyTun, diagLsPatched);
 
                 sw.Stop();
-                report.AppendLine(string.Format("\r\n╚══ Диагностика 3.0 завершена за {0} мс | Найдено: {1} | Исправлено: {2} ══╝", sw.ElapsedMilliseconds, issuesFound, issuesFixed));
-                report.AppendLine("📋 Нажмите «Код для поддержки» ниже для копирования краткого паспорта без личных данных.");
+                report.AppendLine(string.Format("\r\n╚══ Диагностика завершена за {0} мс | Найдено: {1} | Исправлено: {2} ══╝", sw.ElapsedMilliseconds, issuesFound, issuesFixed));
                 });
             }
             catch (Exception diagEx)
@@ -6558,100 +7056,175 @@ namespace PixelTunnel
                 issuesFound++;
                 report.AppendLine("  ✗ [ОШИБКА ДИАГНОСТИКИ] " + diagEx.Message);
             }
-
-            _diagOutputBox.Text = report.ToString();
-            _diagOutputBox.ScrollToEnd();
-            _diagBtnText.Text = "Умная диагностика";
-            if (_diagBtnIconHolder != null)
+            finally
             {
-                _diagBtnIconHolder.Content = CreateVectorIcon("M22 12h-4l-3 9L9 3l-3 9H2", ColGreen, 14);
-            }
-            RefreshAiTelemetryBanner();
-
-            if (issuesFound == 0)
-            {
-                _diagSummaryBadge.Text = "ВСЁ ИСПРАВНО [OK]";
-                _diagSummaryBadge.Foreground = new SolidColorBrush(ColGreen);
-            }
-            else if (issuesFixed >= issuesFound)
-            {
-                _diagSummaryBadge.Text = string.Format("ИСПРАВЛЕНО АВТОМАТИЧЕСКИ ({0})", issuesFixed);
-                _diagSummaryBadge.Foreground = new SolidColorBrush(ColGreen);
-            }
-            else
-            {
-                _diagSummaryBadge.Text = string.Format("НАЙДЕНО: {0} | ИСПРАВЛЕНО: {1}", issuesFound, issuesFixed);
-                _diagSummaryBadge.Foreground = new SolidColorBrush(ColAmber);
+                _isDiagRunning = false;
             }
 
-            _isDiagRunning = false;
-        }
-
-        private async void RunEmergencyNetworkResetAsync()
-        {
-            if (_isDiagRunning) return;
-            _isDiagRunning = true;
-            AnimateDrawerOpen(_diagPanelBorder);
-            _diagSummaryBadge.Text = "СБРОС СЕТИ...";
-            _diagSummaryBadge.Foreground = new SolidColorBrush(ColAmber);
-            _diagOutputBox.Text = ">> Выполнение полного аварийного сброса сети и восстановления прямого интернета...\r\n";
-
-            string yaCode = "000";
-            await Task.Run(() =>
+            try
             {
-                StopTunnelProcess(false);
-                StopConflictingVpnAndApplyFixes();
-
-                try
+                string finalReport = report.ToString();
+                _lastDiagReport = finalReport;
+                RunOnUiThread(delegate
                 {
-                    using (var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Internet Settings", true))
+                    if (_diagBtnText != null) _diagBtnText.Text = "Диагностика";
+                    if (_diagBtnIconHolder != null)
                     {
-                        if (key != null)
+                        _diagBtnIconHolder.Content = CreateVectorIcon("M22 12h-4l-3 9L9 3l-3 9H2", ColGreen, 14);
+                    }
+                    RefreshAiTelemetryBanner();
+                });
+
+                if (isAutoDiagCli)
+                {
+                    SaveDiagnosticReportToDesktop();
+                    RunOnUiThread(delegate { ExplicitShutdown(); });
+                    return;
+                }
+
+                var unusedPulseRefresh = RefreshAiPulseUiAsync(true);
+
+                RunOnUiThread(delegate
+                {
+                    string headline;
+                    if (issuesFound == 0)
+                        headline = "Проблем не обнаружено — настройки и соединение в порядке.";
+                    else if (issuesFixed >= issuesFound)
+                        headline = string.Format("Обнаружено и автоматически исправлено проблем: {0}.", issuesFixed);
+                    else
+                        headline = string.Format("Найдено проблем: {0}, исправлено автоматически: {1}.", issuesFound, issuesFixed);
+
+                    string channelSummary;
+                    if (!string.IsNullOrEmpty(diagLicErrSummary))
+                        channelSummary = "Сервер отклонил текущий ключ (" + diagLicErrSummary + "). Получите новый ключ в " + GetTelegramBotHandle() + ".";
+                    else if (IsHttpCodeHealthy(diagAgCode) || IsHttpCodeHealthy(diagGemCode))
+                        channelSummary = string.Format("Зарубежные сервисы доступны (CloudCode HTTP {0}, Gemini HTTP {1}), российские сайты работают напрямую (ya.ru HTTP {2}).", diagAgCode, diagGemCode, diagYaCode);
+                    else if (!string.IsNullOrEmpty(diagGoReason))
+                        channelSummary = string.Format("Туннель не смог пропустить трафик ({0}). Прямой интернет сохранён.", diagGoReason);
+                    else
+                        channelSummary = string.Format("Прямой интернет (ya.ru): HTTP {0}. Узлы проверены.", diagYaCode);
+
+                    string msg = headline + "\n" + channelSummary + "\n\nСохранить подробный отчёт на Рабочий стол (PixelTunnel_Report.txt) и скопировать в буфер обмена?";
+                    MessageBoxResult res = MessageBox.Show(
+                        this,
+                        msg,
+                        "Диагностика PixelTunnel",
+                        MessageBoxButton.YesNo,
+                        issuesFound > issuesFixed ? MessageBoxImage.Warning : MessageBoxImage.Information);
+                    if (res == MessageBoxResult.Yes)
+                    {
+                        string savedPath = SaveDiagnosticReportToDesktop();
+                        if (!_isConnected && !string.IsNullOrEmpty(savedPath))
                         {
-                            key.SetValue("ProxyEnable", 0, RegistryValueKind.DWord);
-                            key.DeleteValue("AutoConfigURL", false);
+                            SetStatus(ColGreen, "Отчёт диагностики сохранён", "Файл PixelTunnel_Report.txt на Рабочем столе и в буфере обмена.");
                         }
                     }
-                }
-                catch { }
+                    else if (!_isConnected && IsHttpCodeHealthy(diagYaCode) && !IsHttpCodeHealthy(diagAgCode) && string.IsNullOrEmpty(diagLicErrSummary))
+                    {
+                        SetStatus(ColText2, "Готов к подключению", headline);
+                    }
+                });
+            }
+            catch { }
+        }
 
-                ApplyWinInetPerConnectionProxy(false, "", "");
-                FlushWindowsDnsCache();
-                Thread.Sleep(250);
-                yaCode = RunHttpProbe("https://ya.ru", "", 3);
-            });
+        private async void RunEmergencyNetworkResetAsync(bool confirmPrompt = false)
+        {
+            if (_isDiagRunning) return;
+            if (confirmPrompt)
+            {
+                MessageBoxResult confirm = ReadFromUiThread(() => MessageBox.Show(
+                    this,
+                    "Отключить туннель, очистить системный прокси Windows и восстановить прямой доступ в интернет?",
+                    "Сброс сети — PixelTunnel",
+                    MessageBoxButton.YesNo,
+                    MessageBoxImage.Question), MessageBoxResult.No);
+                if (confirm != MessageBoxResult.Yes) return;
+            }
+            _isDiagRunning = true;
 
-            ResetButtonState(false);
-            _pingLabel.Text = "DIRECT NET";
-            _pingLabel.Foreground = new SolidColorBrush(ColGreen);
-            SetStatus(
-                ColGreen,
-                "Прямой интернет полностью восстановлен",
-                string.Format("Все прокси и TUN-адаптеры отключены • Яндекс HTTP {0} [OK]", string.IsNullOrEmpty(yaCode) ? "200" : yaCode)
-            );
+            string yaCode = "000";
+            try
+            {
+                RunOnUiThread(delegate
+                {
+                    if (_diagBtnText != null) _diagBtnText.Text = "Сброс...";
+                    SetStatus(ColAmber, "Выполняется сброс сети...", "Отключаем прокси и очищаем кэш DNS...");
+                });
 
-            _diagOutputBox.Text =
-                "╔══ АВАРИЙНЫЙ СБРОС СЕТИ ВЫПОЛНЕН ══╗\r\n" +
-                "• Процессы pixel-tun-core, sing-box и ProksiFi: ОСТАНОВЛЕНЫ\r\n" +
-                "• Системный прокси Windows: ОТКЛЮЧЁН (ProxyEnable = 0)\r\n" +
-                "• Перехват WPAD (AutoConfigURL): ОЧИЩЕН\r\n" +
-                "• Системный кэш DNS Windows: СБРОШЕН (ipconfig /flushdns)\r\n" +
-                string.Format("• Проверка прямого интернета (ya.ru): HTTP {0} [OK]\r\n", string.IsNullOrEmpty(yaCode) ? "200" : yaCode) +
-                "\r\nТеперь ваша сеть работает напрямую без какого-либо вмешательства.";
-            _diagSummaryBadge.Text = "ЧИСТЫЙ ИНТЕРНЕТ [OK]";
-            _diagSummaryBadge.Foreground = new SolidColorBrush(ColGreen);
-            _isDiagRunning = false;
+                await Task.Run(() =>
+                {
+                    StopTunnelProcess(false);
+                    StopConflictingVpnAndApplyFixes();
+
+                    try
+                    {
+                        using (var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Internet Settings", true))
+                        {
+                            if (key != null)
+                            {
+                                key.SetValue("ProxyEnable", 0, RegistryValueKind.DWord);
+                                key.DeleteValue("AutoConfigURL", false);
+                            }
+                        }
+                    }
+                    catch { }
+
+                    ApplyWinInetPerConnectionProxy(false, "", "");
+                    FlushWindowsDnsCache();
+                    Thread.Sleep(250);
+                    yaCode = RunHttpProbe("https://ya.ru", "", 3);
+                });
+
+                string yaShown = string.IsNullOrEmpty(yaCode) ? "200" : yaCode;
+                _lastDiagReport =
+                    "╔══ АВАРИЙНЫЙ СБРОС СЕТИ ВЫПОЛНЕН ══╗\r\n" +
+                    "• Процессы pixel-tun-core, sing-box и ProksiFi: ОСТАНОВЛЕНЫ\r\n" +
+                    "• Системный прокси Windows: ОТКЛЮЧЁН (ProxyEnable = 0)\r\n" +
+                    "• Перехват WPAD (AutoConfigURL): ОЧИЩЕН\r\n" +
+                    "• Системный кэш DNS Windows: СБРОШЕН (ipconfig /flushdns)\r\n" +
+                    string.Format("• Проверка прямого интернета (ya.ru): HTTP {0} [OK]\r\n", yaShown);
+
+                RunOnUiThread(delegate
+                {
+                    if (_diagBtnText != null) _diagBtnText.Text = "Диагностика";
+                    ResetButtonState(false);
+                    if (_pingLabel != null)
+                    {
+                        _pingLabel.Text = "DIRECT NET";
+                        _pingLabel.Foreground = new SolidColorBrush(ColGreen);
+                    }
+                    SetStatus(
+                        ColGreen,
+                        "Прямой интернет полностью восстановлен",
+                        string.Format("Все прокси и TUN-адаптеры отключены • Яндекс HTTP {0} [OK]", yaShown)
+                    );
+                    MessageBox.Show(
+                        this,
+                        string.Format("Сброс сети выполнен!\n\nСистемный прокси отключён, кэш DNS очищен.\nПрямой интернет работает (ya.ru: HTTP {0}).", yaShown),
+                        "Сброс сети завершён",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Information);
+                });
+            }
+            catch (Exception ex)
+            {
+                string errMsg = ex.Message;
+                RunOnUiThread(delegate
+                {
+                    if (_diagBtnText != null) _diagBtnText.Text = "Диагностика";
+                    SetStatus(ColAmber, "Ошибка сброса сети", errMsg);
+                });
+            }
+            finally
+            {
+                _isDiagRunning = false;
+            }
         }
 
         private void AppendDiagLive(StringBuilder sb, string line)
         {
             sb.AppendLine(line);
-            string snap = sb.ToString();
-            Dispatcher.BeginInvoke(new Action(delegate
-            {
-                _diagOutputBox.Text = snap;
-                _diagOutputBox.ScrollToEnd();
-            }));
         }
 
         private static string ReadLogTail(string path, int maxBytes)
@@ -6710,11 +7283,11 @@ namespace PixelTunnel
         private async void CheckAntigravityUpdateWatchdogAsync()
         {
             if (_isWatchdogPatchRunning || _isDiagRunning) return;
-            if (!HasUnverifiedAntigravityBinaryOnDisk()) return;
-
             _isWatchdogPatchRunning = true;
             try
             {
+                if (!HasUnverifiedAntigravityBinaryOnDisk()) return;
+
                 bool patchedNow = false;
                 await Task.Run(() =>
                 {
@@ -6726,17 +7299,7 @@ namespace PixelTunnel
                         {
                             if (_isConnected)
                             {
-                                if (_optCursorAi || _optDiscordYt || _optSocialWeb)
-                                {
-                                    EnableSystemProxy();
-                                }
-                                else
-                                {
-                                    string proxyUrl = string.Format("http://127.0.0.1:{0}", _activeHttpPort);
-                                    Environment.SetEnvironmentVariable("AG_LS_PROXY", proxyUrl, EnvironmentVariableTarget.User);
-                                    Environment.SetEnvironmentVariable("AG_LS_PROXY", proxyUrl, EnvironmentVariableTarget.Process);
-                                    BroadcastEnvironmentChange();
-                                }
+                                ApplyConnectedProxyPolicy();
                             }
                             HealAiEditorsAndServices(_isConnected, true, _optAntigravity, _optCursorAi, _optDiscordYt, _optSocialWeb);
                         }
@@ -6746,24 +7309,27 @@ namespace PixelTunnel
 
                 if (patchedNow)
                 {
-                    SetStatus(
-                        ColGreen,
-                        "Antigravity обновлён • Патч входа применён на лету!",
-                        string.Format("Снят блок региона + прописан шлюз OAuth2 :{0} для новой версии IDE", _activeHttpPort)
-                    );
-                    if (_trayIcon != null)
+                    RunOnUiThread(delegate
                     {
-                        try
+                        SetStatus(
+                            ColGreen,
+                            "Antigravity обновлён • Патч входа применён на лету!",
+                            string.Format("Снят блок региона + прописан шлюз OAuth2 :{0} для новой версии IDE", _activeHttpPort)
+                        );
+                        if (_trayIcon != null)
                         {
-                            _trayIcon.ShowBalloonTip(
-                                3200,
-                                "PixelTunnel — Авто-патч Antigravity",
-                                "Antigravity обновился — патч входа из-под санкций и шлюз OAuth2 применены автоматически!",
-                                System.Windows.Forms.ToolTipIcon.Info
-                            );
+                            try
+                            {
+                                _trayIcon.ShowBalloonTip(
+                                    3200,
+                                    "PixelTunnel — Авто-патч Antigravity",
+                                    "Antigravity обновился — патч входа из-под санкций и шлюз OAuth2 применены автоматически!",
+                                    System.Windows.Forms.ToolTipIcon.Info
+                                );
+                            }
+                            catch { }
                         }
-                        catch { }
-                    }
+                    });
                 }
             }
             catch { }
@@ -6775,125 +7341,165 @@ namespace PixelTunnel
 
         private async void MonitorLoop()
         {
-            CheckAntigravityUpdateWatchdogAsync();
-            RefreshAiTelemetryBanner();
-            if (!_isConnected || _isBusy || _isDiagRunning) return;
-
-            string licErr = PixelCoreService.LastLicenseError;
-            if (!string.IsNullOrEmpty(licErr))
+            try
             {
-                _isConnected = false;
-                StopTunnelProcess(false);
-                ApplyLicenseErrorToUi(licErr);
-                ResetButtonState(false);
-                return;
-            }
+                CheckAntigravityUpdateWatchdogAsync();
+                RunOnUiThread(delegate { RefreshAiTelemetryBanner(); });
+                if (!_isConnected || _isBusy || _isDiagRunning) return;
 
-            bool alive = PixelCoreService.IsRunning;
-            if (!alive)
-            {
-                try
+                string licErr = PixelCoreService.LastLicenseError;
+                if (!string.IsNullOrEmpty(licErr))
                 {
-                    if (_coreProcess != null && !_coreProcess.HasExited)
-                        alive = true;
-                    else if (Process.GetProcessesByName(CORE_EXE_NAME).Length > 0)
-                        alive = true;
-                }
-                catch { }
-            }
-
-            if (!alive || !IsLocalPortOpen(_activeHttpPort, 200))
-            {
-                // Immediately disable system proxy if core died so browsers NEVER lose internet!
-                _isConnected = false;
-                DisableOrRestoreSystemProxy();
-                ResetButtonState(false);
-                SetStatus(ColRed, "Туннель остановился (Прямой интернет сохранён)", "Системный прокси автоматически отключён. Нажмите «Запустить туннель».");
-                return;
-            }
-
-            // Watchdog: ensure Windows system proxy points to our active port when system-wide categories are enabled
-            if (_optCursorAi || _optDiscordYt || _optSocialWeb || _oauthHelperActive)
-            {
-                try
-                {
-                    using (var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Internet Settings", false))
+                    _isConnected = false;
+                    StopTunnelProcess(false);
+                    RunOnUiThread(delegate
                     {
-                        if (key != null)
+                        ApplyLicenseErrorToUi(licErr);
+                        ResetButtonState(false);
+                    });
+                    return;
+                }
+
+                bool alive = PixelCoreService.IsRunning;
+                if (!alive)
+                {
+                    try
+                    {
+                        if (_coreProcess != null && !_coreProcess.HasExited)
+                            alive = true;
+                        else if (Process.GetProcessesByName(CORE_EXE_NAME).Length > 0)
+                            alive = true;
+                    }
+                    catch { }
+                }
+
+                if (!alive || !IsLocalPortOpen(_activeHttpPort, 200))
+                {
+                    // Immediately disable system proxy if core died so browsers NEVER lose internet!
+                    _isConnected = false;
+                    DisableOrRestoreSystemProxy();
+                    RunOnUiThread(delegate
+                    {
+                        ResetButtonState(false);
+                        SetStatus(ColRed, "Туннель остановился (Прямой интернет сохранён)", "Системный прокси автоматически отключён. Нажмите «Запустить туннель».");
+                    });
+                    return;
+                }
+
+                // Watchdog: ensure Windows system proxy matches active policy (Smart PAC vs Classic ProxyEnable=1)
+                if (ShouldEnableSystemWideBrowserProxy())
+                {
+                    try
+                    {
+                        using (var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Internet Settings", false))
                         {
-                            int en = Convert.ToInt32(key.GetValue("ProxyEnable", 0));
-                            string srv = Convert.ToString(key.GetValue("ProxyServer", ""));
-                            if (en == 0 || srv != string.Format("127.0.0.1:{0}", _activeHttpPort))
+                            if (key != null)
                             {
-                                EnableSystemProxy();
+                                int en = Convert.ToInt32(key.GetValue("ProxyEnable", 0));
+                                string srv = Convert.ToString(key.GetValue("ProxyServer", ""));
+                                string pac = Convert.ToString(key.GetValue("AutoConfigURL", ""));
+                                if (_useSmartPacMode)
+                                {
+                                    if (en != 0 || !IsActivePixelSmartPacUrl(pac))
+                                        EnableSystemProxy();
+                                }
+                                else
+                                {
+                                    if (en == 0 || srv != string.Format("127.0.0.1:{0}", _activeHttpPort))
+                                        EnableSystemProxy();
+                                }
                             }
                         }
                     }
+                    catch { }
                 }
-                catch { }
-            }
 
-            if (_activeNode != null)
-            {
-                int ms = PixelCoreService.ActiveNodeLatencyMs;
-                if (ms <= 0)
+                _pulseTickCounter++;
+                if (_pulseTickCounter % 8 == 1)
                 {
-                    string host = _activeNode.Server;
-                    int port = string.Equals(host, GetDefaultClusterHost(), StringComparison.OrdinalIgnoreCase) ? 443 : _activeNode.Port;
-                    ms = await Task.Run(() => MeasureTcpPing(host, port));
+                    var unusedPulse = RefreshAiPulseUiAsync(false);
                 }
-                int activeStreams = Math.Max(PixelCoreService.ActiveMuxStreams, Math.Max(PixelCoreService.ActiveConnections, CountActiveProxyConnections()));
-                int activeUdp = PixelCoreService.ActiveUdpAssociations;
-                string speedBadge = PixelCoreService.FormatLiveSpeedBadge();
-                UpdateLicenseHintFromServer();
-                if (ms > 0 && _isConnected)
+
+                if (_activeNode != null)
                 {
-                    _consecutivePingFailures = 0;
-                    string tag = (string.Equals(_selectedRegion, "us", StringComparison.OrdinalIgnoreCase) && PixelCoreService.IsRegionAvailable("us"))
-                        ? "US"
-                        : "NL";
-                    if (!string.IsNullOrEmpty(speedBadge) && activeUdp > 0)
-                        _pingLabel.Text = string.Format("{0} • {1} мс • {2} • UDP:{3}", tag, ms, speedBadge, activeUdp);
-                    else if (!string.IsNullOrEmpty(speedBadge))
-                        _pingLabel.Text = string.Format("{0} • {1} мс • {2}", tag, ms, speedBadge);
-                    else if (activeUdp > 0)
-                        _pingLabel.Text = string.Format("{0} • {1} мс • Mux:{2} UDP:{3}", tag, ms, activeStreams, activeUdp);
-                    else if (activeStreams > 0)
-                        _pingLabel.Text = string.Format("{0} • {1} мс • Mux: {2}", tag, ms, activeStreams);
-                    else
-                        _pingLabel.Text = string.Format("{0} • {1} мс", tag, ms);
-                }
-                else if (_isConnected)
-                {
-                    _consecutivePingFailures++;
-                    if (_consecutivePingFailures >= 3)
+                    int ms = PixelCoreService.ActiveNodeLatencyMs;
+                    if (ms <= 0)
+                    {
+                        string host = _activeNode.Server;
+                        int port = IsClusterHost(host) ? 443 : _activeNode.Port;
+                        ms = await Task.Run(() => MeasureTcpPing(host, port));
+                    }
+                    int activeStreams = Math.Max(PixelCoreService.ActiveMuxStreams, Math.Max(PixelCoreService.ActiveConnections, CountActiveProxyConnections()));
+                    int activeUdp = PixelCoreService.ActiveUdpAssociations;
+                    string speedBadge = PixelCoreService.FormatLiveSpeedBadge();
+                    if (ms > 0 && _isConnected)
                     {
                         _consecutivePingFailures = 0;
-                        string proxyUrl = string.Format("http://127.0.0.1:{0}", _activeHttpPort);
-                        string probe = await Task.Run(() => RunHttpProbe("https://www.gstatic.com/generate_204", proxyUrl, 5));
-                        if (!IsHttpCodeHealthy(probe))
+                        string tag = (string.Equals(_selectedRegion, "us", StringComparison.OrdinalIgnoreCase) && PixelCoreService.IsRegionAvailable("us"))
+                            ? "US"
+                            : "NL";
+                        string pingText;
+                        if (!string.IsNullOrEmpty(speedBadge) && activeUdp > 0)
+                            pingText = string.Format("{0} • {1} мс • {2} • UDP:{3}", tag, ms, speedBadge, activeUdp);
+                        else if (!string.IsNullOrEmpty(speedBadge))
+                            pingText = string.Format("{0} • {1} мс • {2}", tag, ms, speedBadge);
+                        else if (activeUdp > 0)
+                            pingText = string.Format("{0} • {1} мс • Mux:{2} UDP:{3}", tag, ms, activeStreams, activeUdp);
+                        else if (activeStreams > 0)
+                            pingText = string.Format("{0} • {1} мс • Mux: {2}", tag, ms, activeStreams);
+                        else
+                            pingText = string.Format("{0} • {1} мс", tag, ms);
+
+                        RunOnUiThread(delegate
                         {
-                            VlessNode curNode = _activeNode;
-                            if (curNode != null)
+                            UpdateLicenseHintFromServer();
+                            if (_isConnected && _pingLabel != null)
                             {
-                                await Task.Run(() =>
+                                _pingLabel.Text = pingText;
+                            }
+                        });
+                    }
+                    else if (_isConnected)
+                    {
+                        RunOnUiThread(delegate { UpdateLicenseHintFromServer(); });
+                        _consecutivePingFailures++;
+                        if (_consecutivePingFailures >= 3)
+                        {
+                            _consecutivePingFailures = 0;
+                            string proxyUrl = string.Format("http://127.0.0.1:{0}", _activeHttpPort);
+                            string probe = await Task.Run(() => RunHttpProbe("https://www.gstatic.com/generate_204", proxyUrl, 5));
+                            if (!IsHttpCodeHealthy(probe))
+                            {
+                                VlessNode curNode = _activeNode;
+                                if (curNode != null)
                                 {
-                                    try
+                                    await Task.Run(() =>
                                     {
-                                        WaitForIdleAiStream(2500);
-                                        PixelCoreService.StopService();
-                                        Thread.Sleep(150);
-                                        string retryCfg = BuildSingBoxConfig(curNode, _optAntigravity, _optCursorAi, _optDiscordYt, _optSocialWeb, false);
-                                        ApplyAndStartCoreConfig(retryCfg);
-                                    }
-                                    catch { }
-                                });
-                                SetStatus(ColGreen, "Туннель активен (Авто-восстановление)", "Авто-переподключение канала выполнено без обрыва сети");
+                                        try
+                                        {
+                                            WaitForIdleAiStream(2500);
+                                            PixelCoreService.StopService();
+                                            Thread.Sleep(150);
+                                            string retryCfg = BuildSingBoxConfig(curNode, _optAntigravity, _optCursorAi, _optDiscordYt, _optSocialWeb, false);
+                                            ApplyAndStartCoreConfig(retryCfg);
+                                        }
+                                        catch { }
+                                    });
+                                    RunOnUiThread(delegate
+                                    {
+                                        SetStatus(ColGreen, "Туннель активен (Авто-восстановление)", "Авто-переподключение канала выполнено без обрыва сети");
+                                    });
+                                }
                             }
                         }
                     }
+                    else
+                    {
+                        RunOnUiThread(delegate { UpdateLicenseHintFromServer(); });
+                    }
                 }
             }
+            catch { }
         }
 
         private static int MeasureTcpPing(string host, int port)
@@ -7005,166 +7611,105 @@ namespace PixelTunnel
             catch { }
         }
 
-        private void LoadCustomRulesIntoUi()
-        {
-            try
-            {
-                string prx, dir, eds;
-                ReadCustomRulesConfig(out prx, out dir, out eds);
-                if (_customProxyBox != null) _customProxyBox.Text = prx;
-                if (_customDirectBox != null) _customDirectBox.Text = dir;
-                if (_customEditorsBox != null) _customEditorsBox.Text = eds;
-            }
-            catch { }
-        }
-
-        private void ToggleCustomRulesDrawer()
-        {
-            if (_customPanelBorder.Visibility == Visibility.Visible)
-            {
-                _customPanelBorder.Visibility = Visibility.Collapsed;
-            }
-            else
-            {
-                LoadCustomRulesIntoUi();
-                AnimateDrawerOpen(_customPanelBorder);
-            }
-        }
-
-        private void ResetCustomRulesToDefault()
-        {
-            if (_customProxyBox != null) _customProxyBox.Text = DEFAULT_CUSTOM_PROXY;
-            if (_customDirectBox != null) _customDirectBox.Text = DEFAULT_CUSTOM_DIRECT;
-            if (_customEditorsBox != null) _customEditorsBox.Text = DEFAULT_CUSTOM_EDITORS;
-            SaveAndHotReloadCustomRules();
-        }
-
-        private async void SaveAndHotReloadCustomRules()
-        {
-            try
-            {
-                string prx = (_customProxyBox != null ? _customProxyBox.Text : DEFAULT_CUSTOM_PROXY).Trim();
-                string dir = (_customDirectBox != null ? _customDirectBox.Text : DEFAULT_CUSTOM_DIRECT).Trim();
-                string eds = (_customEditorsBox != null ? _customEditorsBox.Text : DEFAULT_CUSTOM_EDITORS).Trim();
-
-                string[] lines = new[]
-                {
-                    "# PixelTunnel Custom Routing & AI Services Config",
-                    "PROXY=" + prx,
-                    "DIRECT=" + dir,
-                    "EDITORS=" + eds
-                };
-
-                try { File.WriteAllLines(GetCustomRulesFilePath(), lines, new UTF8Encoding(false)); } catch { }
-                try
-                {
-                    string localFile = System.IO.Path.Combine(_baseDir, "custom_rules.txt");
-                    if (IsDirectoryWritable(_baseDir)) File.WriteAllLines(localFile, lines, new UTF8Encoding(false));
-                }
-                catch { }
-
-                _customStatusBadge.Text = "\u041f\u0420\u0418\u041c\u0415\u041d\u0415\u041d\u0418\u0415...";
-                _customStatusBadge.Foreground = new SolidColorBrush(ColAmber);
-
-                HealAiEditorsAndServices(_isConnected, true, _optAntigravity, _optCursorAi, _optDiscordYt, _optSocialWeb);
-
-                if (_isConnected && _activeNode != null)
-                {
-                    await Task.Run(() =>
-                    {
-                        try
-                        {
-                            WaitForIdleAiStream(2500);
-                            string newCfg = BuildSingBoxConfig(_activeNode, _optAntigravity, _optCursorAi, _optDiscordYt, _optSocialWeb, false);
-                            ApplyAndStartCoreConfig(newCfg);
-                        }
-                        catch { }
-                    });
-                    if (_optCursorAi || _optDiscordYt || _optSocialWeb)
-                    {
-                        EnableSystemProxy();
-                    }
-                    else
-                    {
-                        DisableOrRestoreSystemProxy();
-                        string proxyUrl = string.Format("http://127.0.0.1:{0}", _activeHttpPort);
-                        Environment.SetEnvironmentVariable("AG_LS_PROXY", proxyUrl, EnvironmentVariableTarget.User);
-                        Environment.SetEnvironmentVariable("AG_LS_PROXY", proxyUrl, EnvironmentVariableTarget.Process);
-                        BroadcastEnvironmentChange();
-                    }
-                    FlushWindowsDnsCache();
-                    SetStatus(ColGreen, "\u041f\u0440\u0430\u0432\u0438\u043b\u0430 \u043e\u0431\u043d\u043e\u0432\u043b\u0435\u043d\u044b \u043d\u0430 \u043b\u0435\u0442\u0443!", "\u041d\u043e\u0432\u044b\u0435 \u0441\u0430\u0439\u0442\u044b, \u0438\u0441\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u044f \u0438 AI-\u0440\u0435\u0434\u0430\u043a\u0442\u043e\u0440\u044b \u0430\u043a\u0442\u0438\u0432\u0438\u0440\u043e\u0432\u0430\u043d\u044b \u0431\u0435\u0437 \u043e\u0431\u0440\u044b\u0432\u0430 \u0441\u0435\u0442\u0438.");
-                }
-
-                _customStatusBadge.Text = "\u0421\u041e\u0425\u0420\u0410\u041d\u0415\u041d\u041e [OK]";
-                _customStatusBadge.Foreground = new SolidColorBrush(ColGreen);
-            }
-            catch { }
-        }
-
         private async void TriggerCategoryHotReloadIfConnected()
         {
-            if (!_isConnected || _isBusy || _activeNode == null) return;
             try
             {
+                if (!_isConnected || _isBusy || _activeNode == null) return;
+                string prx, dir, eds;
+                ReadCustomRulesConfig(out prx, out dir, out eds);
+                await PixelCoreService.ReloadRulesV4Async(BuildReloadRulesJsonPayload(prx, dir));
                 await Task.Run(() =>
                 {
                     try
                     {
-                        WaitForIdleAiStream(2000);
                         string newCfg = BuildSingBoxConfig(_activeNode, _optAntigravity, _optCursorAi, _optDiscordYt, _optSocialWeb, false);
-                        ApplyAndStartCoreConfig(newCfg);
+                        File.WriteAllText(_activeConfigPath, newCfg, new UTF8Encoding(false));
                     }
                     catch { }
                 });
                 FlushWindowsDnsCache();
-                if (_optCursorAi || _optDiscordYt || _optSocialWeb)
-                {
-                    EnableSystemProxy();
-                }
-                else
-                {
-                    DisableOrRestoreSystemProxy();
-                    string proxyUrl = string.Format("http://127.0.0.1:{0}", _activeHttpPort);
-                    Environment.SetEnvironmentVariable("AG_LS_PROXY", proxyUrl, EnvironmentVariableTarget.User);
-                    Environment.SetEnvironmentVariable("AG_LS_PROXY", proxyUrl, EnvironmentVariableTarget.Process);
-                    BroadcastEnvironmentChange();
-                }
+                ApplyConnectedProxyPolicy();
                 HealAiEditorsAndServices(true, false, _optAntigravity, _optCursorAi, _optDiscordYt, _optSocialWeb);
-                SetStatus(ColGreen, "Категории маршрутизации обновлены", string.Format("Активный шлюз :{0} перезагружен на лету без потери сессий.", _activeHttpPort));
+                RunOnUiThread(delegate
+                {
+                    SetStatus(ColGreen, "Категории маршрутизации обновлены", string.Format("Активный шлюз :{0} обновлён мгновенно без обрыва соединений.", _activeHttpPort));
+                });
             }
             catch { }
         }
 
-        private void SaveDiagnosticReportToDesktop()
+        private string BuildReloadRulesJsonPayload(string prxCsv, string dirCsv)
+        {
+            var payload = new Dictionary<string, object>
+            {
+                { "categories", new Dictionary<string, object>
+                    {
+                        { "antigravity", _optAntigravity },
+                        { "ai", _optCursorAi },
+                        { "media", _optDiscordYt },
+                        { "social", _optSocialWeb },
+                        { "mcp", _optMcpTerminal }
+                    }
+                },
+                { "custom_proxy_domains", ParseDomainCsv(prxCsv) },
+                { "custom_direct_domains", ParseDomainCsv(dirCsv) },
+                { "proxy_all", _optCursorAi || _optDiscordYt || _optSocialWeb }
+            };
+            return MiniJson.Serialize(payload);
+        }
+
+        private string BuildLocalDiagnosticReportString()
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("=== PIXELTUNNEL DIAGNOSTIC REPORT v" + APP_VERSION + " ===");
+            sb.AppendLine("Timestamp: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+            sb.AppendLine("Engine: " + PixelCoreService.ActiveEngineLabel + (string.IsNullOrEmpty(PixelCoreService.GoEngineFallbackReason) ? "" : (" (" + PixelCoreService.GoEngineFallbackReason + ")")));
+            sb.AppendLine("ProxyMode: " + (_useSmartPacMode ? ("Smart PAC (" + BuildSmartPacUrl() + ")") : "Classic ProxyEnable=1"));
+            sb.AppendLine(string.Format("Active Local Ports: HTTP 127.0.0.1:{0} | SOCKS5 127.0.0.1:{1}", _activeHttpPort, _activeSocksPort));
+            if (!string.IsNullOrEmpty(PixelCoreService.ActiveWslBridgeIp))
+                sb.AppendLine("WSL2 Bridge IP: " + PixelCoreService.ActiveWslBridgeIp + ":" + _activeHttpPort);
+            sb.AppendLine(string.Format("Active Proxy Streams: {0}", CountActiveProxyConnections()));
+            if (!string.IsNullOrEmpty(_lastSupportPassport))
+            {
+                sb.AppendLine();
+                sb.AppendLine(_lastSupportPassport);
+            }
+            sb.AppendLine();
+            sb.AppendLine(_lastDiagReport ?? "");
+
+            string agLog = FindLatestAntigravityLogFile();
+            if (!string.IsNullOrEmpty(agLog))
+            {
+                sb.AppendLine();
+                sb.AppendLine("=== ANTIGRAVITY LANGUAGE_SERVER LOG TAIL ===");
+                sb.AppendLine("Path: " + agLog);
+                sb.AppendLine(ReadLogTail(agLog, 6144));
+            }
+            return sb.ToString();
+        }
+
+        private void CopyDiagnosticReportToClipboard()
+        {
+            try
+            {
+                Clipboard.SetText(BuildLocalDiagnosticReportString());
+            }
+            catch { }
+        }
+
+        private string SaveDiagnosticReportToDesktop()
         {
             try
             {
                 string desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
                 string reportFile = System.IO.Path.Combine(desktop, "PixelTunnel_Report.txt");
-                var sb = new StringBuilder();
-                sb.AppendLine("=== PIXELTUNNEL DIAGNOSTIC REPORT ===");
-                sb.AppendLine("Timestamp: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
-                sb.AppendLine(string.Format("Active Local Ports: HTTP 127.0.0.1:{0} | SOCKS5 127.0.0.1:{1}", _activeHttpPort, _activeSocksPort));
-                sb.AppendLine(string.Format("Active Proxy Streams: {0}", CountActiveProxyConnections()));
-                sb.AppendLine();
-                sb.AppendLine(_diagOutputBox != null ? _diagOutputBox.Text : "");
-
-                string agLog = FindLatestAntigravityLogFile();
-                if (!string.IsNullOrEmpty(agLog))
-                {
-                    sb.AppendLine();
-                    sb.AppendLine("=== ANTIGRAVITY LANGUAGE_SERVER LOG TAIL ===");
-                    sb.AppendLine("Path: " + agLog);
-                    sb.AppendLine(ReadLogTail(agLog, 6144));
-                }
-
-                File.WriteAllText(reportFile, sb.ToString(), new UTF8Encoding(false));
-                Clipboard.SetText(sb.ToString());
-                _diagSummaryBadge.Text = "СОХРАНЕНО НА РАБОЧИЙ СТОЛ [OK]";
-                _diagSummaryBadge.Foreground = new SolidColorBrush(ColGreen);
+                string txt = BuildLocalDiagnosticReportString();
+                File.WriteAllText(reportFile, txt, new UTF8Encoding(false));
+                try { Clipboard.SetText(txt); } catch { }
+                return reportFile;
             }
-            catch { }
+            catch { return ""; }
         }
 
         private static List<string> ParseDomainCsv(string csv)
@@ -7363,23 +7908,57 @@ namespace PixelTunnel
         {
             try
             {
-                if (!string.IsNullOrWhiteSpace(uri) && uri.StartsWith("pwp3://", StringComparison.OrdinalIgnoreCase))
+                if (!string.IsNullOrWhiteSpace(uri) && (uri.StartsWith("pwp3://", StringComparison.OrdinalIgnoreCase) || uri.StartsWith("pwp4://", StringComparison.OrdinalIgnoreCase)))
                 {
                     Uri u = new Uri(uri);
                     string userInfo = string.IsNullOrEmpty(u.UserInfo) ? "" : Uri.UnescapeDataString(u.UserInfo);
-                    string pwp3Uuid = string.Equals(userInfo, "free", StringComparison.OrdinalIgnoreCase) ? "" : userInfo;
-                    string pwp3Host = string.IsNullOrEmpty(u.Host) ? GetDefaultClusterHost() : u.Host;
+                    string pwpUuid = string.Equals(userInfo, "free", StringComparison.OrdinalIgnoreCase) ? "" : userInfo;
+                    string pwpHost = string.IsNullOrEmpty(u.Host) ? GetDefaultClusterHost() : u.Host;
                     return new VlessNode
                     {
-                        Uuid = pwp3Uuid,
-                        Server = pwp3Host,
-                        ResolvedIp = pwp3Host,
+                        Uuid = pwpUuid,
+                        Server = pwpHost,
+                        ResolvedIp = pwpHost,
                         Port = u.Port > 0 ? u.Port : 443,
-                        Sni = pwp3Host,
+                        Sni = pwpHost,
                         TransportType = "pwp3",
                         Security = "pwp3-tls",
                         Flow = "",
-                        Remark = "PixelTunnel PWP-3"
+                        Remark = "PixelTunnel PWP-4"
+                    };
+                }
+                if (!string.IsNullOrWhiteSpace(uri) && Regex.IsMatch(uri.Trim(), @"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"))
+                {
+                    string cleanUuid = uri.Trim().ToLowerInvariant();
+                    string defHost = GetDefaultClusterHost();
+                    return new VlessNode
+                    {
+                        Uuid = LegacyTrialUuids.Contains(cleanUuid) ? "" : cleanUuid,
+                        Server = defHost,
+                        ResolvedIp = defHost,
+                        Port = 443,
+                        Sni = defHost,
+                        TransportType = "pwp3",
+                        Security = "pwp3-tls",
+                        Flow = "",
+                        Remark = "PixelTunnel PRO"
+                    };
+                }
+                if (!string.IsNullOrWhiteSpace(uri) && Regex.IsMatch(uri.Trim(), @"^https://ai\.pixelstore\.space/sub/[A-Za-z0-9_-]{6,64}$", RegexOptions.IgnoreCase))
+                {
+                    string defHost = GetDefaultClusterHost();
+                    string subId = uri.Trim().Substring(uri.Trim().LastIndexOf('/') + 1);
+                    return new VlessNode
+                    {
+                        Uuid = subId,
+                        Server = defHost,
+                        ResolvedIp = defHost,
+                        Port = 443,
+                        Sni = defHost,
+                        TransportType = "pwp3",
+                        Security = "pwp3-tls",
+                        Flow = "",
+                        Remark = "PixelTunnel Sub"
                     };
                 }
                 if (!string.IsNullOrWhiteSpace(uri) && uri.StartsWith("pwp1://", StringComparison.OrdinalIgnoreCase))
@@ -7498,6 +8077,140 @@ namespace PixelTunnel
             }
         }
 
+        private static bool IsClusterHost(string host)
+        {
+            if (string.IsNullOrWhiteSpace(host)) return false;
+            string h = host.Trim();
+            return string.Equals(h, GetDefaultClusterHost(), StringComparison.OrdinalIgnoreCase)
+                || string.Equals(h, "node.pixelstore.space", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(h, "201.34.152.97", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(h, "185.103.103.162", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static void EnsureManifestSecretsForConfig(int maxWaitMs = 3500)
+        {
+            try
+            {
+                Type svcType = typeof(PixelCoreService);
+                BindingFlags flags = BindingFlags.NonPublic | BindingFlags.Static;
+
+                MethodInfo initPaths = svcType.GetMethod("EnsureManifestPathsInitialized", flags);
+                if (initPaths != null) initPaths.Invoke(null, null);
+
+                MethodInfo hasAny = svcType.GetMethod("HasAnyNodeWithSecret", flags);
+                bool hasSecret = hasAny != null && (bool)hasAny.Invoke(null, null);
+
+                if (!hasSecret)
+                {
+                    MethodInfo loadCache = svcType.GetMethod("TryLoadCachedManifest", flags);
+                    if (loadCache != null) loadCache.Invoke(null, null);
+                    hasSecret = hasAny != null && (bool)hasAny.Invoke(null, null);
+                }
+
+                if (!hasSecret)
+                {
+                    string[] localCandidates = new[]
+                    {
+                        System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "nodes_v3.enc"),
+                        System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "manifest", "nodes_v3.enc")
+                    };
+                    foreach (string cand in localCandidates)
+                    {
+                        if (!File.Exists(cand)) continue;
+                        try
+                        {
+                            string raw = File.ReadAllText(cand, Encoding.UTF8);
+                            if (PixelCoreService.TryApplySignedManifestEnvelope(raw, "local-file", false))
+                            {
+                                hasSecret = true;
+                                break;
+                            }
+                        }
+                        catch { }
+                    }
+                }
+
+                if (!hasSecret)
+                {
+                    MethodInfo ensureLoaded = svcType.GetMethod("EnsureManifestSecretsLoaded", flags);
+                    if (ensureLoaded != null) ensureLoaded.Invoke(null, new object[] { maxWaitMs });
+                }
+            }
+            catch { }
+        }
+
+        private static void BuildManifestFieldsForConfig(out string pwpSecret, out string nodesJson)
+        {
+            pwpSecret = "";
+            nodesJson = "[]";
+            try
+            {
+                EnsureManifestSecretsForConfig(3500);
+
+                Type svcType = typeof(PixelCoreService);
+                BindingFlags flags = BindingFlags.NonPublic | BindingFlags.Static;
+                FieldInfo nodesLockField = svcType.GetField("_nodesLock", flags);
+                FieldInfo nodesField = svcType.GetField("_nodes", flags);
+                FieldInfo secretField = svcType.GetField("_secret", flags);
+
+                object lockObj = nodesLockField != null ? nodesLockField.GetValue(null) : null;
+                if (lockObj == null) lockObj = new object();
+
+                var sb = new StringBuilder();
+                sb.Append('[');
+                bool first = true;
+
+                lock (lockObj)
+                {
+                    string globalSecret = secretField != null ? (secretField.GetValue(null) as string ?? "") : "";
+                    pwpSecret = globalSecret.Trim();
+
+                    var nodes = nodesField != null ? (nodesField.GetValue(null) as List<PixelServerNode>) : null;
+                    if (nodes != null)
+                    {
+                        for (int i = 0; i < nodes.Count; i++)
+                        {
+                            PixelServerNode n = nodes[i];
+                            if (n == null || string.IsNullOrWhiteSpace(n.Host)) continue;
+                            string nodeSecret = !string.IsNullOrEmpty(n.Secret) ? n.Secret.Trim() : pwpSecret;
+                            if (string.IsNullOrEmpty(pwpSecret) && !string.IsNullOrEmpty(nodeSecret))
+                                pwpSecret = nodeSecret;
+
+                            string region = string.IsNullOrWhiteSpace(n.Region) ? "nl" : n.Region.Trim().ToLowerInvariant();
+                            string sni = string.IsNullOrWhiteSpace(n.Sni) ? GetDefaultClusterHost() : n.Sni.Trim();
+                            string path = string.IsNullOrWhiteSpace(n.UpgradePath) ? "/api/v3/telemetry/mux" : n.UpgradePath.Trim();
+                            string pwp4Path = n.SupportsMuxV3 ? "/api/v4/telemetry/mux" : "";
+                            string name = string.IsNullOrWhiteSpace(n.Name) ? n.Host : n.Name.Trim();
+
+                            if (!first) sb.Append(", ");
+                            first = false;
+                            sb.AppendFormat(
+                                "{{\"name\":\"{0}\",\"region\":\"{1}\",\"host\":\"{2}\",\"port\":{3},\"sni\":\"{4}\",\"path\":\"{5}\",\"pwp4_path\":\"{6}\",\"secret\":\"{7}\",\"tls\":{8},\"mux\":{9},\"frag\":{10}}}",
+                                EscapeJson(name),
+                                EscapeJson(region),
+                                EscapeJson(n.Host.Trim()),
+                                n.Port > 0 ? n.Port : 443,
+                                EscapeJson(sni),
+                                EscapeJson(path),
+                                EscapeJson(pwp4Path),
+                                EscapeJson(nodeSecret),
+                                n.UseTls ? "true" : "false",
+                                n.SupportsMuxV3 ? "true" : "false",
+                                n.EnableDpiSplit ? "true" : "false");
+                        }
+                    }
+                }
+
+                sb.Append(']');
+                nodesJson = sb.ToString();
+            }
+            catch
+            {
+                if (nodesJson == null) nodesJson = "[]";
+                if (pwpSecret == null) pwpSecret = "";
+            }
+        }
+
         public static string BuildSingBoxConfig(VlessNode node, bool routeAg, bool routeAi, bool routeMedia, bool routeWeb = true, bool includeTun = true)
         {
             if (node == null) node = new VlessNode();
@@ -7513,8 +8226,10 @@ namespace PixelTunnel
             string spx = string.IsNullOrEmpty(node.SpiderX) ? "/" : node.SpiderX;
             string serviceName = string.IsNullOrEmpty(node.ServiceName) ? "" : node.ServiceName;
 
-            if (string.Equals(server, GetDefaultClusterHost(), StringComparison.OrdinalIgnoreCase) || string.Equals(server, "201.34.152.97", StringComparison.OrdinalIgnoreCase))
+            if (IsClusterHost(server))
             {
+                if (string.Equals(server.Trim(), "node.pixelstore.space", StringComparison.OrdinalIgnoreCase))
+                    server = GetDefaultClusterHost();
                 port = 443;
                 net = "pwp3";
                 flow = "";
@@ -7527,6 +8242,9 @@ namespace PixelTunnel
             {
                 flow = "";
             }
+
+            string manifestPwpSecret, manifestNodesJson;
+            BuildManifestFieldsForConfig(out manifestPwpSecret, out manifestNodesJson);
 
             string grpcSettingsJson = "";
             if (string.Equals(net, "grpc", StringComparison.OrdinalIgnoreCase))
@@ -7584,8 +8302,43 @@ namespace PixelTunnel
         ""network"": ""tcp,udp""
       }";
 
+            string prxCsv, dirCsv, edsCsv;
+            ReadCustomRulesConfig(out prxCsv, out dirCsv, out edsCsv);
+            string v2Json = string.Format(@"{{
+    ""smart_pac"": {0},
+    ""pac_rev"": {1},
+    ""wsl_bridge"": {2},
+    ""local_token"": """",
+    ""categories"": {{
+      ""antigravity"": {3},
+      ""ai"": {4},
+      ""media"": {5},
+      ""social"": {6},
+      ""mcp"": {7}
+    }},
+    ""custom_proxy"": [{8}],
+    ""custom_direct"": [{9}],
+    ""custom_proxy_domains"": [{8}],
+    ""custom_direct_domains"": [{9}]
+  }}",
+                _useSmartPacMode ? "true" : "false",
+                Math.Max(1, PixelCoreService.ActivePacRevision),
+                _optWslBridge ? "true" : "false",
+                routeAg ? "true" : "false",
+                routeAi ? "true" : "false",
+                routeMedia ? "true" : "false",
+                routeWeb ? "true" : "false",
+                _optMcpTerminal ? "true" : "false",
+                JoinJsonStrings(ParseDomainCsv(prxCsv)),
+                JoinJsonStrings(ParseDomainCsv(dirCsv)));
+
             return string.Format(@"{{
   ""preferredRegion"": ""{16}"",
+  ""http_port"": {18},
+  ""socks_port"": {19},
+  ""pwpSecret"": ""{20}"",
+  ""nodes"": {21},
+  ""v2"": {17},
   ""log"": {{
     ""loglevel"": ""warning""
   }},
@@ -7696,7 +8449,12 @@ namespace PixelTunnel
                 BuildCustomDirectDomainsJson(),
                 defaultOutboundRules,
                 grpcSettingsJson,
-                EscapeJson(string.IsNullOrEmpty(_selectedRegion) ? "auto" : _selectedRegion)
+                EscapeJson(string.IsNullOrEmpty(_selectedRegion) ? "auto" : _selectedRegion),
+                v2Json,
+                _activeHttpPort,
+                _activeSocksPort,
+                EscapeJson(manifestPwpSecret),
+                manifestNodesJson
             );
         }
 

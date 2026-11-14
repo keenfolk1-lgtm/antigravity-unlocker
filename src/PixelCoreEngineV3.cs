@@ -4,9 +4,13 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.IO.Compression;
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Security;
 using System.Net.Sockets;
+using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
@@ -340,6 +344,7 @@ namespace PixelTunnel
         public bool ProbeVerified = false;
         public int LatencyMs = 20;
         public int FailCount = 0;
+        public DateTime LastHealthMeasuredUtc = DateTime.MinValue;
     }
 
     internal sealed class PixelWarmTunnel : IDisposable
@@ -975,7 +980,7 @@ namespace PixelTunnel
 
     public static class PixelCoreService
     {
-        public const string ENGINE_VERSION = "1.9.0";
+        public const string ENGINE_VERSION = "2.0.0";
         private const string DEFAULT_HOST = "201.34.152.97";
         private const string DEFAULT_SNI = "ai.pixelstore.space";
         private const int WARM_POOL_TARGET = 2;
@@ -1001,8 +1006,74 @@ namespace PixelTunnel
             DEFAULT_PINNED_SPKI_SHA256
         };
 
+        private sealed class NodeHealthSnapshot
+        {
+            public bool IsOnline;
+            public bool ProbeVerified;
+            public int LatencyMs;
+            public int FailCount;
+            public DateTime MeasuredUtc;
+        }
+
+        private const double NODE_HEALTH_TTL_SEC = 120.0;
         private static readonly List<PixelServerNode> _nodes = new List<PixelServerNode>();
+        private static readonly Dictionary<string, NodeHealthSnapshot> _nodeHealthSnapshots = new Dictionary<string, NodeHealthSnapshot>(StringComparer.OrdinalIgnoreCase);
         private static readonly object _nodesLock = new object();
+
+        private static string BuildNodeHealthKey(PixelServerNode node)
+        {
+            if (node == null) return "";
+            return ((node.Host ?? "").Trim().ToLowerInvariant()) + ":" + node.Port.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        private static void SnapshotNodeHealthLocked(PixelServerNode node)
+        {
+            if (node == null || string.IsNullOrEmpty(node.Host) || node.Port <= 0) return;
+            DateTime measured = node.LastHealthMeasuredUtc != DateTime.MinValue ? node.LastHealthMeasuredUtc : DateTime.UtcNow;
+            node.LastHealthMeasuredUtc = measured;
+            _nodeHealthSnapshots[BuildNodeHealthKey(node)] = new NodeHealthSnapshot
+            {
+                IsOnline = node.IsOnline,
+                ProbeVerified = node.ProbeVerified,
+                LatencyMs = node.LatencyMs,
+                FailCount = node.FailCount,
+                MeasuredUtc = measured
+            };
+        }
+
+        private static void SnapshotMeasuredNodesLocked()
+        {
+            foreach (var n in _nodes)
+            {
+                if (n == null) continue;
+                if (n.LastHealthMeasuredUtc != DateTime.MinValue || !n.IsOnline || n.FailCount > 0 || n.ProbeVerified)
+                {
+                    SnapshotNodeHealthLocked(n);
+                }
+            }
+        }
+
+        private static void RestoreNodeHealthFromSnapshotsLocked()
+        {
+            if (_nodeHealthSnapshots.Count == 0) return;
+            DateTime now = DateTime.UtcNow;
+            foreach (var n in _nodes)
+            {
+                string key = BuildNodeHealthKey(n);
+                NodeHealthSnapshot snap;
+                if (!_nodeHealthSnapshots.TryGetValue(key, out snap)) continue;
+                if ((now - snap.MeasuredUtc).TotalSeconds > NODE_HEALTH_TTL_SEC)
+                {
+                    _nodeHealthSnapshots.Remove(key);
+                    continue;
+                }
+                n.IsOnline = snap.IsOnline;
+                n.ProbeVerified = snap.ProbeVerified;
+                n.LatencyMs = snap.LatencyMs;
+                n.FailCount = snap.FailCount;
+                n.LastHealthMeasuredUtc = snap.MeasuredUtc;
+            }
+        }
 
         // Dual-Lane PWP-3 Mux: Lane 0 (AI & Interactive) + Lane 1 (Media & Bulk)
         private static Pwp3MuxClient _laneInteractive;
@@ -1026,6 +1097,10 @@ namespace PixelTunnel
 
         private static HashSet<string> _directDomains = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private static HashSet<string> _proxyDomains = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private static HashSet<string> _baseDirectDomains = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private static Dictionary<string, bool> _activeCategories = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        private static List<string> _customProxyList = new List<string>();
+        private static List<string> _customDirectList = new List<string>();
         private static HashSet<string> _serverHostBypass = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private static bool _defaultOutboundIsProxy = false;
 
@@ -1060,8 +1135,60 @@ namespace PixelTunnel
 
         private static TcpListener _mainListener;
         private static TcpListener _secListener;
+        private static TcpListener _wslHttpListener;
+        private static TcpListener _wslSocksListener;
         private static CancellationTokenSource _cts;
         private static readonly object _syncLock = new object();
+
+        // v2.0 Native Go uTLS + JobObject + Live Radar + Instant Wake + Smart PAC state
+        private static string _activeConfigPath = "";
+        private static bool _wslBridgeEnabled = false;
+        private static bool _smartPacEnabled = true;
+        private static int _pacRevision = 1;
+        private static string _localControlToken = "";
+        private static int _powerHookRegistered = 0;
+        private static long _liveRouteSeq = 0;
+        private static readonly object _liveRoutesLock = new object();
+        private static readonly LinkedList<LiveRouteEntry> _liveRoutes = new LinkedList<LiveRouteEntry>();
+        private static readonly object _aiPulseCacheLock = new object();
+        private static string _cachedAiPulseJson = "";
+        private static DateTime _cachedAiPulseUtc = DateTime.MinValue;
+
+        public sealed class LiveRouteEntry
+        {
+            public long Seq;
+            public long Ts;
+            public string TimeStr;
+            public int Pid;
+            public string ProcessName;
+            public string Domain;
+            public int Port;
+            public string Proto;
+            public string Action;
+            public string Rule;
+            public string Node;
+            public string Role;
+            public int PingMs;
+            public long BytesUp;
+            public long BytesDown;
+            public string Error;
+        }
+
+        public static bool UsingGoEngine { get; private set; }
+        public static string GoEngineFallbackReason { get; private set; }
+        public static string ActiveEngineLabel { get { return UsingGoEngine ? ("Go uTLS (Chrome v" + ENGINE_VERSION + ")") : ("C# Fallback (v" + ENGINE_VERSION + ")"); } }
+        public static string ActiveLocalControlToken { get { return _localControlToken ?? ""; } }
+        public static int ActivePacRevision { get { return _pacRevision; } }
+        public static string ActiveWslBridgeIp { get; private set; }
+        public static int ActiveHttpPort { get { return _localPort; } }
+        public static int ActiveSocksPort { get { return _socksPort; } }
+        public static bool IsWslBridgeEnabled { get { return _wslBridgeEnabled; } }
+        public static string StandbyNodeName { get; private set; }
+        public static bool StandbyReady { get; private set; }
+        public static int FailoverCount { get; private set; }
+        public static int InstantWakeCount { get; private set; }
+        public static string LastWakeReason { get; private set; }
+        public static long LastWakeUnix { get; private set; }
 
         public static bool IsRunning { get; private set; }
         public static string LastLicenseError { get; private set; }
@@ -1438,14 +1565,23 @@ namespace PixelTunnel
                     rawJson = File.ReadAllText(configPath, Encoding.UTF8);
             }
             catch { }
-            StartServiceFromJson(rawJson);
+            StartServiceFromJson(rawJson, configPath);
         }
 
         public static void StartServiceFromJson(string rawJson)
         {
+            StartServiceFromJson(rawJson, null);
+        }
+
+        public static void StartServiceFromJson(string rawJson, string configPathHint)
+        {
             lock (_syncLock)
             {
                 StopService();
+                if (!string.IsNullOrEmpty(configPathHint))
+                {
+                    _activeConfigPath = configPathHint;
+                }
 
                 try
                 {
@@ -1486,6 +1622,12 @@ namespace PixelTunnel
                 LiveTotalMbps = 0.0;
                 LiveLane0Mbps = 0.0;
                 LiveLane1Mbps = 0.0;
+                ActiveWslBridgeIp = "";
+                StandbyNodeName = "";
+                StandbyReady = false;
+                FailoverCount = 0;
+                UsingGoEngine = false;
+                GoEngineFallbackReason = "";
                 lock (_speedLock)
                 {
                     _prevSpeedTicks = 0;
@@ -1502,10 +1644,42 @@ namespace PixelTunnel
                 _cts = new CancellationTokenSource();
 
                 LoadCompatibleJsonString(rawJson);
+                if (string.IsNullOrEmpty(_localControlToken))
+                {
+                    _localControlToken = GenerateLocalTokenHex(16);
+                }
                 BuildDefaultNodesIfEmpty();
                 TryLoadCachedManifest();
+                EnsurePowerModeHook();
 
                 CancellationToken token = _cts.Token;
+
+                string cfgForGo = _activeConfigPath;
+                if (string.IsNullOrEmpty(cfgForGo) || !File.Exists(cfgForGo))
+                {
+                    try
+                    {
+                        Directory.CreateDirectory(NativeUtlsEngineHost.EngineCacheDir);
+                        cfgForGo = Path.Combine(NativeUtlsEngineHost.EngineCacheDir, "runtime_config.json");
+                        if (!string.IsNullOrEmpty(rawJson))
+                            File.WriteAllText(cfgForGo, rawJson, new UTF8Encoding(false));
+                    }
+                    catch { }
+                }
+
+                string goFallbackReason;
+                if (NativeUtlsEngineHost.TryStart(cfgForGo, _localControlToken, _localPort, out goFallbackReason))
+                {
+                    UsingGoEngine = true;
+                    GoEngineFallbackReason = "";
+                    ActiveProtocol = "Go uTLS (Chrome)";
+                    IsRunning = true;
+                    Task.Run(() => GoTelemetryPollLoopAsync(token));
+                    return;
+                }
+
+                UsingGoEngine = false;
+                GoEngineFallbackReason = goFallbackReason ?? "C# Fallback активен";
 
                 _mainListener = new TcpListener(IPAddress.Loopback, _localPort);
                 _mainListener.Start(512);
@@ -1516,6 +1690,11 @@ namespace PixelTunnel
                     _secListener = new TcpListener(IPAddress.Loopback, _socksPort);
                     _secListener.Start(256);
                     Task.Run(() => AcceptLoopAsync(_secListener, token));
+                }
+
+                if (_wslBridgeEnabled)
+                {
+                    TryStartWslBridgeListeners(token);
                 }
 
                 IsRunning = true;
@@ -1530,11 +1709,14 @@ namespace PixelTunnel
             lock (_syncLock)
             {
                 IsRunning = false;
+                UsingGoEngine = false;
+                ActiveWslBridgeIp = "";
                 if (_cts != null)
                 {
                     try { _cts.Cancel(); } catch { }
                     _cts = null;
                 }
+                NativeUtlsEngineHost.Stop();
                 if (_mainListener != null)
                 {
                     try { _mainListener.Stop(); } catch { }
@@ -1544,6 +1726,16 @@ namespace PixelTunnel
                 {
                     try { _secListener.Stop(); } catch { }
                     _secListener = null;
+                }
+                if (_wslHttpListener != null)
+                {
+                    try { _wslHttpListener.Stop(); } catch { }
+                    _wslHttpListener = null;
+                }
+                if (_wslSocksListener != null)
+                {
+                    try { _wslSocksListener.Stop(); } catch { }
+                    _wslSocksListener = null;
                 }
                 ResetMuxLanes();
                 DrainWarmPool();
@@ -1588,6 +1780,7 @@ namespace PixelTunnel
             {
                 if (_nodes.Count > 0) return;
                 AddPixelClusterNodesLocked(_secret, _defaultSni);
+                RestoreNodeHealthFromSnapshotsLocked();
             }
             RebuildServerBypassSet();
         }
@@ -1728,6 +1921,7 @@ namespace PixelTunnel
 
                 lock (_nodesLock)
                 {
+                    SnapshotMeasuredNodesLocked();
                     _nodes.Clear();
                     if ((string.IsNullOrEmpty(serverAddr) ||
                          string.Equals(serverAddr, DEFAULT_HOST, StringComparison.OrdinalIgnoreCase) ||
@@ -1756,6 +1950,7 @@ namespace PixelTunnel
                             AddPixelClusterNodesLocked(_secret, DEFAULT_SNI);
                         }
                     }
+                    RestoreNodeHealthFromSnapshotsLocked();
                 }
                 RebuildServerBypassSet();
 
@@ -1781,6 +1976,69 @@ namespace PixelTunnel
                     }
                 }
 
+                var parsedCustomProxy = new List<string>();
+                var parsedCustomDirect = new List<string>();
+                var parsedCats = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+
+                var rootObj = MiniJson.Deserialize(json) as Dictionary<string, object>;
+                if (rootObj != null)
+                {
+                    int topHttp = MiniJson.GetInt(rootObj, "http_port", 0);
+                    int topSocks = MiniJson.GetInt(rootObj, "socks_port", 0);
+                    if (topHttp > 0) _localPort = topHttp;
+                    if (topSocks > 0) _socksPort = topSocks;
+
+                    var v2Obj = MiniJson.GetDict(rootObj, "v2");
+                    if (v2Obj != null)
+                    {
+                        _smartPacEnabled = MiniJson.GetBool(v2Obj, "smart_pac", _smartPacEnabled);
+                        int parsedRev = MiniJson.GetInt(v2Obj, "pac_rev", 0);
+                        if (parsedRev > 0) _pacRevision = parsedRev;
+                        _wslBridgeEnabled = MiniJson.GetBool(v2Obj, "wsl_bridge", false);
+                        string cfgToken = MiniJson.GetStr(v2Obj, "local_token");
+                        if (!string.IsNullOrEmpty(cfgToken)) _localControlToken = cfgToken.Trim();
+
+                        var catDict = MiniJson.GetDict(v2Obj, "categories");
+                        if (catDict != null)
+                        {
+                            foreach (var kv in catDict)
+                            {
+                                bool enabled = MiniJson.GetBool(catDict, kv.Key, false);
+                                parsedCats[kv.Key] = enabled;
+                                if (enabled)
+                                {
+                                    foreach (string cd in GetCSharpCategoryDomains(kv.Key))
+                                        newProxy.Add(cd);
+                                }
+                            }
+                        }
+
+                        var cpList = v2Obj.ContainsKey("custom_proxy_domains")
+                            ? MiniJson.GetStrList(v2Obj, "custom_proxy_domains")
+                            : MiniJson.GetStrList(v2Obj, "custom_proxy");
+                        foreach (string cp in cpList)
+                        {
+                            string clean = (cp ?? "").Trim().ToLowerInvariant();
+                            if (!string.IsNullOrEmpty(clean)) { parsedCustomProxy.Add(clean); newProxy.Add(clean); newDirect.Remove(clean); }
+                        }
+
+                        var cdList = v2Obj.ContainsKey("custom_direct_domains")
+                            ? MiniJson.GetStrList(v2Obj, "custom_direct_domains")
+                            : MiniJson.GetStrList(v2Obj, "custom_direct");
+                        foreach (string cd in cdList)
+                        {
+                            string clean = (cd ?? "").Trim().ToLowerInvariant();
+                            if (!string.IsNullOrEmpty(clean)) { parsedCustomDirect.Add(clean); newDirect.Add(clean); newProxy.Remove(clean); }
+                        }
+                    }
+                }
+
+                var baseDirect = new HashSet<string>(newDirect, StringComparer.OrdinalIgnoreCase);
+                foreach (string cd in parsedCustomDirect) baseDirect.Remove(cd);
+                _baseDirectDomains = baseDirect;
+                _activeCategories = parsedCats;
+                _customProxyList = parsedCustomProxy;
+                _customDirectList = parsedCustomDirect;
                 _directDomains = newDirect;
                 _proxyDomains = newProxy;
 
@@ -1982,8 +2240,10 @@ namespace PixelTunnel
 
                 lock (_nodesLock)
                 {
+                    SnapshotMeasuredNodesLocked();
                     _nodes.Clear();
                     _nodes.AddRange(parsedNodes);
+                    RestoreNodeHealthFromSnapshotsLocked();
                 }
                 RebuildServerBypassSet();
                 ManifestVersion = ver;
@@ -2248,6 +2508,12 @@ namespace PixelTunnel
             list.Sort((a, b) =>
             {
                 if (a.IsOnline != b.IsOnline) return a.IsOnline ? -1 : 1;
+                bool aTimedOut = a.LatencyMs >= 9000 || a.FailCount > 0;
+                bool bTimedOut = b.LatencyMs >= 9000 || b.FailCount > 0;
+                if (aTimedOut != bTimedOut) return aTimedOut ? 1 : -1;
+                bool aMeasuredOk = a.LastHealthMeasuredUtc != DateTime.MinValue && a.LatencyMs > 0 && !aTimedOut;
+                bool bMeasuredOk = b.LastHealthMeasuredUtc != DateTime.MinValue && b.LatencyMs > 0 && !bTimedOut;
+                if (aMeasuredOk != bMeasuredOk) return aMeasuredOk ? -1 : 1;
                 if (a.ProbeVerified != b.ProbeVerified) return a.ProbeVerified ? -1 : 1;
                 if (a.SupportsMuxV3 != b.SupportsMuxV3) return a.SupportsMuxV3 ? -1 : 1;
                 if (a.UseTls != b.UseTls) return a.UseTls ? -1 : 1;
@@ -2289,7 +2555,7 @@ namespace PixelTunnel
                     if (token.IsCancellationRequested || !IsRunning) break;
                     try
                     {
-                        Pwp3MuxClient created = await Task.Run(() => CreateMuxSession(isBulkMediaLane ? "Lane1-Media" : "Lane0-AI", node, 4200)).ConfigureAwait(false);
+                        Pwp3MuxClient created = await Task.Run(() => CreateMuxSession(isBulkMediaLane ? "Lane1-Media" : "Lane0-AI", node, 2400)).ConfigureAwait(false);
                         if (created != null)
                         {
                             if (isBulkMediaLane) _laneBulk = created;
@@ -2305,12 +2571,17 @@ namespace PixelTunnel
                     {
                         LastConnectError = node.Name + ": " + ex.Message;
                         if (!string.IsNullOrEmpty(LastLicenseError)) return null;
-                        node.FailCount++;
-                        node.ProbeVerified = false;
-                        node.LatencyMs = 9999;
-                        if (node.FailCount >= 2 || (ex.Message != null && ex.Message.IndexOf("TSPU", StringComparison.OrdinalIgnoreCase) >= 0))
+                        lock (_nodesLock)
                         {
-                            node.IsOnline = false;
+                            node.FailCount++;
+                            node.ProbeVerified = false;
+                            node.LatencyMs = 9999;
+                            node.LastHealthMeasuredUtc = DateTime.UtcNow;
+                            if (node.FailCount >= 2 || (ex.Message != null && ex.Message.IndexOf("TSPU", StringComparison.OrdinalIgnoreCase) >= 0))
+                            {
+                                node.IsOnline = false;
+                            }
+                            SnapshotNodeHealthLocked(node);
                         }
                     }
                 }
@@ -2409,8 +2680,9 @@ namespace PixelTunnel
             return gotFin && totalRead >= ExpectedProbeBytes;
         }
 
-        private static Pwp3MuxClient CreateMuxSession(string laneName, PixelServerNode node, int connectTimeoutMs)
+        private static Pwp3MuxClient CreateMuxSession(string laneName, PixelServerNode node, int connectTimeoutMs = 2400)
         {
+            if (connectTimeoutMs <= 0) connectTimeoutMs = 2400;
             Exception lastErr = null;
             bool runProbe = _enableAntiFreezeProbe &&
                             node.UseTls &&
@@ -2432,11 +2704,21 @@ namespace PixelTunnel
 
                     Stopwatch sw = Stopwatch.StartNew();
                     IAsyncResult ar = tcp.BeginConnect(node.Host, node.Port, null, null);
-                    if (!ar.AsyncWaitHandle.WaitOne(connectTimeoutMs))
+                    WaitHandle wh = ar.AsyncWaitHandle;
+                    try
                     {
-                        throw new TimeoutException("Mux connect timeout to " + node.Name);
+                        if (!wh.WaitOne(connectTimeoutMs))
+                        {
+                            try { tcp.Close(); } catch { }
+                            try { ((IDisposable)tcp).Dispose(); } catch { }
+                            throw new TimeoutException("Mux connect timeout to " + node.Name);
+                        }
+                        tcp.EndConnect(ar);
                     }
-                    tcp.EndConnect(ar);
+                    finally
+                    {
+                        try { wh.Close(); } catch { }
+                    }
                     EnableTcpKeepAlive(tcp.Client);
 
                     PixelStreamCipher enc;
@@ -2475,22 +2757,46 @@ namespace PixelTunnel
                     }
 
                     ActiveEffectiveSni = effectiveSni;
-                    node.IsOnline = true;
-                    node.FailCount = 0;
-                    node.LatencyMs = measuredRtt;
+                    lock (_nodesLock)
+                    {
+                        node.IsOnline = true;
+                        node.FailCount = 0;
+                        node.LatencyMs = measuredRtt;
+                        node.LastHealthMeasuredUtc = DateTime.UtcNow;
+                        SnapshotNodeHealthLocked(node);
+                    }
                     return mux;
                 }
                 catch (UnauthorizedAccessException)
                 {
                     if (mux != null) mux.Dispose();
                     try { tcp.Close(); } catch { }
+                    try { ((IDisposable)tcp).Dispose(); } catch { }
                     throw;
+                }
+                catch (TimeoutException tex)
+                {
+                    lastErr = tex;
+                    if (mux != null) mux.Dispose();
+                    try { tcp.Close(); } catch { }
+                    try { ((IDisposable)tcp).Dispose(); } catch { }
+                    lock (_nodesLock)
+                    {
+                        node.IsOnline = false;
+                        node.ProbeVerified = false;
+                        node.FailCount++;
+                        node.LatencyMs = 9999;
+                        node.LastHealthMeasuredUtc = DateTime.UtcNow;
+                        SnapshotNodeHealthLocked(node);
+                    }
+                    break;
                 }
                 catch (Exception ex)
                 {
                     lastErr = ex;
                     if (mux != null) mux.Dispose();
                     try { tcp.Close(); } catch { }
+                    try { ((IDisposable)tcp).Dispose(); } catch { }
 
                     if (ex.Message != null && ex.Message.IndexOf("CLOCK_RESYNCED", StringComparison.OrdinalIgnoreCase) >= 0)
                     {
@@ -2621,22 +2927,24 @@ namespace PixelTunnel
             return false;
         }
 
-        private static bool ShouldBypassDirect(string host)
+        private static void ClassifyRoute(string host, out bool bypassDirect, out string ruleLabel)
         {
-            if (string.IsNullOrEmpty(host)) return false;
+            bypassDirect = false;
+            ruleLabel = "proxy-default";
+            if (string.IsNullOrEmpty(host)) return;
             string h = host.Trim().Trim('[', ']').TrimEnd('.').ToLowerInvariant();
 
-            if (IsPrivateOrServerLoopbackHost(h)) return true;
-            if (MatchesDomainSet(h, _proxyDomains)) return false;
+            if (IsPrivateOrServerLoopbackHost(h)) { bypassDirect = true; ruleLabel = "loopback-private"; return; }
+            if (MatchesDomainSet(h, _proxyDomains)) { bypassDirect = false; ruleLabel = "proxy-rule"; return; }
 
             IPAddress parsedIp;
             if (IPAddress.TryParse(h, out parsedIp) && IsTelegramDcIp(parsedIp) && MatchesDomainSet("telegram.org", _proxyDomains))
-                return false;
+            { bypassDirect = false; ruleLabel = "telegram-dc"; return; }
 
             if (HostMatchesDomain(h, "googleapis.com") || HostMatchesDomain(h, "antigravity.google") ||
                 HostMatchesDomain(h, "antigravity-unleash.goog") || HostMatchesDomain(h, "1e100.net") ||
                 HostMatchesDomain(h, "gstatic.com") || HostMatchesDomain(h, "google.com") || HostMatchesDomain(h, "gvt1.com"))
-                return false;
+            { bypassDirect = false; ruleLabel = "antigravity-core"; return; }
 
             if (h.EndsWith(".ru", StringComparison.Ordinal) || h.EndsWith(".su", StringComparison.Ordinal) ||
                 h.EndsWith(".xn--p1ai", StringComparison.Ordinal) || h.EndsWith(".by", StringComparison.Ordinal) ||
@@ -2648,11 +2956,20 @@ namespace PixelTunnel
                 HostMatchesDomain(h, "ozon.team") || HostMatchesDomain(h, "ozonru.me") ||
                 HostMatchesDomain(h, "ozonrucn.me") || HostMatchesDomain(h, "ozoncom.me") ||
                 HostMatchesDomain(h, "steamcontent.com") || HostMatchesDomain(h, "steampowered.com"))
-                return true;
+            { bypassDirect = true; ruleLabel = "ru-direct"; return; }
 
-            if (MatchesDomainSet(h, _directDomains)) return true;
+            if (MatchesDomainSet(h, _directDomains)) { bypassDirect = true; ruleLabel = "direct-rule"; return; }
 
-            return !_defaultOutboundIsProxy;
+            bypassDirect = !_defaultOutboundIsProxy;
+            ruleLabel = bypassDirect ? "default-direct" : "default-proxy";
+        }
+
+        private static bool ShouldBypassDirect(string host)
+        {
+            bool bypass;
+            string rule;
+            ClassifyRoute(host, out bypass, out rule);
+            return bypass;
         }
 
         private static async Task AcceptLoopAsync(TcpListener listener, CancellationToken token)
@@ -2770,6 +3087,7 @@ namespace PixelTunnel
                 int targetPort = 0;
                 byte[] initialPayload = null;
                 bool isHttpConnect = false;
+                bool suppressRadar = false;
                 bool isSocks5 = (firstByte == 0x05);
 
                 if (isSocks5)
@@ -2830,6 +3148,7 @@ namespace PixelTunnel
                     if (hdrRead == null) return;
                     string headerStr = hdrRead.Item1;
                     byte[] extraBody = hdrRead.Item2;
+                    suppressRadar = string.Equals((ExtractHeader(headerStr, "X-Pixel-Internal-Probe") ?? "").Trim(), "1", StringComparison.Ordinal);
 
                     string firstLine = headerStr.Split(new[] { "\r\n" }, StringSplitOptions.None)[0];
                     string[] parts = firstLine.Split(' ');
@@ -2838,27 +3157,10 @@ namespace PixelTunnel
                     string method = parts[0].ToUpperInvariant();
                     string rawTarget = parts[1];
 
-                    if (rawTarget.StartsWith("/__pixelcore/status", StringComparison.OrdinalIgnoreCase) ||
-                        rawTarget.EndsWith("/__pixelcore/status", StringComparison.OrdinalIgnoreCase))
+                    if (rawTarget.StartsWith("/proxy.pac", StringComparison.OrdinalIgnoreCase) ||
+                        rawTarget.StartsWith("/__pixelcore/", StringComparison.OrdinalIgnoreCase))
                     {
-                        string hostHdr = ExtractHeader(headerStr, "Host").Trim();
-                        int listenPort = _localPort;
-                        try
-                        {
-                            IPEndPoint lep = localClient.Client.LocalEndPoint as IPEndPoint;
-                            if (lep != null && lep.Port > 0) listenPort = lep.Port;
-                        }
-                        catch { }
-                        bool validLocalHost =
-                            string.Equals(hostHdr, "127.0.0.1", StringComparison.OrdinalIgnoreCase) ||
-                            string.Equals(hostHdr, "127.0.0.1:" + listenPort.ToString(CultureInfo.InvariantCulture), StringComparison.OrdinalIgnoreCase);
-                        if (!validLocalHost)
-                        {
-                            byte[] forbidden = Encoding.ASCII.GetBytes("HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
-                            await localStream.WriteAsync(forbidden, 0, forbidden.Length).ConfigureAwait(false);
-                            return;
-                        }
-                        ServeTelemetryApi(localStream);
+                        await HandleLocalControlHttpAsync(localClient, localStream, method, rawTarget, headerStr, extraBody).ConfigureAwait(false);
                         return;
                     }
 
@@ -2893,7 +3195,39 @@ namespace PixelTunnel
 
                 if (string.IsNullOrEmpty(targetHost) || targetPort <= 0) return;
 
-                if (ShouldBypassDirect(targetHost))
+                bool bypassDirect;
+                string routeRule;
+                ClassifyRoute(targetHost, out bypassDirect, out routeRule);
+
+                if (!suppressRadar && !string.Equals(targetHost, "127.0.0.1", StringComparison.OrdinalIgnoreCase))
+                {
+                    int clientPid = 0;
+                    string clientProc = "";
+                    try
+                    {
+                        IPEndPoint rep = localClient.Client.RemoteEndPoint as IPEndPoint;
+                        if (rep != null && IPAddress.IsLoopback(rep.Address))
+                        {
+                            Win32TcpProcessResolver.ResolveLocalPortOwner(rep.Port, out clientPid, out clientProc);
+                        }
+                    }
+                    catch { }
+                    string protoName = isSocks5 ? "SOCKS5" : (isHttpConnect ? "HTTPS" : "HTTP");
+                    RecordLiveRoute(
+                        clientPid,
+                        string.IsNullOrEmpty(clientProc) ? "local" : clientProc,
+                        targetHost,
+                        targetPort,
+                        protoName,
+                        bypassDirect ? "direct" : "tunnel",
+                        routeRule,
+                        bypassDirect ? "DIRECT" : (ActiveNodeName ?? "NL-Edge"),
+                        bypassDirect ? "direct" : "ai",
+                        bypassDirect ? 0 : ActiveNodeLatencyMs,
+                        "");
+                }
+
+                if (bypassDirect)
                 {
                     await BridgeDirectAsync(localClient, localStream, targetHost, targetPort, isHttpConnect, isSocks5, initialPayload).ConfigureAwait(false);
                 }
@@ -3514,8 +3848,9 @@ namespace PixelTunnel
             });
         }
 
-        private static PixelWarmTunnel CreatePwp2Tunnel(PixelServerNode node, int connectTimeoutMs)
+        private static PixelWarmTunnel CreatePwp2Tunnel(PixelServerNode node, int connectTimeoutMs = 2400)
         {
+            if (connectTimeoutMs <= 0) connectTimeoutMs = 2400;
             TcpClient tcp = new TcpClient();
             try
             {
@@ -3524,11 +3859,21 @@ namespace PixelTunnel
                 tcp.SendTimeout = 12000;
 
                 IAsyncResult ar = tcp.BeginConnect(node.Host, node.Port, null, null);
-                if (!ar.AsyncWaitHandle.WaitOne(connectTimeoutMs))
+                WaitHandle wh = ar.AsyncWaitHandle;
+                try
                 {
-                    throw new TimeoutException("Connect timeout to " + node.Name);
+                    if (!wh.WaitOne(connectTimeoutMs))
+                    {
+                        try { tcp.Close(); } catch { }
+                        try { ((IDisposable)tcp).Dispose(); } catch { }
+                        throw new TimeoutException("Connect timeout to " + node.Name);
+                    }
+                    tcp.EndConnect(ar);
                 }
-                tcp.EndConnect(ar);
+                finally
+                {
+                    try { wh.Close(); } catch { }
+                }
                 EnableTcpKeepAlive(tcp.Client);
 
                 PixelStreamCipher enc;
@@ -3537,8 +3882,13 @@ namespace PixelTunnel
                 bool negotiatedMux;
                 Stream transport = HandshakeWithServer(tcp, node, false, out enc, out dec, out nativeTlsBulk, out negotiatedMux);
 
-                node.IsOnline = true;
-                node.FailCount = 0;
+                lock (_nodesLock)
+                {
+                    node.IsOnline = true;
+                    node.FailCount = 0;
+                    node.LastHealthMeasuredUtc = DateTime.UtcNow;
+                    SnapshotNodeHealthLocked(node);
+                }
 
                 return new PixelWarmTunnel
                 {
@@ -3554,6 +3904,7 @@ namespace PixelTunnel
             catch
             {
                 try { tcp.Close(); } catch { }
+                try { ((IDisposable)tcp).Dispose(); } catch { }
                 throw;
             }
         }
@@ -3586,17 +3937,22 @@ namespace PixelTunnel
                     {
                         try
                         {
-                            tunnel = CreatePwp2Tunnel(cand, 4200);
+                            tunnel = CreatePwp2Tunnel(cand, 2400);
                             if (tunnel != null) break;
                         }
                         catch
                         {
                             if (!string.IsNullOrEmpty(LastLicenseError)) return;
-                            cand.FailCount++;
-                            if (cand.FailCount >= 2)
+                            lock (_nodesLock)
                             {
-                                cand.IsOnline = false;
-                                cand.LatencyMs = 9999;
+                                cand.FailCount++;
+                                cand.LastHealthMeasuredUtc = DateTime.UtcNow;
+                                if (cand.FailCount >= 2)
+                                {
+                                    cand.IsOnline = false;
+                                    cand.LatencyMs = 9999;
+                                }
+                                SnapshotNodeHealthLocked(cand);
                             }
                         }
                     }
@@ -4124,9 +4480,10 @@ namespace PixelTunnel
 
             SampleLiveSpeed();
             long uptimeSec = (long)(DateTime.UtcNow - _startTime).TotalSeconds;
+            string standby = FindStandbyNodeNameLocked();
             string body = string.Format(
                 CultureInfo.InvariantCulture,
-                "{{\"engine\":\"PixelCore v3.0 (v{23})\",\"engine_version\":\"{23}\",\"protocol\":\"{0}\",\"region\":\"{1}\",\"manifest_ver\":{2},\"manifest_src\":\"{3}\",\"mux_streams\":{4},\"udp_assocs\":{5},\"dpi_clienthello_split\":{6},\"dpi_profile\":\"{7}\",\"anti_freeze_ok\":{8},\"dpi_escalations\":{9},\"clock_offset_sec\":{22},\"license_tier\":\"{10}\",\"days_left\":{11},\"devices_used\":{12},\"devices_max\":{13},\"speed_mbps\":{14:0.00},\"latest_version\":\"{15}\",\"license_error\":\"{16}\",\"uptime_sec\":{17},\"active_connections\":{18},\"bytes_up\":{19},\"bytes_down\":{20},\"nodes\":{21}}}",
+                "{{\"engine\":\"PixelCore v3.0 (v{23})\",\"engine_version\":\"{23}\",\"protocol\":\"{0}\",\"region\":\"{1}\",\"manifest_ver\":{2},\"manifest_src\":\"{3}\",\"mux_streams\":{4},\"udp_assocs\":{5},\"dpi_clienthello_split\":{6},\"dpi_profile\":\"{7}\",\"anti_freeze_ok\":{8},\"dpi_escalations\":{9},\"clock_offset_sec\":{22},\"license_tier\":\"{10}\",\"days_left\":{11},\"devices_used\":{12},\"devices_max\":{13},\"speed_mbps\":{14:0.00},\"latest_version\":\"{15}\",\"license_error\":\"{16}\",\"uptime_sec\":{17},\"active_connections\":{18},\"bytes_up\":{19},\"bytes_down\":{20},\"utls_profile\":\"{24}\",\"standby_node\":\"{25}\",\"standby_ready\":{26},\"failover_count\":{27},\"instant_wake_count\":{28},\"pac_rev\":{29},\"wsl_bridge_ip\":\"{30}\",\"nodes\":{21}}}",
                 EscapeJson(ActiveProtocol ?? "PWP-3 Mux"),
                 EscapeJson(_preferredRegion),
                 ManifestVersion,
@@ -4150,7 +4507,14 @@ namespace PixelTunnel
                 Interlocked.Read(ref _totalBytesDown),
                 nodesJson.ToString(),
                 Interlocked.Read(ref _clockOffsetSeconds),
-                ENGINE_VERSION);
+                ENGINE_VERSION,
+                UsingGoEngine ? "chrome" : "csharp-fallback",
+                EscapeJson(standby),
+                StandbyReady ? "true" : "false",
+                FailoverCount,
+                InstantWakeCount,
+                _pacRevision,
+                EscapeJson(ActiveWslBridgeIp ?? ""));
 
             byte[] bodyBytes = Encoding.UTF8.GetBytes(body);
             string respHdr =
@@ -4555,13 +4919,32 @@ namespace PixelTunnel
 
                             Stopwatch sw = Stopwatch.StartNew();
                             IAsyncResult ar = tcp.BeginConnect(node.Host, node.Port, null, null);
-                            if (!ar.AsyncWaitHandle.WaitOne(Math.Min(timeoutMs, 2400)))
+                            WaitHandle wh = ar.AsyncWaitHandle;
+                            try
                             {
-                                res.Error = "TCP таймаут";
-                                node.LatencyMs = 9999;
-                                return res;
+                                if (!wh.WaitOne(Math.Min(timeoutMs, 2400)))
+                                {
+                                    try { tcp.Close(); } catch { }
+                                    try { ((IDisposable)tcp).Dispose(); } catch { }
+                                    res.Ok = false;
+                                    res.Error = "TCP таймаут";
+                                    lock (_nodesLock)
+                                    {
+                                        node.IsOnline = false;
+                                        node.ProbeVerified = false;
+                                        node.FailCount++;
+                                        node.LatencyMs = 9999;
+                                        node.LastHealthMeasuredUtc = DateTime.UtcNow;
+                                        SnapshotNodeHealthLocked(node);
+                                    }
+                                    return res;
+                                }
+                                tcp.EndConnect(ar);
                             }
-                            tcp.EndConnect(ar);
+                            finally
+                            {
+                                try { wh.Close(); } catch { }
+                            }
 
                             PixelStreamCipher enc;
                             PixelStreamCipher dec;
@@ -4587,18 +4970,29 @@ namespace PixelTunnel
                                 {
                                     res.Ok = false;
                                     res.Error = "ТСПУ 16KB фриз";
-                                    node.ProbeVerified = false;
-                                    node.IsOnline = false;
-                                    node.LatencyMs = 9999;
+                                    lock (_nodesLock)
+                                    {
+                                        node.ProbeVerified = false;
+                                        node.IsOnline = false;
+                                        node.FailCount++;
+                                        node.LatencyMs = 9999;
+                                        node.LastHealthMeasuredUtc = DateTime.UtcNow;
+                                        SnapshotNodeHealthLocked(node);
+                                    }
                                     return res;
                                 }
 
                                 res.Ok = true;
                                 res.Error = null;
-                                node.IsOnline = true;
-                                node.ProbeVerified = true;
-                                node.FailCount = 0;
-                                node.LatencyMs = Math.Max(1, res.HandshakeMs / 2);
+                                lock (_nodesLock)
+                                {
+                                    node.IsOnline = true;
+                                    node.ProbeVerified = true;
+                                    node.FailCount = 0;
+                                    node.LatencyMs = Math.Max(1, res.HandshakeMs / 2);
+                                    node.LastHealthMeasuredUtc = DateTime.UtcNow;
+                                    SnapshotNodeHealthLocked(node);
+                                }
                             }
                             else
                             {
@@ -4606,9 +5000,14 @@ namespace PixelTunnel
                                 res.Ok = true;
                                 res.Error = null;
                                 res.AntiFreezeOk = true;
-                                node.IsOnline = true;
-                                node.FailCount = 0;
-                                node.LatencyMs = Math.Max(1, res.HandshakeMs / 2);
+                                lock (_nodesLock)
+                                {
+                                    node.IsOnline = true;
+                                    node.FailCount = 0;
+                                    node.LatencyMs = Math.Max(1, res.HandshakeMs / 2);
+                                    node.LastHealthMeasuredUtc = DateTime.UtcNow;
+                                    SnapshotNodeHealthLocked(node);
+                                }
                                 try { tr.Close(); } catch { }
                             }
                             break;
@@ -4621,13 +5020,22 @@ namespace PixelTunnel
                             }
                             res.Ok = false;
                             res.Error = ex.Message;
-                            node.LatencyMs = 9999;
+                            lock (_nodesLock)
+                            {
+                                node.IsOnline = false;
+                                node.ProbeVerified = false;
+                                node.FailCount++;
+                                node.LatencyMs = 9999;
+                                node.LastHealthMeasuredUtc = DateTime.UtcNow;
+                                SnapshotNodeHealthLocked(node);
+                            }
                             break;
                         }
                         finally
                         {
                             if (tempMux != null) tempMux.Dispose();
                             try { tcp.Close(); } catch { }
+                            try { ((IDisposable)tcp).Dispose(); } catch { }
                         }
                     }
                     return res;
@@ -4635,6 +5043,13 @@ namespace PixelTunnel
             }
 
             await Task.WhenAll(tasks).ConfigureAwait(false);
+            lock (_nodesLock)
+            {
+                foreach (var n in snapshot)
+                {
+                    SnapshotNodeHealthLocked(n);
+                }
+            }
 
             List<NodeBenchmarkResult> results = new List<NodeBenchmarkResult>(tasks.Length);
             NodeBenchmarkResult bestMux = null;
@@ -4668,6 +5083,1720 @@ namespace PixelTunnel
             }
 
             return results;
+        }
+
+        // =========================================================================
+        // V2.0 CONTROL API, SMART PAC, LIVE RADAR, WSL2 BRIDGE & GO CORE FORWARDING
+        // =========================================================================
+        private static string GenerateLocalTokenHex(int byteLen)
+        {
+            byte[] buf = new byte[byteLen];
+            using (var rng = RandomNumberGenerator.Create())
+            {
+                rng.GetBytes(buf);
+            }
+            var sb = new StringBuilder(byteLen * 2);
+            foreach (byte b in buf) sb.Append(b.ToString("x2", CultureInfo.InvariantCulture));
+            return sb.ToString();
+        }
+
+        private static string FindStandbyNodeNameLocked()
+        {
+            lock (_nodesLock)
+            {
+                string active = ActiveNodeName ?? "";
+                foreach (var n in _nodes)
+                {
+                    if (n != null && !string.Equals(n.Name, active, StringComparison.OrdinalIgnoreCase) && n.IsOnline)
+                    {
+                        StandbyNodeName = n.Name;
+                        StandbyReady = true;
+                        return n.Name;
+                    }
+                }
+            }
+            StandbyReady = false;
+            return StandbyNodeName ?? "";
+        }
+
+        private static void EnsurePowerModeHook()
+        {
+            if (Interlocked.CompareExchange(ref _powerHookRegistered, 1, 0) == 0)
+            {
+                try
+                {
+                    SystemEvents.PowerModeChanged += (s, e) =>
+                    {
+                        if (e.Mode == PowerModes.Resume && IsRunning)
+                        {
+                            Task.Run(() => TriggerInstantWakeAsync("power_resume"));
+                        }
+                    };
+                }
+                catch { }
+            }
+        }
+
+        private static void TryStartWslBridgeListeners(CancellationToken token)
+        {
+            try
+            {
+                IPAddress wslIp = FindWslBridgeIpv4();
+                if (wslIp == null) return;
+                _wslHttpListener = new TcpListener(wslIp, _localPort);
+                _wslHttpListener.Start(128);
+                Task.Run(() => AcceptLoopAsync(_wslHttpListener, token));
+                if (_socksPort > 0 && _socksPort != _localPort)
+                {
+                    _wslSocksListener = new TcpListener(wslIp, _socksPort);
+                    _wslSocksListener.Start(128);
+                    Task.Run(() => AcceptLoopAsync(_wslSocksListener, token));
+                }
+                ActiveWslBridgeIp = wslIp.ToString();
+            }
+            catch
+            {
+                ActiveWslBridgeIp = "";
+            }
+        }
+
+        public static IPAddress FindWslBridgeIpv4()
+        {
+            try
+            {
+                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.OperationalStatus != OperationalStatus.Up) continue;
+                    string combined = (ni.Name + " " + ni.Description);
+                    if (combined.IndexOf("WSL", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    foreach (UnicastIPAddressInformation ua in ni.GetIPProperties().UnicastAddresses)
+                    {
+                        if (ua.Address != null && ua.Address.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(ua.Address))
+                        {
+                            return ua.Address;
+                        }
+                    }
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        private static async Task GoTelemetryPollLoopAsync(CancellationToken token)
+        {
+            while (!token.IsCancellationRequested && IsRunning && UsingGoEngine)
+            {
+                try
+                {
+                    await SyncGoTelemetryAsync().ConfigureAwait(false);
+                }
+                catch { }
+                try { await Task.Delay(1500, token).ConfigureAwait(false); } catch { break; }
+            }
+        }
+
+        public static async Task SyncGoTelemetryAsync()
+        {
+            if (!IsRunning || !UsingGoEngine) return;
+            try
+            {
+                string raw = await QueryLocalEndpointAsync("GET", "/__pixelcore/v4/status", null, 2500).ConfigureAwait(false);
+                if (string.IsNullOrEmpty(raw))
+                    raw = await QueryLocalEndpointAsync("GET", "/__pixelcore/telemetry", null, 2500).ConfigureAwait(false);
+                var obj = MiniJson.Deserialize(raw) as Dictionary<string, object>;
+                if (obj == null) return;
+
+                string proto = MiniJson.GetStr(obj, "protocol");
+                if (!string.IsNullOrEmpty(proto)) ActiveProtocol = proto;
+                string node = MiniJson.GetStr(obj, "active_node");
+                if (!string.IsNullOrEmpty(node)) ActiveNodeName = node;
+                string standby = MiniJson.GetStr(obj, "standby_node");
+                if (!string.IsNullOrEmpty(standby)) StandbyNodeName = standby;
+                StandbyReady = MiniJson.GetBool(obj, "standby_ready", StandbyReady);
+                FailoverCount = MiniJson.GetInt(obj, "failover_count", FailoverCount);
+                InstantWakeCount = MiniJson.GetInt(obj, "instant_wake_count", InstantWakeCount);
+                string wakeReason = MiniJson.GetStr(obj, "last_wake_reason");
+                if (wakeReason != null) LastWakeReason = wakeReason;
+                LastWakeUnix = MiniJson.GetLong(obj, "last_wake_unix", LastWakeUnix);
+                int pr = MiniJson.GetInt(obj, "pac_rev", 0);
+                if (pr > 0) _pacRevision = pr;
+                string wsl = MiniJson.GetStr(obj, "wsl_bridge_ip");
+                if (wsl != null) ActiveWslBridgeIp = wsl;
+                string tier = MiniJson.GetStr(obj, "license_tier");
+                if (!string.IsNullOrEmpty(tier)) ServerLicenseTier = tier;
+                int dl = MiniJson.GetInt(obj, "days_left", int.MinValue);
+                if (dl != int.MinValue) ServerDaysLeft = dl;
+                int mv = MiniJson.GetInt(obj, "manifest_ver", 0);
+                if (mv > 0) ManifestVersion = mv;
+                string ms = MiniJson.GetStr(obj, "manifest_src");
+                if (!string.IsNullOrEmpty(ms)) ManifestSource = ms;
+                long bup = MiniJson.GetLong(obj, "bytes_up", -1);
+                if (bup >= 0) Interlocked.Exchange(ref _totalBytesUp, bup);
+                long bdn = MiniJson.GetLong(obj, "bytes_down", -1);
+                if (bdn >= 0) Interlocked.Exchange(ref _totalBytesDown, bdn);
+                long ac = MiniJson.GetLong(obj, "active_connections", -1);
+                if (ac >= 0) Interlocked.Exchange(ref _activeConns, ac);
+                double mbps = MiniJson.GetDouble(obj, "speed_mbps", -1.0);
+                if (mbps >= 0.0) LiveTotalMbps = mbps;
+                SampleLiveSpeed();
+            }
+            catch { }
+        }
+
+        private static void RecordLiveRoute(int pid, string procName, string domain, int port, string proto, string action, string rule, string node, string role, int pingMs, string error)
+        {
+            long seq = Interlocked.Increment(ref _liveRouteSeq);
+            DateTime now = DateTime.Now;
+            var entry = new LiveRouteEntry
+            {
+                Seq = seq,
+                Ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                TimeStr = now.ToString("HH:mm:ss", CultureInfo.InvariantCulture),
+                Pid = pid,
+                ProcessName = procName ?? "",
+                Domain = domain ?? "",
+                Port = port,
+                Proto = proto ?? "TCP",
+                Action = action ?? "tunnel",
+                Rule = rule ?? "",
+                Node = node ?? "",
+                Role = role ?? "",
+                PingMs = pingMs,
+                BytesUp = 0,
+                BytesDown = 0,
+                Error = error ?? ""
+            };
+            lock (_liveRoutesLock)
+            {
+                _liveRoutes.AddFirst(entry);
+                while (_liveRoutes.Count > 100) _liveRoutes.RemoveLast();
+            }
+        }
+
+        public static string GeneratePacScript()
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("// PixelTunnel v" + ENGINE_VERSION + " Smart PAC (rev " + _pacRevision + ")");
+            sb.AppendLine("function FindProxyForURL(url, host) {");
+            sb.AppendLine("  var h = (host || '').toLowerCase();");
+            sb.AppendLine("  if (isPlainHostName(h) || shExpMatch(h, '127.*') || shExpMatch(h, 'localhost') || shExpMatch(h, '10.*') || shExpMatch(h, '192.168.*') || isInNet(h, '172.16.0.0', '255.240.0.0')) return 'DIRECT';");
+            sb.AppendLine("  var px = 'PROXY 127.0.0.1:" + _localPort.ToString(CultureInfo.InvariantCulture) + "; DIRECT';");
+
+            foreach (string dom in _proxyDomains)
+            {
+                string d = (dom ?? "").Trim().TrimStart('.').ToLowerInvariant();
+                if (string.IsNullOrEmpty(d)) continue;
+                sb.AppendLine("  if (dnsDomainIs(h, '." + d + "') || h === '" + d + "') return px;");
+            }
+
+            sb.AppendLine("  if (shExpMatch(h, '*.ru') || shExpMatch(h, '*.su') || shExpMatch(h, '*.by') || shExpMatch(h, '*.xn--p1ai')) return 'DIRECT';");
+
+            foreach (string dom in _directDomains)
+            {
+                string d = (dom ?? "").Trim().TrimStart('.').ToLowerInvariant();
+                if (string.IsNullOrEmpty(d)) continue;
+                sb.AppendLine("  if (dnsDomainIs(h, '." + d + "') || h === '" + d + "') return 'DIRECT';");
+            }
+
+            sb.AppendLine(_defaultOutboundIsProxy ? "  return px;" : "  return 'DIRECT';");
+            sb.AppendLine("}");
+            return sb.ToString();
+        }
+
+        private static async Task<string> ReadHttpBodyAsync(NetworkStream stream, string headerStr, byte[] extraBody)
+        {
+            int contentLen = 0;
+            int.TryParse((ExtractHeader(headerStr, "Content-Length") ?? "").Trim(), out contentLen);
+            if (contentLen <= 0 || contentLen > 262144)
+                return (extraBody != null && extraBody.Length > 0) ? Encoding.UTF8.GetString(extraBody) : "";
+
+            byte[] buf = new byte[contentLen];
+            int have = 0;
+            if (extraBody != null && extraBody.Length > 0)
+            {
+                have = Math.Min(extraBody.Length, contentLen);
+                Buffer.BlockCopy(extraBody, 0, buf, 0, have);
+            }
+            while (have < contentLen)
+            {
+                int r = await stream.ReadAsync(buf, have, contentLen - have).ConfigureAwait(false);
+                if (r <= 0) break;
+                have += r;
+            }
+            return Encoding.UTF8.GetString(buf, 0, have);
+        }
+
+        private static async Task WriteHttpResponseAsync(NetworkStream stream, int code, string statusText, string contentType, string body)
+        {
+            byte[] data = Encoding.UTF8.GetBytes(body ?? "");
+            string hdr = string.Format(
+                CultureInfo.InvariantCulture,
+                "HTTP/1.1 {0} {1}\r\nContent-Type: {2}\r\nCache-Control: no-store\r\nContent-Length: {3}\r\nConnection: close\r\n\r\n",
+                code, statusText, contentType, data.Length);
+            byte[] hdrBytes = Encoding.ASCII.GetBytes(hdr);
+            await stream.WriteAsync(hdrBytes, 0, hdrBytes.Length).ConfigureAwait(false);
+            if (data.Length > 0)
+                await stream.WriteAsync(data, 0, data.Length).ConfigureAwait(false);
+        }
+
+        private static async Task HandleLocalControlHttpAsync(TcpClient localClient, NetworkStream localStream, string method, string rawTarget, string headerStr, byte[] extraBody)
+        {
+            string pathOnly = rawTarget.Split('?')[0].ToLowerInvariant();
+            string hostHdr = (ExtractHeader(headerStr, "Host") ?? "").Trim();
+            int listenPort = _localPort;
+            try
+            {
+                IPEndPoint lep = localClient.Client.LocalEndPoint as IPEndPoint;
+                if (lep != null && lep.Port > 0) listenPort = lep.Port;
+            }
+            catch { }
+
+            string portStr = listenPort.ToString(CultureInfo.InvariantCulture);
+            bool validLoopbackHost =
+                string.Equals(hostHdr, "127.0.0.1", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(hostHdr, "127.0.0.1:" + portStr, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(hostHdr, "localhost", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(hostHdr, "localhost:" + portStr, StringComparison.OrdinalIgnoreCase) ||
+                (!string.IsNullOrEmpty(ActiveWslBridgeIp) &&
+                 (string.Equals(hostHdr, ActiveWslBridgeIp, StringComparison.OrdinalIgnoreCase) ||
+                  string.Equals(hostHdr, ActiveWslBridgeIp + ":" + portStr, StringComparison.OrdinalIgnoreCase)));
+
+            if (!validLoopbackHost)
+            {
+                await WriteHttpResponseAsync(localStream, 403, "Forbidden", "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"invalid_host\"}").ConfigureAwait(false);
+                return;
+            }
+
+            if (pathOnly == "/proxy.pac")
+            {
+                await WriteHttpResponseAsync(localStream, 200, "OK", "application/x-ns-proxy-autoconfig; charset=utf-8", GeneratePacScript()).ConfigureAwait(false);
+                return;
+            }
+
+            if (pathOnly == "/__pixelcore/status" || pathOnly == "/__pixelcore/telemetry")
+            {
+                ServeTelemetryApi(localStream);
+                return;
+            }
+
+            if (pathOnly.StartsWith("/__pixelcore/v4/", StringComparison.Ordinal))
+            {
+                string tokHdr = (ExtractHeader(headerStr, "X-Pixel-Local-Token") ?? "").Trim();
+                if (!string.IsNullOrEmpty(_localControlToken) && !string.Equals(tokHdr, _localControlToken, StringComparison.Ordinal))
+                {
+                    await WriteHttpResponseAsync(localStream, 403, "Forbidden", "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"unauthorized\"}").ConfigureAwait(false);
+                    return;
+                }
+
+                string reqBody = (method == "POST" || method == "PUT")
+                    ? await ReadHttpBodyAsync(localStream, headerStr, extraBody).ConfigureAwait(false)
+                    : "";
+
+                string jsonOut = "{}";
+                if (pathOnly == "/__pixelcore/v4/status")
+                    jsonOut = BuildCSharpStatusV4Json();
+                else if (pathOnly == "/__pixelcore/v4/live-routes")
+                    jsonOut = BuildCSharpLiveRoutesJson();
+                else if (pathOnly == "/__pixelcore/v4/ai-pulse")
+                    jsonOut = await ProbeAiPulseCSharpAsync(false).ConfigureAwait(false);
+                else if (pathOnly == "/__pixelcore/v4/reload-rules")
+                    jsonOut = ApplyCSharpReloadRules(reqBody);
+                else if (pathOnly == "/__pixelcore/v4/instant-wake")
+                    jsonOut = await ExecuteCSharpInstantWakeAsync(reqBody).ConfigureAwait(false);
+                else if (pathOnly == "/__pixelcore/v4/run-xray")
+                    jsonOut = await RunCSharpXrayAsync().ConfigureAwait(false);
+                else
+                {
+                    await WriteHttpResponseAsync(localStream, 404, "Not Found", "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"not_found\"}").ConfigureAwait(false);
+                    return;
+                }
+
+                await WriteHttpResponseAsync(localStream, 200, "OK", "application/json; charset=utf-8", jsonOut).ConfigureAwait(false);
+                return;
+            }
+
+            await WriteHttpResponseAsync(localStream, 404, "Not Found", "text/plain; charset=utf-8", "Not Found").ConfigureAwait(false);
+        }
+
+        private static string BuildCSharpStatusV4Json()
+        {
+            SampleLiveSpeed();
+            long uptimeSec = (long)(DateTime.UtcNow - _startTime).TotalSeconds;
+            string standby = FindStandbyNodeNameLocked();
+            var d = new Dictionary<string, object>
+            {
+                { "ok", true },
+                { "engine", "PixelCore-CSharp-Fallback" },
+                { "engine_version", ENGINE_VERSION },
+                { "connected", IsRunning },
+                { "protocol", ActiveProtocol ?? "PWP-3 Mux" },
+                { "utls_profile", "csharp-fallback" },
+                { "dpi_profile", AntiDpiProfileName },
+                { "active_node", ActiveNodeName ?? "NL-Edge-443" },
+                { "active_role", "ai" },
+                { "standby_node", standby },
+                { "standby_ready", StandbyReady },
+                { "failover_count", FailoverCount },
+                { "instant_wake_count", InstantWakeCount },
+                { "last_wake_reason", LastWakeReason ?? "" },
+                { "last_wake_unix", LastWakeUnix },
+                { "pac_rev", _pacRevision },
+                { "http_port", _localPort },
+                { "socks_port", _socksPort },
+                { "wsl_bridge_ip", ActiveWslBridgeIp ?? "" },
+                { "license_tier", ServerLicenseTier ?? "" },
+                { "days_left", ServerDaysLeft },
+                { "manifest_ver", ManifestVersion },
+                { "manifest_src", ManifestSource ?? "Embedded" },
+                { "uptime_sec", uptimeSec },
+                { "bytes_up", Interlocked.Read(ref _totalBytesUp) },
+                { "bytes_down", Interlocked.Read(ref _totalBytesDown) },
+                { "active_connections", Interlocked.Read(ref _activeConns) }
+            };
+            return MiniJson.Serialize(d);
+        }
+
+        private static string BuildCSharpLiveRoutesJson()
+        {
+            var list = new List<object>();
+            lock (_liveRoutesLock)
+            {
+                foreach (var e in _liveRoutes)
+                {
+                    list.Add(new Dictionary<string, object>
+                    {
+                        { "seq", e.Seq },
+                        { "ts", e.Ts },
+                        { "time", e.TimeStr },
+                        { "pid", e.Pid },
+                        { "process", e.ProcessName },
+                        { "domain", e.Domain },
+                        { "port", e.Port },
+                        { "proto", e.Proto },
+                        { "action", e.Action },
+                        { "rule", e.Rule },
+                        { "node", e.Node },
+                        { "role", e.Role },
+                        { "ping_ms", e.PingMs },
+                        { "bytes_up", e.BytesUp },
+                        { "bytes_down", e.BytesDown },
+                        { "error", e.Error }
+                    });
+                }
+            }
+            return MiniJson.Serialize(new Dictionary<string, object>
+            {
+                { "ok", true },
+                { "pac_rev", _pacRevision },
+                { "entries", list }
+            });
+        }
+
+        private static string[] GetCSharpCategoryDomains(string cat)
+        {
+            switch ((cat ?? "").Trim().ToLowerInvariant())
+            {
+                case "antigravity":
+                    return new[]
+                    {
+                        "antigravity.google", "antigravity-unleash.goog", "daily-cloudcode-pa.googleapis.com",
+                        "cloudcode-pa.googleapis.com", "generativelanguage.googleapis.com", "aistudio.google.com",
+                        "gemini.google.com", "makersuite.google.com", "alkalimakersuite-pa.clients6.google.com",
+                        "notebooklm.google.com", "labs.google", "deepmind.google", "ai.google.dev",
+                        "googleapis.com", "oauth2.googleapis.com", "www.googleapis.com",
+                        "clients6.google.com", "clients1.google.com", "clients2.google.com", "clients3.google.com",
+                        "clients4.google.com", "clients5.google.com", "cloudaicompanion.googleapis.com",
+                        "daily-cloud-pa.clients6.google.com", "geminiweb-pa.clients6.google.com", "aicode.googleapis.com",
+                        "gstatic.com", "googleusercontent.com", "accounts.google.com", "google.com",
+                        "gvt1.com", "gvt2.com", "gvt3.com", "1e100.net", "pki.goog"
+                    };
+                case "mcp":
+                case "dev":
+                    return new[]
+                    {
+                        "npmjs.org", "registry.npmjs.org", "npmjs.com",
+                        "pypi.org", "files.pythonhosted.org", "pythonhosted.org", "astral.sh",
+                        "github.com", "api.github.com", "raw.githubusercontent.com", "githubusercontent.com", "githubassets.com", "ghcr.io",
+                        "huggingface.co", "hf.co", "smithery.ai", "context7.com", "modelcontextprotocol.io", "glama.ai",
+                        "deno.land", "jsr.io", "bun.sh", "pkg.dev", "docker.io", "cloudflare.com"
+                    };
+                case "ai":
+                    return new[]
+                    {
+                        "cursor.com", "cursor.sh", "cursorapi.com", "windsurf.com", "codeium.com",
+                        "openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com",
+                        "claude.ai", "anthropic.com", "perplexity.ai", "grok.com", "x.ai",
+                        "elevenlabs.io", "suno.com", "suno.ai", "midjourney.com", "klingai.com",
+                        "runwayml.com", "sora.com", "luma.ai", "lumalabs.ai", "heygen.com",
+                        "v0.dev", "bolt.new", "lovable.dev", "replit.com", "huggingface.co",
+                        "openrouter.ai", "together.ai", "groq.com", "deepseek.com", "mistral.ai",
+                        "cohere.com", "replicate.com", "civitai.com", "githubcopilot.com", "copilot.microsoft.com"
+                    };
+                case "media":
+                    return new[]
+                    {
+                        "discord.com", "discordapp.com", "discordapp.net", "discord.gg", "discord.media", "discordstatus.com",
+                        "youtube.com", "googlevideo.com", "ytimg.com", "youtu.be", "youtubei.googleapis.com", "ggpht.com",
+                        "twitch.tv", "ttvnw.net", "jtvnw.net",
+                        "telegram.org", "t.me", "web.telegram.org", "tdesktop.com", "telesco.pe", "telegra.ph"
+                    };
+                case "social":
+                    return new[]
+                    {
+                        "telegram.org", "t.me", "web.telegram.org", "tdesktop.com", "telesco.pe", "telegra.ph",
+                        "spotify.com", "spotify.net", "scdn.co", "spotifycdn.com", "pscdn.co", "byspotify.com", "spotify.link", "spotilocal.com",
+                        "spclient.wg.spotify.com", "apresolve.spotify.com", "dealer.spotify.com", "login5.spotify.com", "accounts.spotify.com", "open.spotify.com",
+                        "audio-ak-spotify-com.akamaized.net", "heads4-ak-spotify-com.akamaized.net", "akamaized.net",
+                        "instagram.com", "cdninstagram.com", "facebook.com", "fbcdn.net",
+                        "twitter.com", "x.com", "twimg.com", "t.co", "threads.net",
+                        "tiktok.com", "linkedin.com", "netflix.com", "nflxvideo.net",
+                        "patreon.com", "reddit.com", "redd.it", "medium.com", "quora.com",
+                        "canva.com", "figma.com", "notion.so", "rutracker.org", "rutracker.net",
+                        "github.com", "githubusercontent.com", "githubassets.com",
+                        "vscode-cdn.net", "visualstudio.com", "jetbrains.com",
+                        "docker.com", "docker.io", "npmjs.org", "pypi.org", "cloudflare.com", "ipinfo.io"
+                    };
+                default:
+                    return new string[0];
+            }
+        }
+
+        private static string ApplyCSharpReloadRules(string bodyJson)
+        {
+            try
+            {
+                var req = !string.IsNullOrEmpty(bodyJson) ? MiniJson.Deserialize(bodyJson) as Dictionary<string, object> : null;
+                if (req == null)
+                {
+                    if (!string.IsNullOrEmpty(_activeConfigPath) && File.Exists(_activeConfigPath))
+                    {
+                        LoadCompatibleJsonString(File.ReadAllText(_activeConfigPath, Encoding.UTF8));
+                    }
+                }
+                else
+                {
+                    bool rebuildFromCats = false;
+                    var catsDict = MiniJson.GetDict(req, "categories");
+                    if (catsDict != null)
+                    {
+                        rebuildFromCats = true;
+                        var nextCats = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+                        foreach (var kv in catsDict)
+                            nextCats[kv.Key] = MiniJson.GetBool(catsDict, kv.Key, false);
+                        _activeCategories = nextCats;
+                    }
+
+                    if (req.ContainsKey("custom_proxy_domains") || req.ContainsKey("custom_proxy"))
+                    {
+                        string pKey = req.ContainsKey("custom_proxy_domains") ? "custom_proxy_domains" : "custom_proxy";
+                        var nextCustomProxy = new List<string>();
+                        foreach (string s in MiniJson.GetStrList(req, pKey))
+                        {
+                            string clean = (s ?? "").Trim().ToLowerInvariant();
+                            if (!string.IsNullOrEmpty(clean)) nextCustomProxy.Add(clean);
+                        }
+                        _customProxyList = nextCustomProxy;
+                        rebuildFromCats = rebuildFromCats || _activeCategories.Count > 0;
+                    }
+
+                    if (req.ContainsKey("custom_direct_domains") || req.ContainsKey("custom_direct"))
+                    {
+                        string dKey = req.ContainsKey("custom_direct_domains") ? "custom_direct_domains" : "custom_direct";
+                        var nextCustomDirect = new List<string>();
+                        foreach (string s in MiniJson.GetStrList(req, dKey))
+                        {
+                            string clean = (s ?? "").Trim().ToLowerInvariant();
+                            if (!string.IsNullOrEmpty(clean)) nextCustomDirect.Add(clean);
+                        }
+                        _customDirectList = nextCustomDirect;
+                    }
+
+                    if (req.ContainsKey("proxy_all"))
+                        _defaultOutboundIsProxy = MiniJson.GetBool(req, "proxy_all", _defaultOutboundIsProxy);
+
+                    var newDirect = new HashSet<string>(
+                        _baseDirectDomains.Count > 0 ? _baseDirectDomains : _directDomains,
+                        StringComparer.OrdinalIgnoreCase);
+                    var newProxy = rebuildFromCats
+                        ? new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                        : new HashSet<string>(_proxyDomains, StringComparer.OrdinalIgnoreCase);
+
+                    if (rebuildFromCats)
+                    {
+                        foreach (var kv in _activeCategories)
+                        {
+                            if (kv.Value)
+                            {
+                                foreach (string dom in GetCSharpCategoryDomains(kv.Key))
+                                    newProxy.Add(dom);
+                            }
+                        }
+                    }
+
+                    foreach (string cp in _customProxyList)
+                    {
+                        newProxy.Add(cp);
+                        newDirect.Remove(cp);
+                    }
+                    foreach (string cd in _customDirectList)
+                    {
+                        newDirect.Add(cd);
+                        newProxy.Remove(cd);
+                    }
+
+                    _proxyDomains = newProxy;
+                    _directDomains = newDirect;
+                }
+            }
+            catch { }
+
+            _pacRevision++;
+            return MiniJson.Serialize(new Dictionary<string, object>
+            {
+                { "ok", true },
+                { "pac_rev", _pacRevision },
+                { "proxy_domains", _proxyDomains.Count },
+                { "direct_domains", _directDomains.Count }
+            });
+        }
+
+        private static async Task<string> ExecuteCSharpInstantWakeAsync(string reqJson)
+        {
+            string reason = "manual";
+            try
+            {
+                var d = MiniJson.Deserialize(reqJson) as Dictionary<string, object>;
+                string r = d != null ? MiniJson.GetStr(d, "reason") : null;
+                if (!string.IsNullOrEmpty(r)) reason = r;
+            }
+            catch { }
+
+            var sw = Stopwatch.StartNew();
+            ResetMuxLanes();
+            DrainWarmPool();
+            CancellationToken tok = (_cts != null) ? _cts.Token : CancellationToken.None;
+            try { await EnsureInteractiveLaneWarmAsync(tok).ConfigureAwait(false); } catch { }
+            sw.Stop();
+
+            InstantWakeCount++;
+            LastWakeReason = reason;
+            LastWakeUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            _pacRevision++;
+
+            return MiniJson.Serialize(new Dictionary<string, object>
+            {
+                { "ok", IsRunning },
+                { "reason", reason },
+                { "pac_rev", _pacRevision },
+                { "standby_ready", StandbyReady },
+                { "active_node", ActiveNodeName ?? "" },
+                { "failover_ms", (int)sw.ElapsedMilliseconds },
+                { "instant_wake_count", InstantWakeCount }
+            });
+        }
+
+        private static void ObserveFaultedTask(Task t)
+        {
+            if (t != null)
+            {
+                t.ContinueWith(x => { var _ = x.Exception; }, TaskContinuationOptions.OnlyOnFaulted);
+            }
+        }
+
+        private static async Task<bool> AwaitSocketTaskAsync(Task opTask, TcpClient tcp, int remainingMs, CancellationToken ct)
+        {
+            if (remainingMs <= 0 || ct.IsCancellationRequested)
+            {
+                ObserveFaultedTask(opTask);
+                try { if (tcp != null) tcp.Close(); } catch { }
+                return false;
+            }
+            Task delayTask = ct.CanBeCanceled ? Task.Delay(remainingMs, ct) : Task.Delay(remainingMs);
+            Task winner = await Task.WhenAny(opTask, delayTask).ConfigureAwait(false);
+            if (winner != opTask)
+            {
+                ObserveFaultedTask(opTask);
+                try { if (tcp != null) tcp.Close(); } catch { }
+                return false;
+            }
+            await opTask.ConfigureAwait(false);
+            return true;
+        }
+
+        private static async Task<int> ReadWithTimeoutAsync(Stream s, byte[] buf, int offset, int count, TcpClient tcp, int remainingMs, CancellationToken ct)
+        {
+            if (remainingMs <= 0 || ct.IsCancellationRequested)
+            {
+                try { if (tcp != null) tcp.Close(); } catch { }
+                return -1;
+            }
+            Task<int> readTask = s.ReadAsync(buf, offset, count);
+            Task delayTask = ct.CanBeCanceled ? Task.Delay(remainingMs, ct) : Task.Delay(remainingMs);
+            Task winner = await Task.WhenAny(readTask, delayTask).ConfigureAwait(false);
+            if (winner != readTask)
+            {
+                ObserveFaultedTask(readTask);
+                try { if (tcp != null) tcp.Close(); } catch { }
+                return -1;
+            }
+            return await readTask.ConfigureAwait(false);
+        }
+
+        private static async Task<Dictionary<string, object>> ProbeSingleAiHostCSharpAsync(string host, CancellationToken ct)
+        {
+            const int totalTimeoutMs = 4000;
+            var sw = Stopwatch.StartNew();
+            int httpCode = 0;
+            string status;
+            try
+            {
+                using (var tcp = new TcpClient())
+                {
+                    tcp.ReceiveTimeout = totalTimeoutMs;
+                    tcp.SendTimeout = 2500;
+                    if (IsRunning && _localPort > 0)
+                    {
+                        if (!await AwaitSocketTaskAsync(tcp.ConnectAsync(IPAddress.Loopback, _localPort), tcp, totalTimeoutMs - (int)sw.ElapsedMilliseconds, ct).ConfigureAwait(false))
+                            return BuildAiPulseEntry("down", 0, (int)sw.ElapsedMilliseconds, host);
+                        NetworkStream ns = tcp.GetStream();
+                        byte[] connectReq = Encoding.ASCII.GetBytes("CONNECT " + host + ":443 HTTP/1.1\r\nHost: " + host + ":443\r\nX-Pixel-Internal-Probe: 1\r\n\r\n");
+                        if (!await AwaitSocketTaskAsync(ns.WriteAsync(connectReq, 0, connectReq.Length), tcp, totalTimeoutMs - (int)sw.ElapsedMilliseconds, ct).ConfigureAwait(false))
+                            return BuildAiPulseEntry("down", 0, (int)sw.ElapsedMilliseconds, host);
+                        byte[] connResp = new byte[512];
+                        int cr = await ReadWithTimeoutAsync(ns, connResp, 0, connResp.Length, tcp, totalTimeoutMs - (int)sw.ElapsedMilliseconds, ct).ConfigureAwait(false);
+                        string connHdr = cr > 0 ? Encoding.ASCII.GetString(connResp, 0, cr) : "";
+                        if (connHdr.IndexOf("200", StringComparison.Ordinal) < 0)
+                            return BuildAiPulseEntry("down", 0, (int)sw.ElapsedMilliseconds, host);
+                    }
+                    else
+                    {
+                        if (!await AwaitSocketTaskAsync(tcp.ConnectAsync(host, 443), tcp, totalTimeoutMs - (int)sw.ElapsedMilliseconds, ct).ConfigureAwait(false))
+                            return BuildAiPulseEntry("down", 0, (int)sw.ElapsedMilliseconds, host);
+                    }
+
+                    using (var ssl = new SslStream(tcp.GetStream(), false, (s, cert, chain, errs) => errs == SslPolicyErrors.None))
+                    {
+                        if (!await AwaitSocketTaskAsync(ssl.AuthenticateAsClientAsync(host), tcp, totalTimeoutMs - (int)sw.ElapsedMilliseconds, ct).ConfigureAwait(false))
+                            return BuildAiPulseEntry("down", 0, (int)sw.ElapsedMilliseconds, host);
+                        byte[] req = Encoding.ASCII.GetBytes("HEAD / HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\nUser-Agent: PixelTunnel/2.0\r\n\r\n");
+                        if (!await AwaitSocketTaskAsync(ssl.WriteAsync(req, 0, req.Length), tcp, totalTimeoutMs - (int)sw.ElapsedMilliseconds, ct).ConfigureAwait(false))
+                            return BuildAiPulseEntry("down", 0, (int)sw.ElapsedMilliseconds, host);
+                        byte[] respBuf = new byte[256];
+                        int n = await ReadWithTimeoutAsync(ssl, respBuf, 0, respBuf.Length, tcp, totalTimeoutMs - (int)sw.ElapsedMilliseconds, ct).ConfigureAwait(false);
+                        if (n > 12)
+                        {
+                            string first = Encoding.ASCII.GetString(respBuf, 0, n);
+                            Match m = Regex.Match(first, @"^HTTP/\d\.\d\s+(\d{3})");
+                            if (m.Success) int.TryParse(m.Groups[1].Value, out httpCode);
+                        }
+                    }
+                }
+            }
+            catch { }
+            sw.Stop();
+            if (httpCode >= 100 && httpCode < 500 && httpCode != 429) status = "ok";
+            else if (httpCode == 429 || httpCode == 503 || httpCode == 529) status = "degraded";
+            else status = "down";
+            return BuildAiPulseEntry(status, httpCode, (int)sw.ElapsedMilliseconds, host);
+        }
+
+        private static Dictionary<string, object> BuildAiPulseEntry(string status, int httpCode, int latencyMs, string host)
+        {
+            return new Dictionary<string, object>
+            {
+                { "status", status },
+                { "http_code", httpCode },
+                { "latency_ms", latencyMs },
+                { "host", host }
+            };
+        }
+
+        private static async Task<string> ProbeAiPulseCSharpAsync(bool forceRefresh)
+        {
+            lock (_aiPulseCacheLock)
+            {
+                if (!forceRefresh && !string.IsNullOrEmpty(_cachedAiPulseJson) && (DateTime.UtcNow - _cachedAiPulseUtc).TotalSeconds < 25)
+                {
+                    var cachedObj = MiniJson.Deserialize(_cachedAiPulseJson) as Dictionary<string, object>;
+                    if (cachedObj != null)
+                    {
+                        cachedObj["cached"] = true;
+                        return MiniJson.Serialize(cachedObj);
+                    }
+                }
+            }
+
+            CancellationToken ct = (_cts != null) ? _cts.Token : CancellationToken.None;
+            Task<Dictionary<string, object>> tGem = ProbeSingleAiHostCSharpAsync("daily-cloudcode-pa.googleapis.com", ct);
+            Task<Dictionary<string, object>> tCla = ProbeSingleAiHostCSharpAsync("api.anthropic.com", ct);
+            Task<Dictionary<string, object>> tOai = ProbeSingleAiHostCSharpAsync("api.openai.com", ct);
+            await Task.WhenAll(tGem, tCla, tOai).ConfigureAwait(false);
+
+            var payload = new Dictionary<string, object>
+            {
+                { "ok", true },
+                { "node", ActiveNodeName ?? "CSharp-Fallback" },
+                { "checked_at", DateTimeOffset.UtcNow.ToUnixTimeSeconds() },
+                { "ttl_sec", 30 },
+                { "cached", false },
+                { "providers", new Dictionary<string, object>
+                    {
+                        { "gemini", tGem.Result },
+                        { "claude", tCla.Result },
+                        { "openai", tOai.Result }
+                    }
+                }
+            };
+            string json = MiniJson.Serialize(payload);
+            lock (_aiPulseCacheLock)
+            {
+                _cachedAiPulseJson = json;
+                _cachedAiPulseUtc = DateTime.UtcNow;
+            }
+            return json;
+        }
+
+        private static async Task<string> RunCSharpXrayAsync()
+        {
+            var sw = Stopwatch.StartNew();
+            long driftSec;
+            string clockSrc;
+            bool clockSynced = false;
+            try { clockSynced = ProbeAndSyncClockOffset(out driftSec, out clockSrc); }
+            catch { driftSec = 0; clockSrc = "none"; }
+
+            string certIssuer = "";
+            string avMitm = "";
+            bool sslClean = true;
+            try { sslClean = !DetectSslMitmInterceptor(out certIssuer, out avMitm); } catch { }
+
+            List<NodeBenchmarkResult> bench = new List<NodeBenchmarkResult>();
+            try { bench = await RunParallelNodeBenchmarkAsync(3200).ConfigureAwait(false); } catch { }
+
+            int healthyNodes = 0;
+            int bestPing = 9999;
+            foreach (var b in bench)
+            {
+                if (b.Ok)
+                {
+                    healthyNodes++;
+                    if (b.HandshakeMs < bestPing) bestPing = b.HandshakeMs;
+                }
+            }
+
+            string pulseRaw = await ProbeAiPulseCSharpAsync(true).ConfigureAwait(false);
+            var pulseObj = MiniJson.Deserialize(pulseRaw) as Dictionary<string, object>;
+            var provs = pulseObj != null ? MiniJson.GetDict(pulseObj, "providers") : null;
+            var gem = provs != null ? MiniJson.GetDict(provs, "gemini") : null;
+            var cla = provs != null ? MiniJson.GetDict(provs, "claude") : null;
+            var oai = provs != null ? MiniJson.GetDict(provs, "openai") : null;
+            string gemSt = gem != null ? MiniJson.GetStr(gem, "status") : "down";
+            string claSt = cla != null ? MiniJson.GetStr(cla, "status") : "down";
+            string oaiSt = oai != null ? MiniJson.GetStr(oai, "status") : "down";
+            int gemMs = gem != null ? MiniJson.GetInt(gem, "latency_ms", 0) : 0;
+
+            bool aiAllOk = (gemSt == "ok" && claSt == "ok");
+            string utlsStatus = string.IsNullOrEmpty(GoEngineFallbackReason) && sslClean ? "ok" : "warn";
+            string utlsSummary = !sslClean
+                ? ("Обнаружен SSL-перехватчик: " + (string.IsNullOrEmpty(avMitm) ? certIssuer : avMitm))
+                : (!string.IsNullOrEmpty(GoEngineFallbackReason) ? GoEngineFallbackReason : "TLS без локального MITM-перехвата");
+
+            var cards = new List<object>
+            {
+                new Dictionary<string, object> {
+                    { "id", "isp_hosts" }, { "title", "Провайдер & Hosts" },
+                    { "status", clockSynced ? "ok" : "warn" },
+                    { "summary", clockSynced ? ("Время синхронизировано (" + clockSrc + ", сдвиг " + driftSec + "s)") : "Требуется проверка Hosts/DNS провайдера" },
+                    { "latency_ms", 0 }
+                },
+                new Dictionary<string, object> {
+                    { "id", "tspu_mtu" }, { "title", "ТСПУ 64KB & MTU Upload" },
+                    { "status", LastAntiFreezeProbePassed ? "ok" : "warn" },
+                    { "summary", "Anti-DPI профиль: " + AntiDpiProfileName + (LastAntiFreezeProbePassed ? " (без 16KB фризов)" : " (эскалация DPI)") },
+                    { "latency_ms", bestPing < 9999 ? bestPing : 0 }
+                },
+                new Dictionary<string, object> {
+                    { "id", "utls_mitm" }, { "title", "uTLS Chrome & Антивирус SSL" },
+                    { "status", utlsStatus },
+                    { "summary", utlsSummary },
+                    { "latency_ms", 0 }
+                },
+                new Dictionary<string, object> {
+                    { "id", "node_matrix" }, { "title", "Ноды & Горячий резерв" },
+                    { "status", healthyNodes > 0 ? "ok" : "down" },
+                    { "summary", healthyNodes + "/" + bench.Count + " узлов онлайн, пинг " + (bestPing < 9999 ? (bestPing + " мс") : "—") },
+                    { "latency_ms", bestPing < 9999 ? bestPing : 0 }
+                },
+                new Dictionary<string, object> {
+                    { "id", "ide_sockets" }, { "title", "Сокеты IDE по PID" },
+                    { "status", IsRunning ? "ok" : "warn" },
+                    { "summary", IsRunning ? ("HTTP :" + _localPort + " • SOCKS :" + _socksPort + (string.IsNullOrEmpty(ActiveWslBridgeIp) ? "" : (" • WSL " + ActiveWslBridgeIp))) : "Локальные порты не активны" },
+                    { "latency_ms", 0 }
+                },
+                new Dictionary<string, object> {
+                    { "id", "ai_pulse" }, { "title", "AI API & OAuth2" },
+                    { "status", aiAllOk ? "ok" : ((gemSt == "ok" || claSt == "ok") ? "warn" : "down") },
+                    { "summary", string.Format(CultureInfo.InvariantCulture, "Gemini: {0} ({1}ms) • Claude: {2} • OpenAI: {3}", gemSt, gemMs, claSt, oaiSt) },
+                    { "latency_ms", gemMs }
+                }
+            };
+
+            sw.Stop();
+            return MiniJson.Serialize(new Dictionary<string, object>
+            {
+                { "ok", healthyNodes > 0 },
+                { "checked_at", DateTimeOffset.UtcNow.ToUnixTimeSeconds() },
+                { "duration_ms", (int)sw.ElapsedMilliseconds },
+                { "overall", (healthyNodes > 0 && sslClean) ? "ok" : "warn" },
+                { "cards", cards },
+                { "report_text", "" }
+            });
+        }
+
+        private static async Task<string> QueryLocalEndpointAsync(string method, string pathAndQuery, string jsonBody, int timeoutMs)
+        {
+            if (_localPort <= 0) return "";
+            int totalTimeout = timeoutMs > 0 ? timeoutMs : 3000;
+            var sw = Stopwatch.StartNew();
+            try
+            {
+                using (var tcp = new TcpClient())
+                {
+                    if (!await AwaitSocketTaskAsync(tcp.ConnectAsync(IPAddress.Loopback, _localPort), tcp, Math.Min(totalTimeout, 2500), CancellationToken.None).ConfigureAwait(false))
+                        return "";
+                    tcp.ReceiveTimeout = totalTimeout;
+                    tcp.SendTimeout = 3000;
+
+                    byte[] bodyBytes = string.IsNullOrEmpty(jsonBody) ? new byte[0] : Encoding.UTF8.GetBytes(jsonBody);
+                    var reqSb = new StringBuilder();
+                    reqSb.Append(method).Append(' ').Append(pathAndQuery).Append(" HTTP/1.1\r\n");
+                    reqSb.Append("Host: 127.0.0.1:").Append(_localPort.ToString(CultureInfo.InvariantCulture)).Append("\r\n");
+                    if (!string.IsNullOrEmpty(_localControlToken))
+                        reqSb.Append("X-Pixel-Local-Token: ").Append(_localControlToken).Append("\r\n");
+                    if (bodyBytes.Length > 0)
+                    {
+                        reqSb.Append("Content-Type: application/json; charset=utf-8\r\n");
+                        reqSb.Append("Content-Length: ").Append(bodyBytes.Length.ToString(CultureInfo.InvariantCulture)).Append("\r\n");
+                    }
+                    reqSb.Append("Connection: close\r\n\r\n");
+
+                    byte[] hdrBytes = Encoding.ASCII.GetBytes(reqSb.ToString());
+                    NetworkStream ns = tcp.GetStream();
+                    if (!await AwaitSocketTaskAsync(ns.WriteAsync(hdrBytes, 0, hdrBytes.Length), tcp, totalTimeout - (int)sw.ElapsedMilliseconds, CancellationToken.None).ConfigureAwait(false))
+                        return "";
+                    if (bodyBytes.Length > 0 &&
+                        !await AwaitSocketTaskAsync(ns.WriteAsync(bodyBytes, 0, bodyBytes.Length), tcp, totalTimeout - (int)sw.ElapsedMilliseconds, CancellationToken.None).ConfigureAwait(false))
+                        return "";
+
+                    using (var ms = new MemoryStream())
+                    {
+                        byte[] buf = new byte[4096];
+                        while (true)
+                        {
+                            int r = await ReadWithTimeoutAsync(ns, buf, 0, buf.Length, tcp, totalTimeout - (int)sw.ElapsedMilliseconds, CancellationToken.None).ConfigureAwait(false);
+                            if (r < 0) return "";
+                            if (r == 0) break;
+                            ms.Write(buf, 0, r);
+                            if (ms.Length > 2 * 1024 * 1024) break;
+                        }
+                        string full = Encoding.UTF8.GetString(ms.ToArray());
+                        int sep = full.IndexOf("\r\n\r\n", StringComparison.Ordinal);
+                        if (sep < 0) return "";
+                        string respHdr = full.Substring(0, sep);
+                        string rawBody = full.Substring(sep + 4);
+                        if (respHdr.IndexOf("Transfer-Encoding: chunked", StringComparison.OrdinalIgnoreCase) >= 0)
+                            return DecodeHttpChunkedBody(rawBody);
+                        return rawBody;
+                    }
+                }
+            }
+            catch
+            {
+                return "";
+            }
+        }
+
+        private static string DecodeHttpChunkedBody(string raw)
+        {
+            if (string.IsNullOrEmpty(raw)) return "";
+            var sb = new StringBuilder(raw.Length);
+            int pos = 0;
+            while (pos < raw.Length)
+            {
+                int crlf = raw.IndexOf("\r\n", pos, StringComparison.Ordinal);
+                if (crlf < 0) break;
+                string sizeHex = raw.Substring(pos, crlf - pos).Split(';')[0].Trim();
+                int chunkLen;
+                if (!int.TryParse(sizeHex, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out chunkLen) || chunkLen <= 0)
+                    break;
+                pos = crlf + 2;
+                int take = Math.Min(chunkLen, raw.Length - pos);
+                if (take > 0) sb.Append(raw, pos, take);
+                pos += take + 2;
+            }
+            return sb.ToString();
+        }
+
+        public static Task<string> QueryStatusV4JsonAsync()
+        {
+            if (UsingGoEngine) return QueryLocalEndpointAsync("GET", "/__pixelcore/v4/status", null, 3000);
+            return Task.FromResult(BuildCSharpStatusV4Json());
+        }
+
+        public static Task<string> QueryTelemetryV2JsonAsync()
+        {
+            if (UsingGoEngine) return QueryLocalEndpointAsync("GET", "/__pixelcore/telemetry", null, 3000);
+            return Task.FromResult(BuildCSharpStatusV4Json());
+        }
+
+        public static Task<string> QueryLiveRoutesV4JsonAsync()
+        {
+            if (UsingGoEngine) return QueryLocalEndpointAsync("GET", "/__pixelcore/v4/live-routes", null, 3000);
+            return Task.FromResult(BuildCSharpLiveRoutesJson());
+        }
+
+        public static Task<string> QueryAiPulseV4JsonAsync(bool forceRefresh = false)
+        {
+            if (UsingGoEngine) return QueryLocalEndpointAsync("GET", "/__pixelcore/v4/ai-pulse", null, 6000);
+            return ProbeAiPulseCSharpAsync(forceRefresh);
+        }
+
+        public static async Task<int> ReloadRulesV4Async(string optionalBodyJson)
+        {
+            string resJson;
+            if (UsingGoEngine)
+            {
+                resJson = await QueryLocalEndpointAsync("POST", "/__pixelcore/v4/reload-rules", optionalBodyJson ?? "{}", 4000).ConfigureAwait(false);
+            }
+            else
+            {
+                resJson = ApplyCSharpReloadRules(optionalBodyJson);
+            }
+            var obj = MiniJson.Deserialize(resJson) as Dictionary<string, object>;
+            int pr = obj != null ? MiniJson.GetInt(obj, "pac_rev", 0) : 0;
+            if (pr > 0) _pacRevision = pr;
+            return _pacRevision;
+        }
+
+        public static Task<string> TriggerInstantWakeAsync(string reason = "manual")
+        {
+            if (UsingGoEngine)
+            {
+                string body = "{\"reason\":\"" + EscapeJson(reason ?? "manual") + "\"}";
+                return QueryLocalEndpointAsync("POST", "/__pixelcore/v4/instant-wake", body, 5000);
+            }
+            return ExecuteCSharpInstantWakeAsync("{\"reason\":\"" + EscapeJson(reason ?? "manual") + "\"}");
+        }
+
+        public static Task<string> RunXrayV4Async()
+        {
+            if (UsingGoEngine) return QueryLocalEndpointAsync("POST", "/__pixelcore/v4/run-xray", "{}", 15000);
+            return RunCSharpXrayAsync();
+        }
+    }
+
+    // =========================================================================
+    // V2.0 NATIVE GO uTLS ENGINE HOST + WIN32 JOBOBJECT + PROCESS RESOLVER + JSON
+    // =========================================================================
+    internal sealed class Win32JobObject : IDisposable
+    {
+        private IntPtr _handle;
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr CreateJobObject(IntPtr lpJobAttributes, string lpName);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetInformationJobObject(IntPtr hJob, int jobObjectInfoClass, ref JOBOBJECT_EXTENDED_LIMIT_INFORMATION lpJobObjectInfo, uint cbJobObjectInfoLength);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProcess);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr hObject);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct JOBOBJECT_BASIC_LIMIT_INFORMATION
+        {
+            public long PerProcessUserTimeLimit;
+            public long PerJobUserTimeLimit;
+            public uint LimitFlags;
+            public UIntPtr MinimumWorkingSetSize;
+            public UIntPtr MaximumWorkingSetSize;
+            public uint ActiveProcessLimit;
+            public UIntPtr Affinity;
+            public uint PriorityClass;
+            public uint SchedulingClass;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct IO_COUNTERS
+        {
+            public ulong ReadOperationCount;
+            public ulong WriteOperationCount;
+            public ulong OtherOperationCount;
+            public ulong ReadTransferCount;
+            public ulong WriteTransferCount;
+            public ulong OtherTransferCount;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+        {
+            public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+            public IO_COUNTERS IoInfo;
+            public UIntPtr ProcessMemoryLimit;
+            public UIntPtr JobMemoryLimit;
+            public UIntPtr PeakProcessMemoryUsed;
+            public UIntPtr PeakJobMemoryUsed;
+        }
+
+        private const int JobObjectExtendedLimitInformation = 9;
+        private const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+
+        public Win32JobObject()
+        {
+            _handle = CreateJobObject(IntPtr.Zero, null);
+            if (_handle == IntPtr.Zero) return;
+
+            var info = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            uint len = (uint)Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
+            if (!SetInformationJobObject(_handle, JobObjectExtendedLimitInformation, ref info, len))
+            {
+                CloseHandle(_handle);
+                _handle = IntPtr.Zero;
+            }
+        }
+
+        public bool TryAttach(Process proc)
+        {
+            if (_handle == IntPtr.Zero || proc == null) return false;
+            try
+            {
+                return AssignProcessToJobObject(_handle, proc.Handle);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        public void Dispose()
+        {
+            IntPtr h = Interlocked.Exchange(ref _handle, IntPtr.Zero);
+            if (h != IntPtr.Zero)
+            {
+                try { CloseHandle(h); } catch { }
+            }
+        }
+    }
+
+    internal static class Win32TcpProcessResolver
+    {
+        [DllImport("iphlpapi.dll", SetLastError = true)]
+        private static extern uint GetExtendedTcpTable(IntPtr pTcpTable, ref int dwOutBufLen, bool sort, int ipVersion, int tblClass, uint reserved);
+
+        private const int AF_INET = 2;
+        private const int TCP_TABLE_OWNER_PID_ALL = 5;
+        private static readonly ConcurrentDictionary<int, Tuple<string, long>> _pidNameCache = new ConcurrentDictionary<int, Tuple<string, long>>();
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MIB_TCPROW_OWNER_PID
+        {
+            public uint state;
+            public uint localAddr;
+            public uint localPort;
+            public uint remoteAddr;
+            public uint remotePort;
+            public uint owningPid;
+        }
+
+        private static int NetworkPortToHost(uint netPortDword)
+        {
+            ushort low = (ushort)(netPortDword & 0xFFFF);
+            return ((low & 0xFF) << 8) | ((low >> 8) & 0xFF);
+        }
+
+        public static void ResolveLocalPortOwner(int clientSourcePort, out int pid, out string procName)
+        {
+            pid = 0;
+            procName = "";
+            if (clientSourcePort <= 0) return;
+
+            IntPtr buf = IntPtr.Zero;
+            try
+            {
+                int size = 0;
+                GetExtendedTcpTable(IntPtr.Zero, ref size, false, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+                if (size <= 0 || size > 4 * 1024 * 1024) return;
+                buf = Marshal.AllocHGlobal(size);
+                if (GetExtendedTcpTable(buf, ref size, false, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) != 0) return;
+
+                int count = Marshal.ReadInt32(buf);
+                int rowSize = Marshal.SizeOf(typeof(MIB_TCPROW_OWNER_PID));
+                IntPtr rowPtr = IntPtr.Add(buf, 4);
+                for (int i = 0; i < count; i++)
+                {
+                    var row = (MIB_TCPROW_OWNER_PID)Marshal.PtrToStructure(rowPtr, typeof(MIB_TCPROW_OWNER_PID));
+                    rowPtr = IntPtr.Add(rowPtr, rowSize);
+                    // 0x0100007F == 127.0.0.1 in network byte order
+                    if (row.localAddr == 0x0100007Fu && NetworkPortToHost(row.localPort) == clientSourcePort && row.owningPid > 0)
+                    {
+                        pid = (int)row.owningPid;
+                        break;
+                    }
+                }
+            }
+            catch { }
+            finally
+            {
+                if (buf != IntPtr.Zero) Marshal.FreeHGlobal(buf);
+            }
+
+            if (pid > 0)
+            {
+                long nowTicks = DateTime.UtcNow.Ticks;
+                Tuple<string, long> cached;
+                if (_pidNameCache.TryGetValue(pid, out cached) && (nowTicks - cached.Item2) < TimeSpan.TicksPerSecond * 15)
+                {
+                    procName = cached.Item1;
+                    return;
+                }
+                try
+                {
+                    using (var p = Process.GetProcessById(pid))
+                    {
+                        procName = p.ProcessName;
+                        _pidNameCache[pid] = Tuple.Create(procName, nowTicks);
+                    }
+                }
+                catch { }
+            }
+        }
+    }
+
+    internal static class NativeUtlsEngineHost
+    {
+        private static readonly object _hostLock = new object();
+        private static Process _goProc;
+        private static StreamWriter _goStdin;
+        private static Win32JobObject _job;
+
+        public static string EngineCacheDir
+        {
+            get
+            {
+                return Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "PixelTunnel",
+                    "engine");
+            }
+        }
+
+        private static string ComputeSha256Hex(Stream s)
+        {
+            using (var sha = SHA256.Create())
+            {
+                byte[] hash = sha.ComputeHash(s);
+                var sb = new StringBuilder(64);
+                foreach (byte b in hash) sb.Append(b.ToString("x2", CultureInfo.InvariantCulture));
+                return sb.ToString();
+            }
+        }
+
+        private static bool EnsureVerifiedGoBinary(out string exePath, out string failReason)
+        {
+            exePath = Path.Combine(EngineCacheDir, "pixelcore-utls-" + EmbeddedEngineMeta.EngineVersion + ".exe");
+            failReason = "";
+
+            string expected = (EmbeddedEngineMeta.ExpectedSha256 ?? "").Trim().ToLowerInvariant();
+            Stream resStream = Assembly.GetExecutingAssembly().GetManifestResourceStream(EmbeddedEngineMeta.ResourceName);
+            if (resStream == null)
+            {
+                failReason = "Встроенный Go uTLS модуль отсутствует — используется C# Fallback";
+                return false;
+            }
+
+            try
+            {
+                Directory.CreateDirectory(EngineCacheDir);
+                if (File.Exists(exePath) && !string.IsNullOrEmpty(expected))
+                {
+                    using (var fs = File.OpenRead(exePath))
+                    {
+                        if (string.Equals(ComputeSha256Hex(fs), expected, StringComparison.OrdinalIgnoreCase))
+                        {
+                            resStream.Dispose();
+                            return true;
+                        }
+                    }
+                }
+
+                byte[] rawExe;
+                using (resStream)
+                using (var gzip = new GZipStream(resStream, CompressionMode.Decompress))
+                using (var ms = new MemoryStream())
+                {
+                    gzip.CopyTo(ms);
+                    rawExe = ms.ToArray();
+                }
+
+                if (rawExe.Length < 4096)
+                {
+                    failReason = "Распакованный Go uTLS модуль повреждён — активирован C# Fallback";
+                    return false;
+                }
+
+                if (!string.IsNullOrEmpty(expected))
+                {
+                    using (var verifyMs = new MemoryStream(rawExe, false))
+                    {
+                        string actual = ComputeSha256Hex(verifyMs);
+                        if (!string.Equals(actual, expected, StringComparison.OrdinalIgnoreCase))
+                        {
+                            failReason = "Несовпадение SHA-256 встроенного Go uTLS модуля — активирован C# Fallback";
+                            return false;
+                        }
+                    }
+                }
+
+                string tmpPath = exePath + ".tmp." + Process.GetCurrentProcess().Id.ToString(CultureInfo.InvariantCulture);
+                File.WriteAllBytes(tmpPath, rawExe);
+                if (File.Exists(exePath)) File.Delete(exePath);
+                File.Move(tmpPath, exePath);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                failReason = "Ошибка распаковки Go uTLS (" + ex.Message + ") — активирован C# Fallback";
+                return false;
+            }
+        }
+
+        public static bool TryStart(string configPath, string localToken, int httpPort, out string failReason)
+        {
+            lock (_hostLock)
+            {
+                StopLocked();
+                string exePath;
+                if (!EnsureVerifiedGoBinary(out exePath, out failReason))
+                {
+                    return false;
+                }
+
+                if (string.IsNullOrEmpty(configPath) || !File.Exists(configPath))
+                {
+                    failReason = "Отсутствует active_config.json для Go uTLS — активирован C# Fallback";
+                    return false;
+                }
+
+                try
+                {
+                    var job = new Win32JobObject();
+                    var psi = new ProcessStartInfo
+                    {
+                        FileName = exePath,
+                        Arguments = "--headless --watch-stdin --config \"" + configPath + "\"",
+                        WorkingDirectory = Path.GetDirectoryName(configPath) ?? EngineCacheDir,
+                        UseShellExecute = false,
+                        CreateNoWindow = true,
+                        RedirectStandardInput = true,
+                        WindowStyle = ProcessWindowStyle.Hidden
+                    };
+                    if (!string.IsNullOrEmpty(localToken))
+                    {
+                        psi.EnvironmentVariables["PIXEL_LOCAL_TOKEN"] = localToken;
+                    }
+
+                    Process proc = Process.Start(psi);
+                    if (proc == null)
+                    {
+                        job.Dispose();
+                        failReason = "Не удалось запустить Go uTLS процесс — активирован C# Fallback";
+                        return false;
+                    }
+
+                    StreamWriter stdinWriter = null;
+                    try { stdinWriter = proc.StandardInput; } catch { }
+
+                    if (!job.TryAttach(proc))
+                    {
+                        if (stdinWriter != null) { try { stdinWriter.Dispose(); } catch { } }
+                        try { proc.Kill(); } catch { }
+                        proc.Dispose();
+                        job.Dispose();
+                        failReason = "Ошибка Win32 JobObject привязки — активирован C# Fallback";
+                        return false;
+                    }
+
+                    _job = job;
+                    _goStdin = stdinWriter;
+                    _goProc = proc;
+
+                    Stopwatch sw = Stopwatch.StartNew();
+                    while (sw.ElapsedMilliseconds < 2500)
+                    {
+                        if (proc.HasExited)
+                        {
+                            int exitCode = proc.ExitCode;
+                            StopLocked();
+                            failReason = "Go uTLS завершился при старте (код " + exitCode + ") — активирован C# Fallback";
+                            return false;
+                        }
+                        if (ProbeGoControlReady(httpPort, localToken))
+                        {
+                            failReason = "";
+                            return true;
+                        }
+                        Thread.Sleep(45);
+                    }
+
+                    StopLocked();
+                    failReason = "Go uTLS не поднял локальный порт за 2.5с — активирован C# Fallback";
+                    return false;
+                }
+                catch (Exception ex)
+                {
+                    StopLocked();
+                    failReason = "Запуск Go uTLS заблокирован (" + ex.Message + ") — активирован C# Fallback";
+                    return false;
+                }
+            }
+        }
+
+        private static bool ProbeGoControlReady(int port, string token)
+        {
+            try
+            {
+                using (var tcp = new TcpClient())
+                {
+                    var res = tcp.BeginConnect(IPAddress.Loopback, port, null, null);
+                    if (!res.AsyncWaitHandle.WaitOne(120)) return false;
+                    tcp.EndConnect(res);
+                    tcp.ReceiveTimeout = 250;
+                    tcp.SendTimeout = 250;
+                    string req = "GET /__pixelcore/v4/status HTTP/1.1\r\nHost: 127.0.0.1:" +
+                                 port.ToString(CultureInfo.InvariantCulture) +
+                                 (string.IsNullOrEmpty(token) ? "" : ("\r\nX-Pixel-Local-Token: " + token)) +
+                                 "\r\nConnection: close\r\n\r\n";
+                    byte[] b = Encoding.ASCII.GetBytes(req);
+                    NetworkStream ns = tcp.GetStream();
+                    ns.Write(b, 0, b.Length);
+                    byte[] rb = new byte[64];
+                    int n = ns.Read(rb, 0, rb.Length);
+                    return n > 12 && Encoding.ASCII.GetString(rb, 0, n).Contains("200");
+                }
+            }
+            catch { return false; }
+        }
+
+        public static void Stop()
+        {
+            lock (_hostLock) { StopLocked(); }
+        }
+
+        private static void StopLocked()
+        {
+            if (_goStdin != null)
+            {
+                try { _goStdin.Close(); } catch { }
+                try { _goStdin.Dispose(); } catch { }
+                _goStdin = null;
+            }
+            if (_goProc != null)
+            {
+                try
+                {
+                    if (!_goProc.HasExited && !_goProc.WaitForExit(300))
+                    {
+                        _goProc.Kill();
+                        _goProc.WaitForExit(400);
+                    }
+                }
+                catch { }
+                try { _goProc.Dispose(); } catch { }
+                _goProc = null;
+            }
+            if (_job != null)
+            {
+                _job.Dispose();
+                _job = null;
+            }
+        }
+    }
+
+    internal static class MiniJson
+    {
+        public static object Deserialize(string json)
+        {
+            if (string.IsNullOrEmpty(json)) return null;
+            int idx = 0;
+            try { return ParseValue(json, ref idx); }
+            catch { return null; }
+        }
+
+        public static Dictionary<string, object> GetDict(Dictionary<string, object> d, string key)
+        {
+            object v;
+            if (d != null && d.TryGetValue(key, out v)) return v as Dictionary<string, object>;
+            return null;
+        }
+
+        public static List<object> GetList(Dictionary<string, object> d, string key)
+        {
+            object v;
+            if (d != null && d.TryGetValue(key, out v)) return v as List<object>;
+            return null;
+        }
+
+        public static List<string> GetStrList(Dictionary<string, object> d, string key)
+        {
+            var res = new List<string>();
+            var lst = GetList(d, key);
+            if (lst != null)
+            {
+                foreach (var item in lst)
+                {
+                    if (item != null) res.Add(item.ToString());
+                }
+            }
+            return res;
+        }
+
+        public static string GetStr(Dictionary<string, object> d, string key)
+        {
+            object v;
+            if (d != null && d.TryGetValue(key, out v) && v != null) return v.ToString();
+            return null;
+        }
+
+        public static bool GetBool(Dictionary<string, object> d, string key, bool def)
+        {
+            object v;
+            if (d != null && d.TryGetValue(key, out v))
+            {
+                if (v is bool) return (bool)v;
+                bool b;
+                if (v != null && bool.TryParse(v.ToString(), out b)) return b;
+            }
+            return def;
+        }
+
+        public static int GetInt(Dictionary<string, object> d, string key, int def)
+        {
+            object v;
+            if (d != null && d.TryGetValue(key, out v) && v != null)
+            {
+                if (v is long) return (int)(long)v;
+                if (v is double) return (int)(double)v;
+                int i;
+                if (int.TryParse(v.ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out i)) return i;
+            }
+            return def;
+        }
+
+        public static long GetLong(Dictionary<string, object> d, string key, long def)
+        {
+            object v;
+            if (d != null && d.TryGetValue(key, out v) && v != null)
+            {
+                if (v is long) return (long)v;
+                if (v is double) return (long)(double)v;
+                long l;
+                if (long.TryParse(v.ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out l)) return l;
+            }
+            return def;
+        }
+
+        public static double GetDouble(Dictionary<string, object> d, string key, double def)
+        {
+            object v;
+            if (d != null && d.TryGetValue(key, out v) && v != null)
+            {
+                if (v is double) return (double)v;
+                if (v is long) return (double)(long)v;
+                double dbl;
+                if (double.TryParse(v.ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out dbl)) return dbl;
+            }
+            return def;
+        }
+
+        private static void SkipWs(string s, ref int i)
+        {
+            while (i < s.Length && char.IsWhiteSpace(s[i])) i++;
+        }
+
+        private static object ParseValue(string s, ref int i)
+        {
+            SkipWs(s, ref i);
+            if (i >= s.Length) return null;
+            char c = s[i];
+            if (c == '{') return ParseObject(s, ref i);
+            if (c == '[') return ParseArray(s, ref i);
+            if (c == '"') return ParseString(s, ref i);
+            if (c == 't' && i + 4 <= s.Length && s.Substring(i, 4) == "true") { i += 4; return true; }
+            if (c == 'f' && i + 5 <= s.Length && s.Substring(i, 5) == "false") { i += 5; return false; }
+            if (c == 'n' && i + 4 <= s.Length && s.Substring(i, 4) == "null") { i += 4; return null; }
+            return ParseNumber(s, ref i);
+        }
+
+        private static Dictionary<string, object> ParseObject(string s, ref int i)
+        {
+            var dict = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+            i++;
+            while (i < s.Length)
+            {
+                SkipWs(s, ref i);
+                if (i >= s.Length) break;
+                if (s[i] == '}') { i++; return dict; }
+                string key = ParseString(s, ref i);
+                SkipWs(s, ref i);
+                if (i < s.Length && s[i] == ':') i++;
+                dict[key ?? ""] = ParseValue(s, ref i);
+                SkipWs(s, ref i);
+                if (i < s.Length && s[i] == ',') i++;
+            }
+            return dict;
+        }
+
+        private static List<object> ParseArray(string s, ref int i)
+        {
+            var list = new List<object>();
+            i++;
+            while (i < s.Length)
+            {
+                SkipWs(s, ref i);
+                if (i >= s.Length) break;
+                if (s[i] == ']') { i++; return list; }
+                list.Add(ParseValue(s, ref i));
+                SkipWs(s, ref i);
+                if (i < s.Length && s[i] == ',') i++;
+            }
+            return list;
+        }
+
+        private static string ParseString(string s, ref int i)
+        {
+            if (i >= s.Length || s[i] != '"') return null;
+            i++;
+            var sb = new StringBuilder();
+            while (i < s.Length)
+            {
+                char c = s[i++];
+                if (c == '"') return sb.ToString();
+                if (c == '\\' && i < s.Length)
+                {
+                    char e = s[i++];
+                    if (e == 'n') sb.Append('\n');
+                    else if (e == 'r') sb.Append('\r');
+                    else if (e == 't') sb.Append('\t');
+                    else if (e == 'b') sb.Append('\b');
+                    else if (e == 'f') sb.Append('\f');
+                    else if (e == 'u' && i + 4 <= s.Length)
+                    {
+                        ushort u;
+                        if (ushort.TryParse(s.Substring(i, 4), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out u))
+                            sb.Append((char)u);
+                        i += 4;
+                    }
+                    else sb.Append(e);
+                }
+                else sb.Append(c);
+            }
+            return sb.ToString();
+        }
+
+        private static object ParseNumber(string s, ref int i)
+        {
+            int start = i;
+            bool isFloat = false;
+            while (i < s.Length)
+            {
+                char c = s[i];
+                if ((c >= '0' && c <= '9') || c == '-' || c == '+') { i++; }
+                else if (c == '.' || c == 'e' || c == 'E') { isFloat = true; i++; }
+                else break;
+            }
+            string raw = s.Substring(start, i - start);
+            if (!isFloat)
+            {
+                long l;
+                if (long.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out l)) return l;
+            }
+            double d;
+            if (double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out d)) return d;
+            return 0L;
+        }
+
+        public static string Serialize(object obj)
+        {
+            var sb = new StringBuilder();
+            WriteJson(obj, sb);
+            return sb.ToString();
+        }
+
+        private static void WriteJson(object obj, StringBuilder sb)
+        {
+            if (obj == null) { sb.Append("null"); return; }
+            if (obj is bool) { sb.Append(((bool)obj) ? "true" : "false"); return; }
+            if (obj is string) { WriteEscapedStr((string)obj, sb); return; }
+            if (obj is int || obj is long || obj is short || obj is byte)
+            { sb.Append(Convert.ToInt64(obj, CultureInfo.InvariantCulture).ToString(CultureInfo.InvariantCulture)); return; }
+            if (obj is double || obj is float || obj is decimal)
+            { sb.Append(Convert.ToDouble(obj, CultureInfo.InvariantCulture).ToString("0.###", CultureInfo.InvariantCulture)); return; }
+
+            var dict = obj as IDictionary<string, object>;
+            if (dict != null)
+            {
+                sb.Append('{');
+                bool first = true;
+                foreach (var kv in dict)
+                {
+                    if (!first) sb.Append(',');
+                    first = false;
+                    WriteEscapedStr(kv.Key, sb);
+                    sb.Append(':');
+                    WriteJson(kv.Value, sb);
+                }
+                sb.Append('}');
+                return;
+            }
+
+            var seq = obj as System.Collections.IEnumerable;
+            if (seq != null)
+            {
+                sb.Append('[');
+                bool first = true;
+                foreach (var item in seq)
+                {
+                    if (!first) sb.Append(',');
+                    first = false;
+                    WriteJson(item, sb);
+                }
+                sb.Append(']');
+                return;
+            }
+
+            WriteEscapedStr(obj.ToString(), sb);
+        }
+
+        private static void WriteEscapedStr(string s, StringBuilder sb)
+        {
+            sb.Append('"');
+            if (!string.IsNullOrEmpty(s))
+            {
+                foreach (char c in s)
+                {
+                    if (c == '"') sb.Append("\\\"");
+                    else if (c == '\\') sb.Append("\\\\");
+                    else if (c == '\r') sb.Append("\\r");
+                    else if (c == '\n') sb.Append("\\n");
+                    else if (c == '\t') sb.Append("\\t");
+                    else if (c < 32) sb.Append("\\u").Append(((int)c).ToString("x4", CultureInfo.InvariantCulture));
+                    else sb.Append(c);
+                }
+            }
+            sb.Append('"');
         }
     }
 }
