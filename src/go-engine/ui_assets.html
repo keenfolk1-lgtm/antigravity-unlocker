@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="pixel-csrf" content="__PIXEL_CSRF__" />
+  <title>PixelTunnel v2.0 — Core v4 Control</title>
+  <style>
+    :root {
+      --bg: #0b0d12;
+      --surface: #12161f;
+      --surface-2: #171c28;
+      --border: #232a3b;
+      --text: #e6ebf5;
+      --muted: #8b96ad;
+      --accent: #5e81ff;
+      --accent-hover: #7392ff;
+      --ok: #2bd47d;
+      --warn: #f5b642;
+      --bad: #ff5c72;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      --sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 20px;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      font-size: 14px;
+      line-height: 1.5;
+    }
+    .container { max-width: 1120px; margin: 0 auto; display: grid; gap: 16px; }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px;
+    }
+    .header {
+      display: flex; flex-wrap: wrap; gap: 12px;
+      align-items: center; justify-content: space-between;
+    }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .brand-title { font-size: 18px; font-weight: 700; letter-spacing: -0.02em; }
+    .pill {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 4px 10px; border-radius: 999px;
+      font-size: 12px; font-weight: 600;
+      background: var(--surface-2); border: 1px solid var(--border);
+    }
+    .pill.ok { color: var(--ok); border-color: rgba(43,212,125,0.35); }
+    .pill.warn { color: var(--warn); border-color: rgba(245,182,66,0.35); }
+    .pill.bad { color: var(--bad); border-color: rgba(255,92,114,0.35); }
+    .btn {
+      background: var(--surface-2); color: var(--text);
+      border: 1px solid var(--border); border-radius: 8px;
+      padding: 8px 14px; font-size: 13px; font-weight: 600;
+      cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 6px;
+    }
+    .btn:hover { border-color: var(--accent); }
+    .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .btn.primary:hover { background: var(--accent-hover); }
+    .btn.danger { background: rgba(255,92,114,0.12); color: var(--bad); border-color: rgba(255,92,114,0.4); }
+    .btn.sm { padding: 4px 8px; font-size: 11px; border-radius: 6px; }
+    .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+    .grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+    .muted { color: var(--muted); font-size: 12px; }
+    .mono { font-family: var(--mono); }
+    input[type=text], textarea {
+      width: 100%; background: var(--bg); color: var(--text);
+      border: 1px solid var(--border); border-radius: 8px;
+      padding: 9px 11px; font-family: var(--mono); font-size: 12px;
+    }
+    textarea { min-height: 86px; resize: vertical; }
+    .toggles { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+    label.toggle {
+      display: inline-flex; align-items: center; gap: 7px;
+      padding: 6px 10px; background: var(--surface-2);
+      border: 1px solid var(--border); border-radius: 8px; cursor: pointer; font-size: 13px;
+    }
+    .tabs { display: flex; gap: 8px; border-bottom: 1px solid var(--border); padding-bottom: 10px; margin-bottom: 12px; }
+    .tab-btn {
+      background: transparent; border: 1px solid transparent; color: var(--muted);
+      padding: 6px 12px; border-radius: 8px; font-weight: 600; cursor: pointer;
+    }
+    .tab-btn.active { background: var(--surface-2); border-color: var(--border); color: var(--text); }
+    .hidden { display: none; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border); }
+    th { color: var(--muted); font-weight: 600; }
+    pre.report-box {
+      background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+      padding: 12px; overflow: auto; max-height: 360px; font-family: var(--mono); font-size: 12px;
+      white-space: pre-wrap; margin: 0;
+    }
+    .toast {
+      position: fixed; right: 20px; bottom: 20px;
+      background: var(--surface-2); border: 1px solid var(--accent);
+      color: var(--text); padding: 10px 14px; border-radius: 8px; font-size: 13px;
+      display: none; z-index: 99;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <!-- Top Header -->
+    <div class="card header">
+      <div class="brand">
+        <div class="brand-title">PixelTunnel Core v4</div>
+        <span id="connPill" class="pill warn">CHECKING...</span>
+        <span id="protoPill" class="pill mono">-</span>
+        <span id="standbyPill" class="pill">Standby: -</span>
+      </div>
+      <div class="row">
+        <button id="togglePowerBtn" class="btn primary">Подключить / Переподключить</button>
+        <button id="wakeBtn" class="btn">Instant Wake</button>
+        <a id="tgSocksBtn" class="btn" href="#">Telegram SOCKS5</a>
+      </div>
+    </div>
+
+    <!-- AI Pulse Strip -->
+    <div class="card">
+      <div class="header" style="margin-bottom:8px;">
+        <strong>AI Pulse</strong>
+        <div class="row">
+          <span id="pulseMeta" class="muted mono">-</span>
+          <button id="refreshPulseBtn" class="btn sm">Обновить</button>
+        </div>
+      </div>
+      <div id="pulseStrip" class="row">
+        <span class="pill">Gemini: ...</span>
+        <span class="pill">Claude: ...</span>
+        <span class="pill">OpenAI: ...</span>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <!-- Categories & Custom Domains -->
+      <div class="card">
+        <strong>Категории и Smart PAC правила</strong>
+        <div id="catToggles" class="toggles"></div>
+        <div style="margin-top:12px;">
+          <div class="muted" style="margin-bottom:4px;">Свои прокси-домены (через запятую или с новой строки)</div>
+          <textarea id="customProxyBox" placeholder="example.com&#10;.myservice.io"></textarea>
+        </div>
+        <div style="margin-top:8px;">
+          <div class="muted" style="margin-bottom:4px;">Свои DIRECT-домены</div>
+          <textarea id="customDirectBox" placeholder="internal.corp"></textarea>
+        </div>
+        <div class="row" style="margin-top:10px; justify-content:space-between;">
+          <span id="pacRevLabel" class="muted mono">PAC rev: -</span>
+          <button id="saveRulesBtn" class="btn primary">Сохранить правила</button>
+        </div>
+      </div>
+
+      <!-- PRO Activation & CLI Env -->
+      <div class="card" style="display:flex; flex-direction:column; justify-content:space-between; gap:12px;">
+        <div>
+          <strong>PRO Активация и статус лицензии</strong>
+          <div class="row" style="margin-top:6px;">
+            <span id="licPill" class="pill">Tier: -</span>
+            <span id="nodePill" class="pill mono">Node: -</span>
+          </div>
+          <div class="row" style="margin-top:10px;">
+            <input id="keyInput" type="text" placeholder="UUID, vless://, pwp4://, pwp3://, https://ai.pixelstore.space/sub/..." />
+            <button id="activateBtn" class="btn primary" style="margin-top:6px;">Активировать ключ</button>
+          </div>
+        </div>
+        <div>
+          <strong>CLI окружение (Claude Code / Codex / Gemini CLI)</strong>
+          <pre id="cliEnvBox" class="report-box mono" style="margin-top:6px; max-height:110px;">export HTTP_PROXY=http://127.0.0.1:17890</pre>
+          <div class="row" style="margin-top:8px;">
+            <button id="copyBashEnvBtn" class="btn sm">Копировать Bash/Zsh</button>
+            <button id="copyPsEnvBtn" class="btn sm">Копировать PowerShell</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Diagnostics 4.0 -->
+    <div class="card">
+      <div class="header" style="margin-bottom:10px;">
+        <strong>Диагностика 4.0 — Network X-Ray</strong>
+        <button id="runXrayBtn" class="btn primary">Запустить X-Ray (6 проверок)</button>
+      </div>
+      <div class="tabs">
+        <button class="tab-btn active" data-tab="cards">Карточки (6)</button>
+        <button class="tab-btn" data-tab="radar">Live Radar (100)</button>
+        <button class="tab-btn" data-tab="report">Локальный отчёт</button>
+      </div>
+
+      <div id="tab-cards">
+        <div id="xrayCards" class="grid-3">
+          <div class="muted">Нажмите «Запустить X-Ray» для комплексной проверки без записи в облако.</div>
+        </div>
+      </div>
+
+      <div id="tab-radar" class="hidden">
+        <div class="row" style="justify-content:space-between; margin-bottom:8px;">
+          <span class="muted">Живые маршруты приложений и быстрый override</span>
+          <button id="refreshRadarBtn" class="btn sm">Обновить</button>
+        </div>
+        <div style="overflow-x:auto;">
+          <table>
+            <thead>
+              <tr><th>Время</th><th>Процесс</th><th>Домен</th><th>Действие</th><th>Правило</th><th>Узел</th><th>Ping</th><th>+</th></tr>
+            </thead>
+            <tbody id="radarBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div id="tab-report" class="hidden">
+        <div class="row" style="margin-bottom:8px;">
+          <button id="copyReportBtn" class="btn primary">Копировать отчёт</button>
+          <button id="downloadReportBtn" class="btn">Скачать отчёт</button>
+        </div>
+        <pre id="reportBox" class="report-box">Запустите X-Ray или выберите вкладку для формирования локального отчёта.</pre>
+      </div>
+    </div>
+  </div>
+  <div id="toast" class="toast"></div>
+
+  <script>
+    (function () {
+      if (window.location.search.indexOf('t=') !== -1 && window.history && window.history.replaceState) {
+        window.history.replaceState(null, '', '/ui');
+      }
+      var csrfMeta = document.querySelector('meta[name="pixel-csrf"]');
+      var csrfToken = csrfMeta ? csrfMeta.getAttribute('content') : '';
+      var currentHttpPort = 17890;
+      var currentSocksPort = 17891;
+      var customProxyArr = [];
+      var customDirectArr = [];
+      var catsDirty = false;
+      var lastReportText = '';
+
+      function showToast(msg) {
+        var el = document.getElementById('toast');
+        el.textContent = msg;
+        el.style.display = 'block';
+        clearTimeout(el._t);
+        el._t = setTimeout(function () { el.style.display = 'none'; }, 2600);
+      }
+
+      async function apiFetch(path, opts) {
+        opts = opts || {};
+        opts.credentials = 'same-origin';
+        opts.headers = Object.assign({}, opts.headers || {}, { 'X-Pixel-CSRF': csrfToken });
+        var resp = await fetch(path, opts);
+        if (!resp.ok) {
+          var txt = await resp.text();
+          throw new Error(txt || ('HTTP ' + resp.status));
+        }
+        return await resp.json();
+      }
+
+      function setPillClass(el, status) {
+        el.classList.remove('ok', 'warn', 'bad');
+        if (status === 'ok') el.classList.add('ok');
+        else if (status === 'warn' || status === 'degraded') el.classList.add('warn');
+        else el.classList.add('bad');
+      }
+
+      function renderStatus(st) {
+        currentHttpPort = st.http_port || 17890;
+        currentSocksPort = st.socks_port || 17891;
+
+        var cp = document.getElementById('connPill');
+        cp.textContent = st.connected ? 'CONNECTED' : 'STANDBY / IDLE';
+        setPillClass(cp, st.connected ? 'ok' : 'warn');
+
+        document.getElementById('protoPill').textContent = (st.protocol || 'PWP-4') + ' · ' + (st.utls_profile || 'Chrome');
+        var sp = document.getElementById('standbyPill');
+        sp.textContent = st.standby_ready ? ('Standby: ' + (st.standby_node || 'OK')) : 'Standby: warming';
+        setPillClass(sp, st.standby_ready ? 'ok' : 'warn');
+
+        document.getElementById('licPill').textContent = 'Tier: ' + (st.license_tier || 'FREE') + (st.days_left ? (' (' + st.days_left + 'd)') : '');
+        document.getElementById('nodePill').textContent = 'Node: ' + (st.active_node || '-') + ' | Failovers: ' + (st.failover_count || 0);
+        document.getElementById('pacRevLabel').textContent = 'PAC rev: ' + (st.pac_rev || 1) + ' · HTTP :' + currentHttpPort + ' · SOCKS :' + currentSocksPort;
+
+        document.getElementById('tgSocksBtn').href = 'tg://socks?server=127.0.0.1&port=' + currentSocksPort;
+        document.getElementById('cliEnvBox').textContent =
+          'export HTTP_PROXY=http://127.0.0.1:' + currentHttpPort + '\n' +
+          'export HTTPS_PROXY=http://127.0.0.1:' + currentHttpPort + '\n' +
+          'export ALL_PROXY=socks5h://127.0.0.1:' + currentSocksPort;
+
+        if (!catsDirty) {
+          var cats = st.categories || {};
+          var catBox = document.getElementById('catToggles');
+          catBox.innerHTML = '';
+          ['antigravity', 'ai', 'mcp', 'media', 'social'].forEach(function (k) {
+            var lbl = document.createElement('label');
+            lbl.className = 'toggle';
+            var cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.checked = !!cats[k];
+            cb.dataset.cat = k;
+            cb.addEventListener('change', function () { catsDirty = true; });
+            lbl.appendChild(cb);
+            var spTxt = document.createElement('span');
+            spTxt.textContent = k.toUpperCase();
+            lbl.appendChild(spTxt);
+            catBox.appendChild(lbl);
+          });
+        }
+
+        customProxyArr = Array.isArray(st.custom_proxy_domains) ? st.custom_proxy_domains.slice() : [];
+        customDirectArr = Array.isArray(st.custom_direct_domains) ? st.custom_direct_domains.slice() : [];
+        if (document.activeElement.id !== 'customProxyBox') {
+          document.getElementById('customProxyBox').value = customProxyArr.join('\n');
+        }
+        if (document.activeElement.id !== 'customDirectBox') {
+          document.getElementById('customDirectBox').value = customDirectArr.join('\n');
+        }
+      }
+
+      async function loadStatus() {
+        try {
+          var st = await apiFetch('/__pixelcore/v4/status');
+          renderStatus(st);
+        } catch (e) {
+          console.error(e);
+        }
+      }
+
+      async function loadPulse() {
+        try {
+          var p = await apiFetch('/__pixelcore/v4/ai-pulse');
+          document.getElementById('pulseMeta').textContent = (p.node || '-') + ' · cached=' + (!!p.cached);
+          var strip = document.getElementById('pulseStrip');
+          strip.innerHTML = '';
+          ['gemini', 'claude', 'openai'].forEach(function (k) {
+            var info = (p.providers && p.providers[k]) || { status: 'down', latency_ms: 0, http_code: 0 };
+            var el = document.createElement('span');
+            el.className = 'pill mono';
+            setPillClass(el, info.status);
+            el.textContent = k.toUpperCase() + ': ' + (info.status || 'down').toUpperCase() + ' · ' + (info.http_code || 0) + ' · ' + (info.latency_ms || 0) + 'ms';
+            strip.appendChild(el);
+          });
+        } catch (e) {
+          showToast('AI Pulse: ' + e.message);
+        }
+      }
+
+      async function loadRadar() {
+        try {
+          var res = await apiFetch('/__pixelcore/v4/live-routes?limit=100');
+          var body = document.getElementById('radarBody');
+          body.innerHTML = '';
+          (res.entries || []).forEach(function (ent) {
+            var tr = document.createElement('tr');
+            function td(txt, cls) {
+              var cell = document.createElement('td');
+              if (cls) cell.className = cls;
+              cell.textContent = txt;
+              return cell;
+            }
+            tr.appendChild(td(ent.time || '-', 'mono'));
+            tr.appendChild(td((ent.process || 'unknown') + (ent.pid ? ' (' + ent.pid + ')' : '')));
+            tr.appendChild(td((ent.domain || '-') + ':' + (ent.port || 0), 'mono'));
+            tr.appendChild(td(ent.action || '-'));
+            tr.appendChild(td(ent.rule || '-', 'muted'));
+            tr.appendChild(td(ent.node || '-', 'mono'));
+            tr.appendChild(td((ent.ping_ms || 0) + 'ms', 'mono'));
+
+            var actTd = document.createElement('td');
+            var addBtn = document.createElement('button');
+            addBtn.className = 'btn sm';
+            addBtn.textContent = ent.action === 'PROXY' ? '+Direct' : '+Proxy';
+            addBtn.addEventListener('click', function () { quickOverrideDomain(ent.domain, ent.action !== 'PROXY'); });
+            actTd.appendChild(addBtn);
+            tr.appendChild(actTd);
+
+            body.appendChild(tr);
+          });
+        } catch (e) {}
+      }
+
+      async function quickOverrideDomain(domain, toProxy) {
+        if (!domain) return;
+        if (toProxy) {
+          customDirectArr = customDirectArr.filter(function (d) { return d !== domain; });
+          if (customProxyArr.indexOf(domain) === -1) customProxyArr.push(domain);
+        } else {
+          customProxyArr = customProxyArr.filter(function (d) { return d !== domain; });
+          if (customDirectArr.indexOf(domain) === -1) customDirectArr.push(domain);
+        }
+        await saveRulesPayload({
+          custom_proxy_domains: customProxyArr,
+          custom_direct_domains: customDirectArr
+        });
+        showToast(domain + ' -> ' + (toProxy ? 'PROXY' : 'DIRECT'));
+        loadRadar();
+      }
+
+      async function saveRulesPayload(extra) {
+        var cats = {};
+        document.querySelectorAll('#catToggles input[type="checkbox"]').forEach(function (cb) {
+          cats[cb.dataset.cat] = cb.checked;
+        });
+        var payload = Object.assign({ categories: cats }, extra || {});
+        var res = await apiFetch('/__pixelcore/v4/reload-rules', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        catsDirty = false;
+        await loadStatus();
+        return res;
+      }
+
+      function renderXRay(rep) {
+        var box = document.getElementById('xrayCards');
+        box.innerHTML = '';
+        (rep.cards || []).forEach(function (c) {
+          var div = document.createElement('div');
+          div.className = 'card';
+          div.style.background = 'var(--surface-2)';
+          var top = document.createElement('div');
+          top.className = 'row';
+          top.style.justifyContent = 'space-between';
+          var title = document.createElement('strong');
+          title.textContent = c.title || c.id;
+          var pill = document.createElement('span');
+          pill.className = 'pill';
+          setPillClass(pill, c.status);
+          pill.textContent = (c.status || 'ok').toUpperCase() + ' · ' + (c.latency_ms || 0) + 'ms';
+          top.appendChild(title);
+          top.appendChild(pill);
+          var sum = document.createElement('div');
+          sum.className = 'muted mono';
+          sum.style.marginTop = '8px';
+          sum.textContent = c.summary || '-';
+          div.appendChild(top);
+          div.appendChild(sum);
+          box.appendChild(div);
+        });
+        lastReportText = rep.report_text || '';
+        document.getElementById('reportBox').textContent = lastReportText;
+      }
+
+      document.querySelectorAll('.tab-btn').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          document.querySelectorAll('.tab-btn').forEach(function (b) { b.classList.remove('active'); });
+          btn.classList.add('active');
+          var t = btn.dataset.tab;
+          ['cards', 'radar', 'report'].forEach(function (name) {
+            document.getElementById('tab-' + name).classList.toggle('hidden', name !== t);
+          });
+          if (t === 'radar') loadRadar();
+        });
+      });
+
+      document.getElementById('saveRulesBtn').addEventListener('click', async function () {
+        var parseList = function (s) {
+          return s.split(/[\n,;]+/).map(function (v) { return v.trim(); }).filter(Boolean);
+        };
+        try {
+          var r = await saveRulesPayload({
+            custom_proxy_domains: parseList(document.getElementById('customProxyBox').value),
+            custom_direct_domains: parseList(document.getElementById('customDirectBox').value)
+          });
+          showToast('Правила обновлены (PAC rev ' + r.pac_rev + ')');
+        } catch (e) { showToast('Ошибка: ' + e.message); }
+      });
+
+      document.getElementById('togglePowerBtn').addEventListener('click', async function () {
+        try {
+          await apiFetch('/__pixelcore/v4/instant-wake', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ reason: 'ui_connect' })
+          });
+          showToast('Туннель подключен / переподключен');
+          loadStatus();
+        } catch (e) { showToast('Ошибка: ' + e.message); }
+      });
+
+      document.getElementById('wakeBtn').addEventListener('click', async function () {
+        try {
+          var r = await apiFetch('/__pixelcore/v4/instant-wake', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ reason: 'manual' })
+          });
+          showToast('Instant Wake: ' + r.failover_ms + 'ms');
+          loadStatus();
+        } catch (e) { showToast('Ошибка: ' + e.message); }
+      });
+
+      document.getElementById('activateBtn').addEventListener('click', async function () {
+        var keyVal = document.getElementById('keyInput').value.trim();
+        if (!keyVal) return;
+        try {
+          var r = await apiFetch('/__pixelcore/v4/activate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ key: keyVal })
+          });
+          showToast('PRO ключ принят (' + r.format + ')');
+          loadStatus();
+        } catch (e) { showToast('Ошибка ключа: ' + e.message); }
+      });
+
+      document.getElementById('runXrayBtn').addEventListener('click', async function () {
+        showToast('Выполняется X-Ray...');
+        try {
+          var rep = await apiFetch('/__pixelcore/v4/run-xray', { method: 'POST' });
+          renderXRay(rep);
+          showToast('X-Ray завершён: ' + (rep.overall || 'ok').toUpperCase());
+        } catch (e) { showToast('X-Ray: ' + e.message); }
+      });
+
+      document.getElementById('refreshPulseBtn').addEventListener('click', loadPulse);
+      document.getElementById('refreshRadarBtn').addEventListener('click', loadRadar);
+
+      document.getElementById('copyBashEnvBtn').addEventListener('click', function () {
+        navigator.clipboard.writeText(document.getElementById('cliEnvBox').textContent);
+        showToast('Bash env скопирован');
+      });
+      document.getElementById('copyPsEnvBtn').addEventListener('click', function () {
+        var ps = '$env:HTTP_PROXY="http://127.0.0.1:' + currentHttpPort + '"\n$env:HTTPS_PROXY="http://127.0.0.1:' + currentHttpPort + '"\n$env:ALL_PROXY="socks5h://127.0.0.1:' + currentSocksPort + '"';
+        navigator.clipboard.writeText(ps);
+        showToast('PowerShell env скопирован');
+      });
+
+      document.getElementById('copyReportBtn').addEventListener('click', function () {
+        if (!lastReportText) return showToast('Сначала запустите X-Ray');
+        navigator.clipboard.writeText(lastReportText);
+        showToast('Отчёт скопирован в буфер обмена');
+      });
+      document.getElementById('downloadReportBtn').addEventListener('click', function () {
+        if (!lastReportText) return showToast('Сначала запустите X-Ray');
+        var blob = new Blob([lastReportText], { type: 'text/plain;charset=utf-8' });
+        var a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'pixeltunnel-xray-' + Math.floor(Date.now() / 1000) + '.txt';
+        a.click();
+      });
+
+      loadStatus();
+      loadPulse();
+      setInterval(loadStatus, 5000);
+    })();
+  </script>
+</body>
+</html>
