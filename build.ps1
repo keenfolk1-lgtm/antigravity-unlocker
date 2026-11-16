@@ -33,18 +33,16 @@ function Invoke-GoBuildTarget {
     $origCgo = $env:CGO_ENABLED
     $origOs = $env:GOOS
     $origArch = $env:GOARCH
-    Push-Location $SourceDir
     try {
         $env:CGO_ENABLED = "0"
         $env:GOOS = $TargetOS
         $env:GOARCH = $TargetArch
-        & go build -buildvcs=false -trimpath "-ldflags=$LdFlags" -o $OutputPath .
+        & go -C $SourceDir build -buildvcs=false -trimpath "-ldflags=$LdFlags" -o $OutputPath .
         if ($LASTEXITCODE -ne 0) {
             throw "go build failed for $TargetOS/$TargetArch with exit code $LASTEXITCODE"
         }
     }
     finally {
-        Pop-Location
         $env:CGO_ENABLED = $origCgo
         $env:GOOS = $origOs
         $env:GOARCH = $origArch
@@ -129,7 +127,7 @@ namespace PixelTunnel
     internal static class EmbeddedEngineMeta
     {
         public const string ExpectedSha256 = "$expectedSha";
-        public const string EngineVersion = "2.0.0";
+        public const string EngineVersion = "2.1.0";
         public const string ResourceName = "PixelTunnel.pixelcore_utls.gz";
     }
 }
@@ -171,7 +169,7 @@ namespace PixelTunnel
         $metaPath
     )
 
-    Write-Host "Building PixelTunnel.exe v2.0.0 from open source..."
+    Write-Host "Building PixelTunnel.exe v2.1.0 from open source..."
     & $csc @cscArgs
     if ($LASTEXITCODE -ne 0) {
         throw "Build failed with exit code $LASTEXITCODE"

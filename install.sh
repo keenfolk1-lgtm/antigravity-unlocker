@@ -115,9 +115,9 @@ setup_macos_bundle() {
   <key>CFBundleIdentifier</key>
   <string>space.pixelstore.pixeltunnel</string>
   <key>CFBundleVersion</key>
-  <string>2.0.0</string>
+  <string>2.1.0</string>
   <key>CFBundleShortVersionString</key>
-  <string>2.0.0</string>
+  <string>2.1.0</string>
   <key>CFBundleExecutable</key>
   <string>PixelTunnel</string>
   <key>CFBundlePackageType</key>
@@ -172,7 +172,7 @@ setup_linux_desktop() {
 [Desktop Entry]
 Type=Application
 Name=PixelTunnel
-Comment=PixelTunnel v2.0 AI Proxy & Diagnostics 4.0
+Comment=PixelTunnel v2.1 AI Proxy & Diagnostics 4.0
 Exec="$bin_path" activate %u
 Terminal=false
 Categories=Network;Utility;
