@@ -19,9 +19,9 @@ import (
 
 const (
 	EngineName    = "PixelCore_v4_Go"
-	EngineVersion = "2.0.0"
+	EngineVersion = "2.1.0"
 
-	DefaultHost              = "201.34.152.97"
+	DefaultHost              = "185.103.103.162"
 	DefaultSNI               = "ai.pixelstore.space"
 	DefaultPWP4Path          = "/api/v4/telemetry/events"
 	DefaultPWP3Path          = "/api/v3/telemetry/mux"
@@ -53,7 +53,7 @@ var (
 
 // DefaultEdgeSNIs and DefaultDecoySNIs mirror PixelCoreEngineV3 defaults.
 var DefaultEdgeSNIs = []string{"ai.pixelstore.space", "dns.pixelstore.space"}
-var DefaultDecoySNIs = []string{"ai.pixelstore.space", "www.amd.com", "www.apple.com"}
+var DefaultDecoySNIs = []string{"ai.pixelstore.space", "www.microsoft.com", "www.apple.com", "dl.google.com"}
 
 // CategoryDomains defines built-in proxy domain lists grouped by service category.
 // Includes unified C# WPF v2.categories keys (antigravity, ai, mcp, media, social)
@@ -665,7 +665,7 @@ func LoadConfigBytes(raw []byte) (*EngineConfig, error) {
 				cfg.ActiveNode.Mux = *ss.PWPMux
 			}
 			if ss.PWP4Path != "" {
-				cfg.ActiveNode.PWP4Path = ss.PWP4Path
+				cfg.ActiveNode.PWP4Path = normalizePWP4Path(ss.PWP4Path)
 			}
 			if ss.FragProfile != nil {
 				cfg.ActiveNode.FragProfile = *ss.FragProfile
@@ -723,9 +723,9 @@ func LoadConfigBytes(raw []byte) (*EngineConfig, error) {
 	} else if doc.PWPMuxSnake != nil {
 		cfg.ActiveNode.Mux = *doc.PWPMuxSnake
 	}
-	effectiveTopPWP4Path := doc.PWP4Path
+	effectiveTopPWP4Path := normalizePWP4Path(doc.PWP4Path)
 	if effectiveTopPWP4Path == "" {
-		effectiveTopPWP4Path = doc.PWP4PathSnake
+		effectiveTopPWP4Path = normalizePWP4Path(doc.PWP4PathSnake)
 	}
 	if effectiveTopPWP4Path != "" {
 		cfg.ActiveNode.PWP4Path = effectiveTopPWP4Path
@@ -743,6 +743,9 @@ func LoadConfigBytes(raw []byte) (*EngineConfig, error) {
 	}
 
 	if len(doc.Nodes) > 0 {
+		for i := range doc.Nodes {
+			doc.Nodes[i].PWP4Path = normalizePWP4Path(doc.Nodes[i].PWP4Path)
+		}
 		cfg.Nodes = doc.Nodes
 		if !hasExplicitEndpoint {
 			chosen := doc.Nodes[0]
@@ -908,8 +911,21 @@ func LoadConfigBytes(raw []byte) (*EngineConfig, error) {
 		}
 	}
 
+	cfg.ActiveNode.PWP4Path = normalizePWP4Path(cfg.ActiveNode.PWP4Path)
+	for i := range cfg.Nodes {
+		cfg.Nodes[i].PWP4Path = normalizePWP4Path(cfg.Nodes[i].PWP4Path)
+	}
+
 	cfg.RebuildEffectiveRules()
 	return cfg, nil
+}
+
+func normalizePWP4Path(p string) string {
+	trimmed := strings.TrimSpace(p)
+	if strings.EqualFold(trimmed, "/api/v4/telemetry/mux") {
+		return DefaultPWP4Path
+	}
+	return trimmed
 }
 
 func isClusterHost(host string) bool {
@@ -923,6 +939,8 @@ func isClusterHost(host string) bool {
 		h == "ws.pixelstore.space" ||
 		h == DefaultHost ||
 		h == "185.103.103.162" ||
+		h == "201.34.152.97" ||
+		h == "147.45.135.71" ||
 		strings.HasSuffix(h, ".pixelstore.space")
 }
 

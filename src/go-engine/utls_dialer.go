@@ -446,7 +446,17 @@ func dialUTLSOnce(ctx context.Context, opts UTLSDialOptions, profileName string,
 		uconn = utls.UClient(splitConn, utlsCfg, helloID)
 	}
 
-	if err := uconn.HandshakeContext(ctx); err != nil {
+	handshakeCtx := ctx
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		hsTimeout := timeout * 2
+		if hsTimeout < 12*time.Second {
+			hsTimeout = 12 * time.Second
+		}
+		var cancel context.CancelFunc
+		handshakeCtx, cancel = context.WithTimeout(ctx, hsTimeout)
+		defer cancel()
+	}
+	if err := uconn.HandshakeContext(handshakeCtx); err != nil {
 		_ = rawConn.Close()
 		return nil, err
 	}
@@ -478,7 +488,13 @@ func DialUTLSOverConn(ctx context.Context, rawConn net.Conn, serverName string) 
 	} else {
 		uconn = utls.UClient(rawConn, cfg, utls.HelloChrome_Auto)
 	}
-	if err := uconn.HandshakeContext(ctx); err != nil {
+	handshakeCtx := ctx
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		handshakeCtx, cancel = context.WithTimeout(ctx, 12*time.Second)
+		defer cancel()
+	}
+	if err := uconn.HandshakeContext(handshakeCtx); err != nil {
 		return nil, err
 	}
 	return uconn, nil

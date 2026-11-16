@@ -397,3 +397,118 @@ func TestFetchLatestManifestURLOrderFallbackAndCache(t *testing.T) {
 		t.Fatalf("LoadCachedOrEmbeddedManifest failed: src=%s err=%v doc=%+v", cachedSrc, cerr, cachedDoc)
 	}
 }
+
+func TestFilterRetiredManifestNodesAndSingleNodeGuard(t *testing.T) {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("gen key: %v", err)
+	}
+	nowStr := time.Now().UTC().Format(time.RFC3339)
+
+	// Multi-node manifest must strip retired NL hosts (201.34.152.97 and 147.45.135.71)
+	// while keeping live nodes.
+	multiDoc := ManifestDocument{
+		Ver:       210,
+		IssuedUTC: nowStr,
+		Secret:    "multi-secret",
+		Nodes: []NodeConfig{
+			{Name: "NL-Old-1", Region: "NL", Host: "201.34.152.97", Port: 443, Mux: true},
+			{Name: "NL-Old-2", Region: "NL", Host: "147.45.135.71", Port: 443, Mux: true},
+			{Name: "SE-Live", Region: "SE", Host: "185.103.103.162", Port: 443, Mux: true},
+			{Name: "Edge-WS", Region: "Edge", Host: "ws.pixelstore.space", Port: 443, Mux: true},
+		},
+	}
+	multiEnv, pubB64, aesHex := buildSignedTestPTM3(t, priv, multiDoc)
+	parsedMulti, err := VerifyAndDecryptPTM3(multiEnv, ManifestVerifierOptions{
+		PubKeyB64: pubB64,
+		AesKeyHex: aesHex,
+	})
+	if err != nil {
+		t.Fatalf("VerifyAndDecryptPTM3 multi failed: %v", err)
+	}
+	if len(parsedMulti.Nodes) != 2 {
+		t.Fatalf("expected 2 live nodes after stripping retired NL hosts, got %d: %+v", len(parsedMulti.Nodes), parsedMulti.Nodes)
+	}
+	for _, n := range parsedMulti.Nodes {
+		if n.Host == "201.34.152.97" || n.Host == "147.45.135.71" {
+			t.Fatalf("retired host %s should have been stripped from multi-node manifest", n.Host)
+		}
+	}
+
+	// ApplyManifestToConfig must also filter retired nodes even if doc wasn't verified first
+	// and legacy config still preferred the retired NL host.
+	cfg := DefaultEngineConfig()
+	cfg.PreferredRegion = "NL"
+	cfg.ActiveNode = NodeConfig{Name: "NL-Old-1", Region: "NL", Host: "201.34.152.97", Port: 443}
+	unfilteredDoc := &ManifestDocument{
+		Ver:    210,
+		Secret: "apply-secret",
+		Nodes: []NodeConfig{
+			{Name: "NL-Old-1", Region: "NL", Host: "201.34.152.97", Port: 443, Mux: true},
+			{Name: "NL-Old-2", Region: "NL", Host: "147.45.135.71", Port: 443, Mux: true},
+			{Name: "SE-Live", Region: "SE", Host: "185.103.103.162", Port: 443, Mux: true},
+		},
+	}
+	ApplyManifestToConfig(cfg, unfilteredDoc)
+	if len(cfg.Nodes) != 1 || cfg.Nodes[0].Host != "185.103.103.162" {
+		t.Fatalf("expected ApplyManifestToConfig to strip retired hosts leaving SE node, got %+v", cfg.Nodes)
+	}
+	if cfg.ActiveNode.Host != "185.103.103.162" {
+		t.Fatalf("expected ActiveNode.Host=185.103.103.162, got %q", cfg.ActiveNode.Host)
+	}
+
+	// Synthetic 1-node test manifest containing ONLY 201.34.152.97 must stay intact.
+	singleDoc := ManifestDocument{
+		Ver:       210,
+		IssuedUTC: nowStr,
+		Secret:    "synthetic-secret",
+		Nodes: []NodeConfig{
+			{Name: "Synthetic-NL", Region: "NL", Host: "201.34.152.97", Port: 443, Mux: true},
+		},
+	}
+	singleEnv, singlePub, singleAes := buildSignedTestPTM3(t, priv, singleDoc)
+	parsedSingle, err := VerifyAndDecryptPTM3(singleEnv, ManifestVerifierOptions{
+		PubKeyB64: singlePub,
+		AesKeyHex: singleAes,
+	})
+	if err != nil {
+		t.Fatalf("VerifyAndDecryptPTM3 single failed: %v", err)
+	}
+	if len(parsedSingle.Nodes) != 1 || parsedSingle.Nodes[0].Host != "201.34.152.97" {
+		t.Fatalf("expected 1-node synthetic manifest to keep 201.34.152.97, got %+v", parsedSingle.Nodes)
+	}
+
+	singleCfg := DefaultEngineConfig()
+	ApplyManifestToConfig(singleCfg, parsedSingle)
+	if len(singleCfg.Nodes) != 1 || singleCfg.Nodes[0].Host != "201.34.152.97" {
+		t.Fatalf("expected ApplyManifestToConfig on 1-node synthetic manifest to preserve 201.34.152.97, got %+v", singleCfg.Nodes)
+	}
+}
+
+func TestV210DefaultsAndClusterHostNormalization(t *testing.T) {
+	if EngineVersion != "2.1.0" {
+		t.Fatalf("expected EngineVersion=2.1.0, got %q", EngineVersion)
+	}
+	if DefaultHost != "185.103.103.162" {
+		t.Fatalf("expected DefaultHost=185.103.103.162, got %q", DefaultHost)
+	}
+
+	hasMicrosoft := false
+	for _, sni := range DefaultDecoySNIs {
+		if sni == "www.amd.com" {
+			t.Fatalf("DefaultDecoySNIs must not contain www.amd.com: %v", DefaultDecoySNIs)
+		}
+		if sni == "www.microsoft.com" {
+			hasMicrosoft = true
+		}
+	}
+	if !hasMicrosoft {
+		t.Fatalf("DefaultDecoySNIs must contain www.microsoft.com: %v", DefaultDecoySNIs)
+	}
+
+	for _, h := range []string{"201.34.152.97", "147.45.135.71", "185.103.103.162", "node.pixelstore.space", "ai.pixelstore.space"} {
+		if !isClusterHost(h) {
+			t.Fatalf("expected isClusterHost(%q) == true", h)
+		}
+	}
+}

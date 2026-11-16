@@ -248,6 +248,7 @@ func VerifyAndDecryptPTM3(envelope string, opts ManifestVerifierOptions) (*Manif
 		if doc.Nodes[i].Path == "" {
 			doc.Nodes[i].Path = DefaultPWP3Path
 		}
+		doc.Nodes[i].PWP4Path = normalizePWP4Path(doc.Nodes[i].PWP4Path)
 		if doc.Nodes[i].Mux && doc.Nodes[i].PWP4Path == "" {
 			doc.Nodes[i].PWP4Path = DefaultPWP4Path
 		}
@@ -257,7 +258,34 @@ func VerifyAndDecryptPTM3(envelope string, opts ManifestVerifierOptions) (*Manif
 		doc.Nodes[i].EnableDpiSplit = doc.Nodes[i].Frag
 	}
 
+	doc.Nodes = filterRetiredManifestNodes(doc.Nodes)
 	return &doc, nil
+}
+
+func isRetiredManifestHost(host string) bool {
+	switch strings.ToLower(strings.TrimSpace(host)) {
+	case "201.34.152.97", "147.45.135.71":
+		return true
+	default:
+		return false
+	}
+}
+
+// filterRetiredManifestNodes strips retired NL hosts when at least one non-retired node remains.
+func filterRetiredManifestNodes(nodes []NodeConfig) []NodeConfig {
+	if len(nodes) == 0 {
+		return nodes
+	}
+	nonRetired := make([]NodeConfig, 0, len(nodes))
+	for _, n := range nodes {
+		if !isRetiredManifestHost(n.Host) {
+			nonRetired = append(nonRetired, n)
+		}
+	}
+	if len(nonRetired) > 0 {
+		return nonRetired
+	}
+	return nodes
 }
 
 // ReadPersistedManifestVersion returns 0 if version file does not exist or is invalid.
@@ -323,12 +351,17 @@ func ApplyManifestToConfig(cfg *EngineConfig, doc *ManifestDocument) {
 	}
 
 	doc.normalize()
+	doc.Nodes = filterRetiredManifestNodes(doc.Nodes)
 
 	nodes := make([]NodeConfig, len(doc.Nodes))
 	copy(nodes, doc.Nodes)
 	for i := range nodes {
 		if nodes[i].UUID == "" {
 			nodes[i].UUID = cfg.ClientUUID
+		}
+		nodes[i].PWP4Path = normalizePWP4Path(nodes[i].PWP4Path)
+		if nodes[i].Mux && nodes[i].PWP4Path == "" {
+			nodes[i].PWP4Path = DefaultPWP4Path
 		}
 		if strings.TrimSpace(nodes[i].Secret) == "" && doc.Secret != "" {
 			nodes[i].Secret = doc.Secret

@@ -653,10 +653,20 @@ func (s *LocalProxyServer) handleReloadRules(w http.ResponseWriter, r *http.Requ
 	if cfg.Categories == nil {
 		cfg.Categories = make(map[string]bool)
 	}
-	if len(strings.TrimSpace(string(raw))) == 0 && cfg.ConfigPath != "" {
+	trimmedBody := strings.TrimSpace(string(raw))
+	if (len(trimmedBody) == 0 || trimmedBody == "{}") && cfg.ConfigPath != "" {
 		if reloaded, err := LoadConfig(cfg.ConfigPath); err == nil {
 			if reloaded.Categories == nil {
 				reloaded.Categories = make(map[string]bool)
+			}
+			var diskNodesCheck struct {
+				Nodes []json.RawMessage `json:"nodes"`
+			}
+			hasDiskNodes := len(reloaded.RawSourceJSON) > 0 &&
+				json.Unmarshal(reloaded.RawSourceJSON, &diskNodesCheck) == nil &&
+				len(diskNodesCheck.Nodes) > 0
+			if !hasDiskNodes && s.cfg != nil && len(s.cfg.Nodes) > 0 {
+				reloaded.Nodes = append([]NodeConfig(nil), s.cfg.Nodes...)
 			}
 			cfg = reloaded
 		}
@@ -789,8 +799,8 @@ func (s *LocalProxyServer) handleHTTPConnect(w http.ResponseWriter, r *http.Requ
 	} else {
 		port, _ = strconv.Atoi(portStr)
 	}
-	if port <= 0 || port > 65535 {
-		http.Error(w, "Invalid port", http.StatusBadRequest)
+	if strings.TrimSpace(host) == "" || port <= 0 || port > 65535 {
+		http.Error(w, "Invalid host or port", http.StatusBadRequest)
 		return
 	}
 
@@ -975,7 +985,9 @@ func (s *LocalProxyServer) handleSOCKS5Conn(c net.Conn, isWSL bool) {
 		decision := s.matcher.Classify(targetHost)
 		pid, proc := LookupProcessForConnection(c.RemoteAddr(), s.HTTPPort(), s.SOCKSPort())
 		t0 := time.Now()
-		upstream, nodeUsed, uerr := s.dialUpstreamTCP(context.Background(), decision, targetHost, targetPort, isWSL)
+		dialCtx, cancelDial := context.WithTimeout(context.Background(), 15*time.Second)
+		upstream, nodeUsed, uerr := s.dialUpstreamTCP(dialCtx, decision, targetHost, targetPort, isWSL)
+		cancelDial()
 		lat := time.Since(t0).Milliseconds()
 		errStr := ""
 		if uerr != nil {
@@ -1029,7 +1041,9 @@ func (s *LocalProxyServer) handleSOCKS5UDPAssociate(tcpCtrl net.Conn, isWSL bool
 		return
 	}
 
-	sess, err := s.mux.GetOrConnectSession(context.Background(), "ai")
+	sessCtx, cancelSess := context.WithTimeout(context.Background(), 10*time.Second)
+	sess, err := s.mux.GetOrConnectSession(sessCtx, "ai")
+	cancelSess()
 	if err != nil {
 		_, _ = tcpCtrl.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
@@ -1079,8 +1093,11 @@ func (s *LocalProxyServer) handleSOCKS5UDPAssociate(tcpCtrl net.Conn, isWSL bool
 		buf := make([]byte, 16384)
 		for {
 			n, from, rerr := udpConn.ReadFromUDP(buf)
-			if rerr != nil || n < 8 {
+			if rerr != nil {
 				return
+			}
+			if n < 8 {
+				continue
 			}
 			// Reject packets from any source IP other than the authenticated TCP control client
 			// BEFORE parsing or storing the peer UDP endpoint to prevent session hijacking.

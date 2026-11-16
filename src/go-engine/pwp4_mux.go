@@ -547,7 +547,7 @@ func (m *MuxManager) UpdateConfig(cfg *EngineConfig) {
 // WarmConnect initializes the primary session and pre-warms standby.
 func (m *MuxManager) WarmConnect(ctx context.Context) error {
 	_, err := m.getOrConnectRole(ctx, "ai")
-	if err == nil {
+	if err == nil && !m.isStopped() {
 		go m.ensureStandby(context.Background())
 	}
 	return err
@@ -564,7 +564,9 @@ func (m *MuxManager) OpenStream(ctx context.Context, role, targetHost string, ta
 		if sb := m.promoteStandby(role); sb != nil {
 			m.failoverCount.Add(1)
 			if st, serr := sb.OpenTCPStream(targetHost, targetPort, 3*time.Second); serr == nil {
-				go m.ensureStandby(context.Background())
+				if !m.isStopped() {
+					go m.ensureStandby(context.Background())
+				}
 				return st, sb.Node().Name, nil
 			}
 		}
@@ -708,7 +710,9 @@ func (m *MuxManager) TriggerInstantWake(reason string) (failoverMs int64, err er
 	defer cancel()
 	_, err = m.getOrConnectRole(wctx, "ai")
 	failoverMs = time.Since(start).Milliseconds()
-	go m.ensureStandby(context.Background())
+	if !m.isStopped() {
+		go m.ensureStandby(context.Background())
+	}
 
 	if cb != nil {
 		cb(reason, failoverMs)
@@ -1061,7 +1065,14 @@ func (m *MuxManager) getOrConnectRole(ctx context.Context, role string) (*Client
 }
 
 func (m *MuxManager) ensureStandby(ctx context.Context) {
+	if m.isStopped() {
+		return
+	}
 	m.mu.Lock()
+	if m.isStopped() {
+		m.mu.Unlock()
+		return
+	}
 	cfg := m.cfg
 	if cfg != nil && !cfg.V2.StandbyEnabled {
 		m.mu.Unlock()
@@ -1098,13 +1109,22 @@ func (m *MuxManager) ensureStandby(ctx context.Context) {
 
 	dctx, cancel := context.WithTimeout(ctx, 6*time.Second)
 	defer cancel()
+	doneDial := make(chan struct{})
+	defer close(doneDial)
+	go func() {
+		select {
+		case <-m.stopCh:
+			cancel()
+		case <-doneDial:
+		}
+	}()
 	sess, _, err := m.dialSessionWithFallback(dctx, chosen)
 	if err != nil {
 		return
 	}
 
 	m.mu.Lock()
-	if m.standby != nil && !m.standby.IsClosed() {
+	if m.isStopped() || (m.standby != nil && !m.standby.IsClosed()) {
 		m.mu.Unlock()
 		_ = sess.Close()
 		return
@@ -1164,9 +1184,11 @@ func (m *MuxManager) dialSessionWithFallback(ctx context.Context, node NodeConfi
 	if uuid == "" && cfg != nil {
 		uuid = cfg.ClientUUID
 	}
-	hwid := DefaultHost
+	hwid := ""
 	if cfg != nil && cfg.DeviceHWID != "" {
 		hwid = cfg.DeviceHWID
+	} else {
+		hwid = ComputeDeviceHWID()
 	}
 	preferPWP4 := true
 	utlsProf := "chrome"

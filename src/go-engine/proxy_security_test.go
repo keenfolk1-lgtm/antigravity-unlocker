@@ -13,6 +13,8 @@ import (
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -664,5 +666,74 @@ func TestRound3NodeDedupAndNodesFallbackConfig(t *testing.T) {
 	}
 	if mt, _, del := resolveKDERollbackSettings("1", ""); mt != "1" || del != true {
 		t.Fatalf("expected manual KDE mode 1 preserved, got type=%q del=%v", mt, del)
+	}
+}
+
+func TestProxyBugfixesConnectEmptyHostReloadEmptyJSONAndStandbyStop(t *testing.T) {
+	// 1. Empty host in HTTP CONNECT (:443) must fail with 400 Bad Request rather than hijacking.
+	srv := NewLocalProxyServer(LocalProxyOptions{Config: DefaultEngineConfig()})
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodConnect, "http://:443", nil)
+	req.Host = ":443"
+	srv.handleHTTPConnect(rr, req, false)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for empty CONNECT host, got %d", rr.Code)
+	}
+
+	// 2. normalizePWP4Path must heal /api/v4/telemetry/mux typo -> /api/v4/telemetry/events.
+	if got := normalizePWP4Path("/api/v4/telemetry/mux"); got != DefaultPWP4Path {
+		t.Fatalf("expected %q, got %q", DefaultPWP4Path, got)
+	}
+	cfgJSON := []byte(`{"nodes":[{"name":"Edge","host":"185.103.103.162","port":443,"pwp4_path":"/api/v4/telemetry/mux","secret":"sec","tls":true,"mux":true}]}`)
+	parsedCfg, perr := LoadConfigBytes(cfgJSON)
+	if perr != nil {
+		t.Fatalf("LoadConfigBytes failed: %v", perr)
+	}
+	if parsedCfg.ActiveNode.PWP4Path != DefaultPWP4Path || parsedCfg.Nodes[0].PWP4Path != DefaultPWP4Path {
+		t.Fatalf("expected normalized PWP4Path=%q, got active=%q node=%q", DefaultPWP4Path, parsedCfg.ActiveNode.PWP4Path, parsedCfg.Nodes[0].PWP4Path)
+	}
+
+	// 3. handleReloadRules with "{}" must reload from ConfigPath while preserving runtime Nodes.
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "active_config.json")
+	if err := os.WriteFile(cfgPath, []byte(`{"v2":{"categories":{"antigravity":true}}}`), 0600); err != nil {
+		t.Fatalf("write temp config: %v", err)
+	}
+	reloadCfg := DefaultEngineConfig()
+	reloadCfg.ConfigPath = cfgPath
+	reloadCfg.Nodes = []NodeConfig{{Name: "RuntimeNode", Host: "185.103.103.162", Port: 443, Mux: true, PWP4Path: DefaultPWP4Path}}
+	reloadSrv := NewLocalProxyServer(LocalProxyOptions{Config: reloadCfg})
+	rrReload := httptest.NewRecorder()
+	reqReload := httptest.NewRequest(http.MethodPost, "/__pixelcore/v4/reload-rules", strings.NewReader("{}"))
+	reloadSrv.handleReloadRules(rrReload, reqReload)
+	if rrReload.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from handleReloadRules, got %d: %s", rrReload.Code, rrReload.Body.String())
+	}
+	if len(reloadSrv.cfg.Nodes) != 1 || reloadSrv.cfg.Nodes[0].Name != "RuntimeNode" {
+		t.Fatalf("expected runtime Nodes preserved after reload with {}, got %+v", reloadSrv.cfg.Nodes)
+	}
+
+	// 4. MuxManager.Close() must abort in-flight ensureStandby without leaving leaked standby session.
+	cfg := DefaultEngineConfig()
+	cfg.V2.StandbyEnabled = true
+	cfg.Nodes = []NodeConfig{{Name: "SE-1", Host: "185.103.103.162", Port: 443, Mux: true}}
+	mux := NewMuxManager(cfg, nil)
+	started := make(chan struct{})
+	mux.dialNodeOverride = func(ctx context.Context, node NodeConfig, forcePWP3 bool) (*ClientMuxSession, string, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, "", ctx.Err()
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		mux.ensureStandby(context.Background())
+	}()
+	<-started
+	mux.Close()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("ensureStandby did not abort promptly on MuxManager.Close()")
 	}
 }
