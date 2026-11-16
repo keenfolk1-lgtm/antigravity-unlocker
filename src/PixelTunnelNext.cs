@@ -35,8 +35,8 @@ using ShapePath = System.Windows.Shapes.Path;
 [assembly: AssemblyTrademark("")]
 [assembly: AssemblyCulture("")]
 [assembly: ComVisible(false)]
-[assembly: AssemblyVersion("2.0.0.0")]
-[assembly: AssemblyFileVersion("2.0.0.0")]
+[assembly: AssemblyVersion("2.1.0.0")]
+[assembly: AssemblyFileVersion("2.1.0.0")]
 [assembly: System.Runtime.Versioning.TargetFramework(".NETFramework,Version=v4.8", FrameworkDisplayName = ".NET Framework 4.8")]
 
 namespace PixelTunnel
@@ -47,7 +47,7 @@ namespace PixelTunnel
         public string Server = "";
         public string ResolvedIp = "";
         public int Port = 443;
-        public string Sni = "www.amd.com";
+        public string Sni = "www.microsoft.com";
         public string PublicKey = "";
         public string ShortId = "";
         public string Fingerprint = "chrome";
@@ -79,6 +79,7 @@ namespace PixelTunnel
 
             // 1. SAFE --genconfig: MUST execute BEFORE Mutex, process killing, or Registry writes!
             bool isGenConfig = false;
+            bool isSanitizeProxy = false;
             bool autoConnect = false;
             bool autoDiag = false;
             string deepLinkUri = null;
@@ -88,6 +89,8 @@ namespace PixelTunnel
                 {
                     if (string.Equals(a, "--genconfig", StringComparison.OrdinalIgnoreCase))
                         isGenConfig = true;
+                    else if (string.Equals(a, "--sanitize-proxy", StringComparison.OrdinalIgnoreCase))
+                        isSanitizeProxy = true;
                     else if (string.Equals(a, "--autoconnect", StringComparison.OrdinalIgnoreCase) ||
                              string.Equals(a, "--connect", StringComparison.OrdinalIgnoreCase))
                         autoConnect = true;
@@ -114,6 +117,12 @@ namespace PixelTunnel
                         PixelTunnel.MainWindow.ParseVlessUri(PixelTunnel.MainWindow.GetFreeModeSentinelUri());
                 string cfg = PixelTunnel.MainWindow.BuildSingBoxConfig(n, true, true, true, true, true);
                 File.WriteAllText(outPath, cfg, new UTF8Encoding(false));
+                return;
+            }
+
+            if (isSanitizeProxy)
+            {
+                PixelTunnel.MainWindow.EmergencyDisableDeadSystemProxy();
                 return;
             }
 
@@ -478,7 +487,7 @@ namespace PixelTunnel
         public static string GetFreeModeSentinelUri() { return "pwp3://free@ai.pixelstore.space:443#PixelTunnel-Free"; }
         private static string GetDefaultClusterHost() { return "ai.pixelstore.space"; }
 
-        public const string APP_VERSION = "2.0.0";
+        public const string APP_VERSION = "2.1.0";
         public const string IPC_PIPE_NAME = "Local\\PixelTunnel_IPC_v2";
         private const string CORE_EXE_NAME = "pixel-tun-core";
         private const int LOCAL_MIXED_PORT = 17890;
@@ -503,6 +512,10 @@ namespace PixelTunnel
         private string _lastValidationUrl = "";
         private string _githubReleaseUrl = "";
         private DateTime _tunnelConnectedUtc = DateTime.MinValue;
+        private static DateTime _lastTunnelConnectedUtc = DateTime.MinValue;
+        private static DateTime _agLsEnvLastUpdatedUtc = DateTime.MinValue;
+        private static DateTime _lsBinaryLastPatchedUtc = DateTime.MinValue;
+        private static volatile bool _forceShowAgBannerOnNextCheck = false;
         private int _agRelaunchedForPort = 0;
         private bool _agBannerDismissed = false;
         private static string _selectedRegion = "auto";
@@ -516,7 +529,7 @@ namespace PixelTunnel
         private TextBlock _regTextUs;
         private static bool _isWatchdogPatchRunning = false;
         private static readonly Dictionary<string, string> _verifiedLsBinSignatures = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        private const string PROXY_OVERRIDE = "localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*;<local>;*.ru;*.su;*.xn--p1ai;*.pixelstore.space;pixelstore.space;201.34.152.97;*.o3.ru;*.o3team.ru;*.o3t.ru;*.ozon.ru;*.ozon-dostavka.ru;*.ozonalco.ru;*.ozon.by;*.ozon.kz;*.ozone.ru;*.ozonru.me;*.ozonrucn.me;*.ozoncom.me;*.ozon.tech;*.ozonusercontent.com;*.ozon.com;*.ozonpartners.ru;*.ozondostavka.ru;*.ozon.travel;*.ozon.team;*.chatzone.ru;185.73.*;89.31.143.*";
+        private const string PROXY_OVERRIDE = "localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*;<local>;*.ru;*.su;*.xn--p1ai;*.pixelstore.space;pixelstore.space;185.103.103.162;201.34.152.97;*.o3.ru;*.o3team.ru;*.o3t.ru;*.ozon.ru;*.ozon-dostavka.ru;*.ozonalco.ru;*.ozon.by;*.ozon.kz;*.ozone.ru;*.ozonru.me;*.ozonrucn.me;*.ozoncom.me;*.ozon.tech;*.ozonusercontent.com;*.ozon.com;*.ozonpartners.ru;*.ozondostavka.ru;*.ozon.travel;*.ozon.team;*.chatzone.ru;185.73.*;89.31.143.*";
 
         private readonly string _baseDir;
         private readonly string _engineDir;
@@ -1307,14 +1320,25 @@ namespace PixelTunnel
             {
                 if (enable)
                 {
-                    using (var runOnce = Registry.CurrentUser.CreateSubKey(@"Software\Microsoft\Windows\CurrentVersion\RunOnce"))
+                    string exePath = "";
+                    try { exePath = System.Reflection.Assembly.GetExecutingAssembly().Location; } catch { }
+                    if (string.IsNullOrEmpty(exePath))
                     {
-                        if (runOnce != null)
+                        try { using (var cp = Process.GetCurrentProcess()) { exePath = cp.MainModule.FileName; } } catch { }
+                    }
+                    if (!string.IsNullOrEmpty(exePath) &&
+                        File.Exists(exePath) &&
+                        exePath.IndexOf("\\Temp\\", StringComparison.OrdinalIgnoreCase) < 0)
+                    {
+                        using (var runOnce = Registry.CurrentUser.CreateSubKey(@"Software\Microsoft\Windows\CurrentVersion\RunOnce"))
                         {
-                            runOnce.SetValue(
-                                "PixelTunnelProxyReset",
-                                "cmd /c reg add \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\" /v ProxyEnable /t REG_DWORD /d 0 /f & reg delete \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\" /v AutoConfigURL /f",
-                                RegistryValueKind.String);
+                            if (runOnce != null)
+                            {
+                                runOnce.SetValue(
+                                    "PixelTunnelProxyReset",
+                                    string.Format("\"{0}\" --sanitize-proxy", exePath),
+                                    RegistryValueKind.String);
+                            }
                         }
                     }
                 }
@@ -1353,29 +1377,78 @@ namespace PixelTunnel
             catch { }
         }
 
-        public static void EmergencyDisableDeadSystemProxy()
+        private static bool TryClearDeadSystemProxyInRegistry(int probeTimeoutMs, bool treatDefaultPortAsDead, out string clearedSummary)
         {
+            clearedSummary = "";
+            bool clearedAny = false;
             try
             {
                 using (var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Internet Settings", true))
                 {
                     if (key != null)
                     {
+                        object autoCfgObj = key.GetValue("AutoConfigURL", null);
+                        if (autoCfgObj != null)
+                        {
+                            string pac = Convert.ToString(autoCfgObj);
+                            if (IsPixelOrLocalAutoConfig(pac))
+                            {
+                                int pacPort = TryExtractLoopbackProxyPort(pac);
+                                bool deadPac = pacPort <= 0 ||
+                                               (treatDefaultPortAsDead && pacPort == LOCAL_MIXED_PORT) ||
+                                               !IsLocalPortOpen(pacPort, probeTimeoutMs);
+                                if (deadPac)
+                                {
+                                    key.DeleteValue("AutoConfigURL", false);
+                                    clearedAny = true;
+                                    clearedSummary = pac;
+                                }
+                            }
+                        }
+
                         int en = Convert.ToInt32(key.GetValue("ProxyEnable", 0));
                         string srv = Convert.ToString(key.GetValue("ProxyServer", ""));
-                        if (en == 1 && srv.StartsWith("127.0.0.1:", StringComparison.OrdinalIgnoreCase))
+                        if (en == 1 && !string.IsNullOrEmpty(srv) &&
+                            (srv.IndexOf("127.0.0.1:", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                             srv.IndexOf("localhost:", StringComparison.OrdinalIgnoreCase) >= 0))
                         {
-                            int port = 0;
-                            int.TryParse(srv.Substring("127.0.0.1:".Length), out port);
-                            if (port == LOCAL_MIXED_PORT || (port > 0 && !IsLocalPortOpen(port, 150)))
+                            int port = TryExtractLoopbackProxyPort(srv);
+                            bool deadProxy = (treatDefaultPortAsDead && port == LOCAL_MIXED_PORT) ||
+                                             (port > 0 && !IsLocalPortOpen(port, probeTimeoutMs));
+                            if (deadProxy)
                             {
                                 key.SetValue("ProxyEnable", 0, RegistryValueKind.DWord);
-                                ApplyWinInetPerConnectionProxy(false, "", "");
+                                clearedAny = true;
+                                clearedSummary = srv;
+                            }
+                        }
+
+                        if (clearedAny)
+                        {
+                            int remainingEn = Convert.ToInt32(key.GetValue("ProxyEnable", 0));
+                            if (remainingEn == 0)
+                            {
+                                ApplyWinInetPerConnectionProxy(false, "", "", "");
                                 SetProxyResetRunOnceGuard(false);
+                            }
+                            else
+                            {
+                                RefreshWinInet();
                             }
                         }
                     }
                 }
+            }
+            catch { }
+            return clearedAny;
+        }
+
+        public static void EmergencyDisableDeadSystemProxy()
+        {
+            try
+            {
+                string ignored;
+                TryClearDeadSystemProxyInRegistry(150, true, out ignored);
                 CleanDeadProxyEnvironmentVariables();
             }
             catch { }
@@ -1417,6 +1490,27 @@ namespace PixelTunnel
             return cleanedAny;
         }
 
+        private static void SetAgLsProxyEnv(string proxyUrl, bool updateProcessEnv = true)
+        {
+            try
+            {
+                string prevUser = Environment.GetEnvironmentVariable("AG_LS_PROXY", EnvironmentVariableTarget.User);
+                string prevProc = Environment.GetEnvironmentVariable("AG_LS_PROXY", EnvironmentVariableTarget.Process);
+                Environment.SetEnvironmentVariable("AG_LS_PROXY", proxyUrl, EnvironmentVariableTarget.User);
+                if (updateProcessEnv)
+                {
+                    Environment.SetEnvironmentVariable("AG_LS_PROXY", proxyUrl, EnvironmentVariableTarget.Process);
+                }
+                if (!string.IsNullOrEmpty(proxyUrl) &&
+                    (!string.Equals(prevUser, proxyUrl, StringComparison.Ordinal) ||
+                     (updateProcessEnv && !string.Equals(prevProc, proxyUrl, StringComparison.Ordinal))))
+                {
+                    _agLsEnvLastUpdatedUtc = DateTime.UtcNow;
+                }
+            }
+            catch { }
+        }
+
         private static bool CleanDeadProxyEnvironmentVariables()
         {
             bool cleanedAny = PurgeGlobalCliProxyEnvVars();
@@ -1430,8 +1524,7 @@ namespace PixelTunnel
                     if (col > 0) int.TryParse(val.Substring(col + 1).TrimEnd('/'), out p);
                     if (p > 0 && !IsLocalPortOpen(p, 150))
                     {
-                        Environment.SetEnvironmentVariable("AG_LS_PROXY", null, EnvironmentVariableTarget.User);
-                        Environment.SetEnvironmentVariable("AG_LS_PROXY", null, EnvironmentVariableTarget.Process);
+                        SetAgLsProxyEnv(null, true);
                         cleanedAny = true;
                     }
                 }
@@ -1448,35 +1541,14 @@ namespace PixelTunnel
         {
             try
             {
-                using (var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Internet Settings", true))
+                string clearedProxy;
+                if (TryClearDeadSystemProxyInRegistry(180, false, out clearedProxy) && !string.IsNullOrEmpty(clearedProxy))
                 {
-                    if (key != null)
-                    {
-                        object autoCfgObj = key.GetValue("AutoConfigURL", null);
-                        if (autoCfgObj != null && IsPixelOrLocalAutoConfig(Convert.ToString(autoCfgObj)))
-                        {
-                            key.DeleteValue("AutoConfigURL", false);
-                        }
-
-                        int en = Convert.ToInt32(key.GetValue("ProxyEnable", 0));
-                        string srv = Convert.ToString(key.GetValue("ProxyServer", ""));
-                        if (en == 1 && srv.StartsWith("127.0.0.1:", StringComparison.OrdinalIgnoreCase))
-                        {
-                            int port = 0;
-                            int.TryParse(srv.Substring("127.0.0.1:".Length), out port);
-                            if (port > 0 && !IsLocalPortOpen(port, 180))
-                            {
-                                key.SetValue("ProxyEnable", 0, RegistryValueKind.DWord);
-                                ApplyWinInetPerConnectionProxy(false, "", "");
-                                SetProxyResetRunOnceGuard(false);
-                                SetStatus(
-                                    ColAmber,
-                                    "Восстановлен прямой интернет",
-                                    string.Format("Отключен зависший системный прокси ({0}), блокировавший сеть.", srv)
-                                );
-                            }
-                        }
-                    }
+                    SetStatus(
+                        ColAmber,
+                        "Восстановлен прямой интернет",
+                        string.Format("Отключен зависший системный прокси ({0}), блокировавший сеть.", clearedProxy)
+                    );
                 }
 
                 // Purge global HTTP_PROXY / ALL_PROXY and clean dead AG_LS_PROXY + Cursor/VS Code leftovers on startup
@@ -3809,6 +3881,381 @@ namespace PixelTunnel
             return false;
         }
 
+        private static readonly byte[] _patTiers1 = Encoding.ASCII.GetBytes("ineligible_tiers");
+        private static readonly byte[] _repTiers1 = Encoding.ASCII.GetBytes("inexigible_tiers");
+        private static readonly byte[] _patTiers2 = Encoding.ASCII.GetBytes("ineligibleTiers");
+        private static readonly byte[] _repTiers2 = Encoding.ASCII.GetBytes("inexigibleTiers");
+
+        private static readonly byte[] _patAgLsProxy = Encoding.ASCII.GetBytes("AG_LS_PROXY");
+        private static readonly byte[] _patProxyP1 = Encoding.ASCII.GetBytes("HTTPS_PROXYhttps_proxy");
+        private static readonly byte[] _repProxyP1 = Encoding.ASCII.GetBytes("AG_LS_PROXYag_ls_proxy");
+        private static readonly byte[] _patProxyP2a = Encoding.ASCII.GetBytes("retry-afterHTTPS_PROXY");
+        private static readonly byte[] _repProxyP2a = Encoding.ASCII.GetBytes("retry-afterAG_LS_PROXY");
+        private static readonly byte[] _patProxyP2b = Encoding.ASCII.GetBytes("retry-afterhttps_proxy");
+        private static readonly byte[] _repProxyP2b = Encoding.ASCII.GetBytes("retry-afterag_ls_proxy");
+        private static readonly byte[] _patProxyP3Upper = Encoding.ASCII.GetBytes("HTTPS_PROXY");
+        private static readonly byte[] _repProxyP3Upper = Encoding.ASCII.GetBytes("AG_LS_PROXY");
+        private static readonly byte[] _patProxyP3Lower = Encoding.ASCII.GetBytes("https_proxy");
+        private static readonly byte[] _repProxyP3Lower = Encoding.ASCII.GetBytes("ag_ls_proxy");
+
+        private static readonly byte[][] _p3ContextAnchors = new byte[][]
+        {
+            Encoding.ASCII.GetBytes("HTTP_PROXY"),
+            Encoding.ASCII.GetBytes("http_proxy"),
+            Encoding.ASCII.GetBytes("NO_PROXY"),
+            Encoding.ASCII.GetBytes("no_proxy")
+        };
+
+        private static bool IsDisallowedProxyAdjacentByte(byte b)
+        {
+            return b == (byte)'_' || b == (byte)'=' ||
+                   (b >= (byte)'0' && b <= (byte)'9') ||
+                   (b >= (byte)'A' && b <= (byte)'Z') ||
+                   (b >= (byte)'a' && b <= (byte)'z');
+        }
+
+        private static List<long> FilterP3ContextProxyOffsets(string filePath, List<long> rawOffsets, int patternLen)
+        {
+            var accepted = new List<long>();
+            if (rawOffsets == null || rawOffsets.Count == 0) return accepted;
+
+            try
+            {
+                using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                {
+                    long fileLen = fs.Length;
+                    byte[] winBuf = new byte[1024 + patternLen + 4];
+
+                    foreach (long pos in rawOffsets)
+                    {
+                        if (pos < 0 || pos + patternLen > fileLen) continue;
+
+                        if (pos > 0)
+                        {
+                            fs.Seek(pos - 1, SeekOrigin.Begin);
+                            int bPrev = fs.ReadByte();
+                            if (bPrev >= 0 && IsDisallowedProxyAdjacentByte((byte)bPrev)) continue;
+                        }
+                        if (pos + patternLen < fileLen)
+                        {
+                            fs.Seek(pos + patternLen, SeekOrigin.Begin);
+                            int bNext = fs.ReadByte();
+                            if (bNext >= 0 && IsDisallowedProxyAdjacentByte((byte)bNext)) continue;
+                        }
+
+                        long winStart = Math.Max(0L, pos - 512);
+                        long winEnd = Math.Min(fileLen, pos + patternLen + 512);
+                        int winLen = (int)(winEnd - winStart);
+                        if (winLen <= 0 || winLen > winBuf.Length) continue;
+
+                        fs.Seek(winStart, SeekOrigin.Begin);
+                        int totalRead = 0;
+                        while (totalRead < winLen)
+                        {
+                            int n = fs.Read(winBuf, totalRead, winLen - totalRead);
+                            if (n <= 0) break;
+                            totalRead += n;
+                        }
+
+                        bool hasAnchor = false;
+                        for (int a = 0; a < _p3ContextAnchors.Length; a++)
+                        {
+                            if (FindSubArray(winBuf, totalRead, _p3ContextAnchors[a], 0) >= 0)
+                            {
+                                hasAnchor = true;
+                                break;
+                            }
+                        }
+                        if (hasAnchor && !accepted.Contains(pos))
+                        {
+                            accepted.Add(pos);
+                        }
+                    }
+                }
+            }
+            catch { }
+            return accepted;
+        }
+
+        private static void ApplyOffsetPatchesToStream(FileStream fs, List<KeyValuePair<List<long>, byte[]>> patches)
+        {
+            foreach (var kv in patches)
+            {
+                byte[] rep = kv.Value;
+                foreach (long pos in kv.Key)
+                {
+                    fs.Seek(pos, SeekOrigin.Begin);
+                    fs.Write(rep, 0, rep.Length);
+                }
+            }
+            fs.Flush();
+        }
+
+        private static void StopLanguageServerProcessesForPath(string targetBinPath, bool fallbackAll)
+        {
+            string fullTarget = "";
+            try { fullTarget = System.IO.Path.GetFullPath(targetBinPath); } catch { fullTarget = targetBinPath ?? ""; }
+            foreach (var lsName in new[] { "language_server", "language_server_windows_x64" })
+            {
+                foreach (var p in Process.GetProcessesByName(lsName))
+                {
+                    bool shouldKill = false;
+                    try
+                    {
+                        string procPath = p.MainModule != null ? p.MainModule.FileName : "";
+                        if (!string.IsNullOrEmpty(procPath) &&
+                            string.Equals(System.IO.Path.GetFullPath(procPath), fullTarget, StringComparison.OrdinalIgnoreCase))
+                        {
+                            shouldKill = true;
+                        }
+                    }
+                    catch
+                    {
+                        if (fallbackAll) shouldKill = true;
+                    }
+                    if (shouldKill)
+                    {
+                        try { p.Kill(); p.WaitForExit(1000); } catch { }
+                    }
+                }
+            }
+        }
+
+        private static DateTime GetAntigravityStateCutoffUtc()
+        {
+            DateTime cutoff = _lastTunnelConnectedUtc;
+            if (_agLsEnvLastUpdatedUtc > cutoff) cutoff = _agLsEnvLastUpdatedUtc;
+            if (_lsBinaryLastPatchedUtc > cutoff) cutoff = _lsBinaryLastPatchedUtc;
+            return cutoff;
+        }
+
+        private static int CountProcessesStartedBefore(string[] procNames, DateTime cutoffUtc)
+        {
+            if (cutoffUtc == DateTime.MinValue || procNames == null) return 0;
+            int count = 0;
+            DateTime threshold = cutoffUtc.AddSeconds(-2);
+            foreach (var name in procNames)
+            {
+                try
+                {
+                    foreach (var p in Process.GetProcessesByName(name))
+                    {
+                        try
+                        {
+                            if (p.StartTime.ToUniversalTime() < threshold) count++;
+                        }
+                        catch { }
+                    }
+                }
+                catch { }
+            }
+            return count;
+        }
+
+        private static int RestartStaleLanguageServers(DateTime cutoffUtc)
+        {
+            if (cutoffUtc == DateTime.MinValue) return 0;
+            int killed = 0;
+            DateTime threshold = cutoffUtc.AddSeconds(-2);
+            foreach (var lsName in new[] { "language_server", "language_server_windows_x64" })
+            {
+                try
+                {
+                    foreach (var p in Process.GetProcessesByName(lsName))
+                    {
+                        try
+                        {
+                            if (p.StartTime.ToUniversalTime() < threshold)
+                            {
+                                p.Kill();
+                                killed++;
+                            }
+                        }
+                        catch { }
+                    }
+                }
+                catch { }
+            }
+            return killed;
+        }
+
+        private static bool PatchSingleLanguageServerBinary(string binPath, out bool tiersVerified, out bool proxyVerified, out bool patchedNow, out string detailMsg)
+        {
+            tiersVerified = false;
+            proxyVerified = false;
+            patchedNow = false;
+            detailMsg = "";
+
+            if (string.IsNullOrWhiteSpace(binPath) || !File.Exists(binPath))
+            {
+                detailMsg = "  ⚠ [ФАЙЛ НЕ НАЙДЕН] Бинарник language_server не найден: " + (binPath ?? "");
+                return false;
+            }
+
+            string fileName = System.IO.Path.GetFileName(binPath);
+            bool isTempPath = binPath.IndexOf("\\Temp\\", StringComparison.OrdinalIgnoreCase) >= 0;
+
+            try
+            {
+                var offTiers1 = ScanBinaryForPatternOffsets(binPath, _patTiers1);
+                var offTiers2 = ScanBinaryForPatternOffsets(binPath, _patTiers2);
+                bool hasRepTiersBefore = ScanBinaryForPatternOffsets(binPath, _repTiers1).Count > 0 ||
+                                         ScanBinaryForPatternOffsets(binPath, _repTiers2).Count > 0;
+                bool hadTiersOnlyBefore = (offTiers1.Count == 0 && offTiers2.Count == 0 && hasRepTiersBefore);
+
+                bool hasAgLsProxyBefore = ScanBinaryForPatternOffsets(binPath, _patAgLsProxy).Count > 0;
+
+                var patches = new List<KeyValuePair<List<long>, byte[]>>();
+                if (offTiers1.Count > 0) patches.Add(new KeyValuePair<List<long>, byte[]>(offTiers1, _repTiers1));
+                if (offTiers2.Count > 0) patches.Add(new KeyValuePair<List<long>, byte[]>(offTiers2, _repTiers2));
+
+                string proxyPatchTag = "";
+                bool patchingProxyNow = false;
+                if (!hasAgLsProxyBefore)
+                {
+                    var offP1 = ScanBinaryForPatternOffsets(binPath, _patProxyP1);
+                    if (offP1.Count > 0)
+                    {
+                        patches.Add(new KeyValuePair<List<long>, byte[]>(offP1, _repProxyP1));
+                        proxyPatchTag = "P1";
+                        patchingProxyNow = true;
+                    }
+                    else
+                    {
+                        var offP2a = ScanBinaryForPatternOffsets(binPath, _patProxyP2a);
+                        var offP2b = ScanBinaryForPatternOffsets(binPath, _patProxyP2b);
+                        if (offP2a.Count > 0) patches.Add(new KeyValuePair<List<long>, byte[]>(offP2a, _repProxyP2a));
+                        if (offP2b.Count > 0) patches.Add(new KeyValuePair<List<long>, byte[]>(offP2b, _repProxyP2b));
+                        if (offP2a.Count > 0 || offP2b.Count > 0)
+                        {
+                            proxyPatchTag = "P2";
+                            patchingProxyNow = true;
+                        }
+                        else
+                        {
+                            var rawP3Upper = ScanBinaryForPatternOffsets(binPath, _patProxyP3Upper);
+                            var offP3Upper = FilterP3ContextProxyOffsets(binPath, rawP3Upper, _patProxyP3Upper.Length);
+                            if (offP3Upper.Count > 0) patches.Add(new KeyValuePair<List<long>, byte[]>(offP3Upper, _repProxyP3Upper));
+
+                            var rawP3Lower = ScanBinaryForPatternOffsets(binPath, _patProxyP3Lower);
+                            var offP3Lower = FilterP3ContextProxyOffsets(binPath, rawP3Lower, _patProxyP3Lower.Length);
+                            if (offP3Lower.Count > 0) patches.Add(new KeyValuePair<List<long>, byte[]>(offP3Lower, _repProxyP3Lower));
+
+                            if (offP3Upper.Count > 0 || offP3Lower.Count > 0)
+                            {
+                                proxyPatchTag = "P3";
+                                patchingProxyNow = true;
+                            }
+                        }
+                    }
+                }
+
+                bool writeFailed = false;
+                string writeErr = "";
+
+                if (patches.Count > 0)
+                {
+                    StopLanguageServerProcessesForPath(binPath, false);
+
+                    string oldBak = binPath + ".old";
+                    try { if (File.Exists(oldBak)) File.Delete(oldBak); } catch { }
+
+                    bool writeOk = false;
+                    try
+                    {
+                        using (var fs = new FileStream(binPath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite))
+                        {
+                            ApplyOffsetPatchesToStream(fs, patches);
+                        }
+                        writeOk = true;
+                    }
+                    catch (Exception exPrimary)
+                    {
+                        writeErr = exPrimary.Message;
+                        if (!isTempPath) StopLanguageServerProcessesForPath(binPath, true);
+                        try
+                        {
+                            File.Move(binPath, oldBak);
+                            File.Copy(oldBak, binPath, true);
+                            using (var fs = new FileStream(binPath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite))
+                            {
+                                ApplyOffsetPatchesToStream(fs, patches);
+                            }
+                            StopLanguageServerProcessesForPath(binPath, !isTempPath);
+                            writeOk = true;
+                        }
+                        catch (Exception exFallback)
+                        {
+                            try
+                            {
+                                if (!File.Exists(binPath) && File.Exists(oldBak))
+                                    File.Move(oldBak, binPath);
+                            }
+                            catch { }
+                            writeErr = !string.IsNullOrEmpty(exFallback.Message) ? exFallback.Message : exPrimary.Message;
+                            writeFailed = true;
+                        }
+                    }
+
+                    if (writeOk)
+                    {
+                        patchedNow = true;
+                        _lsBinaryLastPatchedUtc = DateTime.UtcNow;
+                    }
+                }
+
+                // Independent verification on disk
+                bool hasRepTiers1 = ScanBinaryForPatternOffsets(binPath, _repTiers1).Count > 0;
+                bool hasRepTiers2 = ScanBinaryForPatternOffsets(binPath, _repTiers2).Count > 0;
+                bool hasRemTiers1 = ScanBinaryForPatternOffsets(binPath, _patTiers1).Count > 0;
+                bool hasRemTiers2 = ScanBinaryForPatternOffsets(binPath, _patTiers2).Count > 0;
+                tiersVerified = hasRepTiers1 || hasRepTiers2 || (patchedNow && !hasRemTiers1 && !hasRemTiers2);
+                proxyVerified = ScanBinaryForPatternOffsets(binPath, _patAgLsProxy).Count > 0;
+
+                bool bothVerified = tiersVerified && proxyVerified;
+                string tiersText = tiersVerified ? "Tiers (inexigible_tiers OK)" : "Tiers (ОТСУТСТВУЕТ)";
+                string proxyText = proxyVerified ? "Proxy (AG_LS_PROXY bin-patch OK)" : "Proxy (AG_LS_PROXY ОТСУТСТВУЕТ)";
+
+                if (writeFailed)
+                {
+                    detailMsg = string.Format(
+                        "  ⚠ [ПРАВА / ФАЙЛ ЗАНЯТ] {0}: не удалось записать патч ({1}). Статус: {2} | {3}. Запустите PixelTunnel 1 раз от имени Администратора ИЛИ нажмите «Перезапустить Antigravity в туннеле».",
+                        fileName, writeErr, tiersText, proxyText);
+                }
+                else if (bothVerified && patchedNow && hadTiersOnlyBefore && patchingProxyNow)
+                {
+                    detailMsg = string.Format(
+                        "  ⚡ [АВТО-ПАТЧ ПРОКСИ] Доустановлен патч прокси-шлюза AG_LS_PROXY ({0}) в {1} | {2} | {3}.",
+                        proxyPatchTag, fileName, tiersText, proxyText);
+                }
+                else if (bothVerified && patchedNow)
+                {
+                    detailMsg = string.Format(
+                        "  ⚡ [АВТО-ПАТЧ САНКЦИЙ] {0}: успешно пропатчен ({1}) | {2} | {3}.",
+                        fileName, string.IsNullOrEmpty(proxyPatchTag) ? "tiers" : proxyPatchTag, tiersText, proxyText);
+                }
+                else if (bothVerified)
+                {
+                    detailMsg = string.Format(
+                        "  ✓ [OK] {0}: {1} | {2}.",
+                        fileName, tiersText, proxyText);
+                }
+                else
+                {
+                    detailMsg = string.Format(
+                        "  ⚠ [НЕПОЛНЫЙ ПАТЧ] {0}: {1} | {2}. Нажмите «Перезапустить Antigravity в туннеле» или запустите от имени Администратора.",
+                        fileName, tiersText, proxyText);
+                }
+
+                return bothVerified;
+            }
+            catch (Exception ex)
+            {
+                detailMsg = string.Format("  ⚠ [ОШИБКА ПАТЧА] {0}: {1}", fileName, ex.Message);
+                return false;
+            }
+        }
+
         private static bool PatchAntigravitySanctionsAndProxy(out List<string> logs, bool restartIfAlreadyPatched)
         {
             bool dummyPatchedNow;
@@ -3824,126 +4271,38 @@ namespace PixelTunnel
             try
             {
                 var candidateBins = DiscoverAntigravityLanguageServerBinaries();
-
-                byte[] patTiers1 = Encoding.ASCII.GetBytes("ineligible_tiers");
-                byte[] repTiers1 = Encoding.ASCII.GetBytes("inexigible_tiers");
-                byte[] patTiers2 = Encoding.ASCII.GetBytes("ineligibleTiers");
-                byte[] repTiers2 = Encoding.ASCII.GetBytes("inexigibleTiers");
-                byte[] patProxy  = Encoding.ASCII.GetBytes("retry-afterHTTPS_PROXY");
-                byte[] repProxy  = Encoding.ASCII.GetBytes("retry-afterAG_LS_PROXY");
+                if (candidateBins.Count == 0)
+                {
+                    logs.Add("  ℹ [ИНФО] Исполняемые файлы Antigravity language_server.exe не найдены.");
+                    return false;
+                }
 
                 foreach (var binPath in candidateBins)
                 {
-                    try
+                    bool tOk, pOk, patchedFile;
+                    string detailMsg;
+                    bool ok = PatchSingleLanguageServerBinary(binPath, out tOk, out pOk, out patchedFile, out detailMsg);
+                    if (!string.IsNullOrEmpty(detailMsg)) logs.Add(detailMsg);
+                    if (patchedFile) anyPatchedNow = true;
+
+                    if (ok && tOk && pOk)
                     {
-                        var offTiers1 = ScanBinaryForPatternOffsets(binPath, patTiers1);
-                        var offTiers2 = ScanBinaryForPatternOffsets(binPath, patTiers2);
-                        var offProxy  = ScanBinaryForPatternOffsets(binPath, patProxy);
-
-                        if (offTiers1.Count == 0 && offTiers2.Count == 0 && offProxy.Count == 0)
+                        anyVerified = true;
+                        string sigOk = GetFileSignatureFast(binPath);
+                        if (!string.IsNullOrEmpty(sigOk))
                         {
-                            var checkDone = ScanBinaryForPatternOffsets(binPath, repTiers1);
-                            if (checkDone.Count > 0)
-                            {
-                                anyVerified = true;
-                                string sigOk = GetFileSignatureFast(binPath);
-                                if (!string.IsNullOrEmpty(sigOk))
-                                {
-                                    lock (_verifiedLsBinSignatures) { _verifiedLsBinSignatures[binPath] = sigOk; }
-                                }
-                                logs.Add("  ✓ [ВХОД ИЗ-ПОД САНКЦИЙ] Патч разблокировки Google-аккаунта в language_server.exe активен (inexigible_tiers + AG_LS_PROXY).");
-                            }
-                            continue;
-                        }
-
-                        // Stop language_server so we can write in-place or swap
-                        foreach (var lsName in new[] { "language_server", "language_server_windows_x64" })
-                        {
-                            foreach (var p in Process.GetProcessesByName(lsName))
-                            {
-                                try { p.Kill(); p.WaitForExit(1000); } catch { }
-                            }
-                        }
-
-                        // Clean up old .old file if present
-                        string oldBak = binPath + ".old";
-                        try { if (File.Exists(oldBak)) File.Delete(oldBak); } catch { }
-
-                        bool patchedThisFile = false;
-                        try
-                        {
-                            using (var fs = new FileStream(binPath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite))
-                            {
-                                foreach (long pos in offTiers1)
-                                {
-                                    fs.Seek(pos, SeekOrigin.Begin);
-                                    fs.Write(repTiers1, 0, repTiers1.Length);
-                                }
-                                foreach (long pos in offTiers2)
-                                {
-                                    fs.Seek(pos, SeekOrigin.Begin);
-                                    fs.Write(repTiers2, 0, repTiers2.Length);
-                                }
-                                foreach (long pos in offProxy)
-                                {
-                                    fs.Seek(pos, SeekOrigin.Begin);
-                                    fs.Write(repProxy, 0, repProxy.Length);
-                                }
-                                fs.Flush();
-                            }
-                            patchedThisFile = true;
-                        }
-                        catch
-                        {
-                            // Fallback: rename locked running exe to .old, copy to original name, and patch
-                            try
-                            {
-                                File.Move(binPath, oldBak);
-                                File.Copy(oldBak, binPath, true);
-                                using (var fs = new FileStream(binPath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite))
-                                {
-                                    foreach (long pos in offTiers1)
-                                    {
-                                        fs.Seek(pos, SeekOrigin.Begin);
-                                        fs.Write(repTiers1, 0, repTiers1.Length);
-                                    }
-                                    foreach (long pos in offTiers2)
-                                    {
-                                        fs.Seek(pos, SeekOrigin.Begin);
-                                        fs.Write(repTiers2, 0, repTiers2.Length);
-                                    }
-                                    foreach (long pos in offProxy)
-                                    {
-                                        fs.Seek(pos, SeekOrigin.Begin);
-                                        fs.Write(repProxy, 0, repProxy.Length);
-                                    }
-                                    fs.Flush();
-                                }
-                                foreach (var lsName in new[] { "language_server", "language_server_windows_x64" })
-                                {
-                                    foreach (var p in Process.GetProcessesByName(lsName))
-                                    {
-                                        try { p.Kill(); } catch { }
-                                    }
-                                }
-                                patchedThisFile = true;
-                            }
-                            catch { }
-                        }
-
-                        if (patchedThisFile)
-                        {
-                            anyPatchedNow = true;
-                            anyVerified = true;
-                            string sigNew = GetFileSignatureFast(binPath);
-                            if (!string.IsNullOrEmpty(sigNew))
-                            {
-                                lock (_verifiedLsBinSignatures) { _verifiedLsBinSignatures[binPath] = sigNew; }
-                            }
-                            logs.Add("  ⚡ [АВТО-ПАТЧ САНКЦИЙ] Успешно пропатчен language_server.exe: снят блок «Account ineligible» (inexigible_tiers) + шлюз AG_LS_PROXY!");
+                            lock (_verifiedLsBinSignatures) { _verifiedLsBinSignatures[binPath] = sigOk; }
                         }
                     }
-                    catch { }
+                    else
+                    {
+                        lock (_verifiedLsBinSignatures) { _verifiedLsBinSignatures.Remove(binPath); }
+                    }
+                }
+
+                if (anyPatchedNow)
+                {
+                    _forceShowAgBannerOnNextCheck = true;
                 }
 
                 if ((anyPatchedNow || restartIfAlreadyPatched) && !IsAiStreamActivelyFlowing())
@@ -3958,7 +4317,7 @@ namespace PixelTunnel
                 }
             }
             catch { }
-            return anyPatchedNow || anyVerified;
+            return anyVerified;
         }
 
         private void SaveCurrentState()
@@ -4036,13 +4395,21 @@ namespace PixelTunnel
             {
                 try
                 {
-                    var scCheck = Process.Start(new ProcessStartInfo("sc.exe", "query ProksiFiService") { CreateNoWindow = true, UseShellExecute = false, RedirectStandardOutput = true });
-                    string scOut = scCheck.StandardOutput.ReadToEnd();
-                    scCheck.WaitForExit(400);
-                    if (scOut.IndexOf("RUNNING", StringComparison.OrdinalIgnoreCase) >= 0)
+                    using (var scCheck = Process.Start(new ProcessStartInfo("sc.exe", "query ProksiFiService") { CreateNoWindow = true, UseShellExecute = false, RedirectStandardOutput = true }))
                     {
-                        Process.Start(new ProcessStartInfo("sc.exe", "stop ProksiFiService") { CreateNoWindow = true, UseShellExecute = false }).WaitForExit(800);
-                        fixedItems.Add("Остановлена устаревшая служба ProksiFiService");
+                        if (scCheck != null)
+                        {
+                            string scOut = scCheck.StandardOutput.ReadToEnd();
+                            scCheck.WaitForExit(400);
+                            if (scOut.IndexOf("RUNNING", StringComparison.OrdinalIgnoreCase) >= 0)
+                            {
+                                using (var scStop = Process.Start(new ProcessStartInfo("sc.exe", "stop ProksiFiService") { CreateNoWindow = true, UseShellExecute = false }))
+                                {
+                                    if (scStop != null) scStop.WaitForExit(800);
+                                }
+                                fixedItems.Add("Остановлена устаревшая служба ProksiFiService");
+                            }
+                        }
                     }
                 }
                 catch { }
@@ -4065,6 +4432,11 @@ namespace PixelTunnel
                         if (IsPixelOrLocalAutoConfig(wpad) && !IsActivePixelSmartPacUrl(wpad))
                         {
                             key.DeleteValue("AutoConfigURL", false);
+                            int pe = Convert.ToInt32(key.GetValue("ProxyEnable", 0));
+                            if (pe == 0)
+                                ApplyWinInetPerConnectionProxy(false, "", "", "");
+                            else
+                                RefreshWinInet();
                             fixedItems.Add(string.Format("Удалён устаревший WPAD AutoConfigURL ({0})", wpad));
                         }
                     }
@@ -4142,7 +4514,7 @@ namespace PixelTunnel
                 if (!string.IsNullOrEmpty(logFile) && File.Exists(logFile))
                 {
                     double ageSec = (DateTime.UtcNow - File.GetLastWriteTimeUtc(logFile)).TotalSeconds;
-                    if (ageSec >= 0 && ageSec < 2.2) return true;
+                    if (ageSec >= 0 && ageSec < 10.0) return true;
                 }
             }
             catch { }
@@ -4192,6 +4564,43 @@ namespace PixelTunnel
             return bestFile;
         }
 
+        private static string GetCurrentAgLsProxyState(out bool portLive, out int portNum)
+        {
+            portLive = false;
+            portNum = 0;
+            string agLs = Environment.GetEnvironmentVariable("AG_LS_PROXY", EnvironmentVariableTarget.User);
+            if (string.IsNullOrEmpty(agLs))
+            {
+                agLs = Environment.GetEnvironmentVariable("AG_LS_PROXY", EnvironmentVariableTarget.Process);
+            }
+            if (!string.IsNullOrEmpty(agLs))
+            {
+                portNum = TryExtractLoopbackProxyPort(agLs);
+                if (portNum <= 0 && agLs.Contains(":"))
+                {
+                    int col = agLs.LastIndexOf(':');
+                    int.TryParse(agLs.Substring(col + 1).TrimEnd('/'), out portNum);
+                }
+                portLive = portNum > 0 && IsLocalPortOpen(portNum, 120);
+            }
+            return agLs ?? "";
+        }
+
+        private static bool IsAnyLsBinaryProxyPatchedOnDisk()
+        {
+            try
+            {
+                var bins = DiscoverAntigravityLanguageServerBinaries();
+                if (bins.Count == 0) return true;
+                foreach (var b in bins)
+                {
+                    if (ScanBinaryForPatternOffsets(b, _patAgLsProxy).Count > 0) return true;
+                }
+                return false;
+            }
+            catch { return true; }
+        }
+
         private static void InspectAntigravityLogs(out string statusBanner, out Color dotColor, out string validationUrl, out List<string> diagLines)
         {
             statusBanner = string.Format("AI Телеметрия: шлюз :{0} готов • защита от слетов активна", _activeHttpPort);
@@ -4217,6 +4626,22 @@ namespace PixelTunnel
                 string tail = ReadLogTail(logFile, 32768);
                 DateTime lastWrite = File.GetLastWriteTime(logFile);
                 double minsAgo = Math.Max(0, (DateTime.Now - lastWrite).TotalMinutes);
+                InspectAntigravityLogContent(tail, System.IO.Path.GetFileName(logFile), minsAgo, activeConns, out statusBanner, out dotColor, out validationUrl, out diagLines);
+            }
+            catch { }
+        }
+
+        private static void InspectAntigravityLogContent(string tail, string fileName, double minsAgo, int activeConns, out string statusBanner, out Color dotColor, out string validationUrl, out List<string> diagLines)
+        {
+            statusBanner = string.Format("AI Телеметрия: шлюз :{0} готов • защита от слетов активна", _activeHttpPort);
+            dotColor = ColBlue;
+            validationUrl = "";
+            diagLines = new List<string>();
+
+            try
+            {
+                if (tail == null) tail = "";
+                if (string.IsNullOrEmpty(fileName)) fileName = "language_server.log";
                 string recency = minsAgo < 1.0 ? "только что" : string.Format("{0:0} мин назад", minsAgo);
 
                 // 1. Check for Google Account Validation URL challenge
@@ -4235,30 +4660,108 @@ namespace PixelTunnel
                     return;
                 }
 
-                // 2. Check last 6KB for recent overload (503/429) vs region block vs 200 OK
-                string recentTail = tail.Length > 6000 ? tail.Substring(tail.Length - 6000) : tail;
+                // 2. Check last 8KB line-by-line for overload, active region error, auth expiry, or real Google API TLS timeouts.
+                string recentTail = tail.Length > 8192 ? tail.Substring(tail.Length - 8192) : tail;
+
                 bool hasOverload = recentTail.IndexOf("503", StringComparison.OrdinalIgnoreCase) >= 0 ||
                                    recentTail.IndexOf("429", StringComparison.OrdinalIgnoreCase) >= 0 ||
                                    recentTail.IndexOf("RESOURCE_EXHAUSTED", StringComparison.OrdinalIgnoreCase) >= 0 ||
                                    recentTail.IndexOf("overloaded", StringComparison.OrdinalIgnoreCase) >= 0 ||
                                    recentTail.IndexOf("high traffic", StringComparison.OrdinalIgnoreCase) >= 0;
 
-                bool hasRegionErr = recentTail.IndexOf("location is not supported", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                    recentTail.IndexOf("REGION_NOT_SUPPORTED", StringComparison.OrdinalIgnoreCase) >= 0;
-
                 bool hasAuthErr = recentTail.IndexOf("UNAUTHENTICATED", StringComparison.OrdinalIgnoreCase) >= 0 ||
                                   recentTail.IndexOf("invalid_grant", StringComparison.OrdinalIgnoreCase) >= 0;
 
-                bool hasNetTimeout = recentTail.IndexOf("TLS handshake timeout", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                     recentTail.IndexOf("context deadline exceeded", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                     recentTail.IndexOf("connection refused", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                     recentTail.IndexOf("actively refused", StringComparison.OrdinalIgnoreCase) >= 0;
+                int lastSuccessLineIdx = -1;
+                int lastFatalNetLineIdx = -1;
+                int lastRegionLineIdx = -1;
+                bool fatalWasLoadCodeAssist = false;
+                string[] tailLines = recentTail.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                for (int i = 0; i < tailLines.Length; i++)
+                {
+                    string ln = tailLines[i];
+                    if (ln.IndexOf("Auth succeeded", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        ln.IndexOf("CCPA routed this account", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        ln.IndexOf("get_auth_status valid=true", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        (ln.IndexOf("FetchUserInfo", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                         ln.IndexOf("error", StringComparison.OrdinalIgnoreCase) < 0 &&
+                         ln.IndexOf("fail", StringComparison.OrdinalIgnoreCase) < 0))
+                    {
+                        lastSuccessLineIdx = i;
+                    }
+
+                    if (ln.IndexOf("location is not supported", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        ln.IndexOf("REGION_NOT_SUPPORTED", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        lastRegionLineIdx = i;
+                    }
+
+                    bool lineHasLoadCodeAssistErr = ln.IndexOf("failed to get load code assist response", StringComparison.OrdinalIgnoreCase) >= 0;
+                    bool lineHasTlsTimeout = ln.IndexOf("TLS handshake timeout", StringComparison.OrdinalIgnoreCase) >= 0;
+                    bool lineHasGoogleCloudApiHost =
+                        ln.IndexOf("daily-cloudcode-pa.googleapis.com", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        ln.IndexOf("cloudaicompanion.googleapis.com", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        ln.IndexOf("aicode.googleapis.com", StringComparison.OrdinalIgnoreCase) >= 0;
+                    bool lineHasConnRefusedOrDialTimeout =
+                        ln.IndexOf("connection refused", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        ln.IndexOf("actively refused", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        (ln.IndexOf("dial tcp", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                         ln.IndexOf("i/o timeout", StringComparison.OrdinalIgnoreCase) >= 0);
+
+                    if (lineHasLoadCodeAssistErr || lineHasTlsTimeout || (lineHasGoogleCloudApiHost && lineHasConnRefusedOrDialTimeout))
+                    {
+                        lastFatalNetLineIdx = i;
+                        if (lineHasLoadCodeAssistErr || ln.IndexOf("loadCodeAssist", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            fatalWasLoadCodeAssist = true;
+                        }
+                    }
+                }
+
+                bool hasRegionErr = lastRegionLineIdx > lastSuccessLineIdx;
+                bool hasNetTimeout = lastFatalNetLineIdx > lastSuccessLineIdx;
+                bool hasLoadCodeAssistTimeout = hasNetTimeout && fatalWasLoadCodeAssist;
+
+                DateTime cutoffUtc = GetAntigravityStateCutoffUtc();
+                bool staleAgRunning = CountProcessesStartedBefore(new[] { "Antigravity" }, cutoffUtc) > 0;
 
                 if (hasRegionErr && minsAgo < 10)
                 {
                     dotColor = ColAmber;
                     statusBanner = string.Format("Обнаружен блок региона в логе ({0}) • нажмите Авто-Фикс для перезапуска LS", recency);
                     diagLines.Add("  ⚠ [ЛОГ ANTIGRAVITY] В language_server.log зафиксирована ошибка региона (" + recency + "). Авто-патч AG_LS_PROXY применён.");
+                    if (staleAgRunning)
+                    {
+                        _forceShowAgBannerOnNextCheck = true;
+                        diagLines.Add("  💡 [РЕШЕНИЕ] Antigravity.exe запущен до патча/туннеля -> нажмите «Перезапустить Antigravity в туннеле».");
+                    }
+                }
+                else if (hasLoadCodeAssistTimeout && minsAgo < 15)
+                {
+                    bool agEnvLive;
+                    int agEnvPort;
+                    string agEnvVal = GetCurrentAgLsProxyState(out agEnvLive, out agEnvPort);
+                    bool binProxyPatched = IsAnyLsBinaryProxyPatchedOnDisk();
+
+                    var causes = new List<string>();
+                    if (!binProxyPatched)
+                        causes.Add("в language_server.exe отсутствует патч AG_LS_PROXY");
+                    if (string.IsNullOrEmpty(agEnvVal) || !agEnvLive)
+                        causes.Add("переменная AG_LS_PROXY не задана или порт не отвечает");
+                    if (staleAgRunning)
+                    {
+                        causes.Add("Antigravity.exe запущен ДО включения туннеля/патча и не унаследовал AG_LS_PROXY");
+                        _forceShowAgBannerOnNextCheck = true;
+                    }
+                    if (causes.Count == 0)
+                        causes.Add("процесс language_server стартовал без унаследованного AG_LS_PROXY / HTTPS_PROXY");
+
+                    dotColor = ColRed;
+                    statusBanner = "Antigravity обходит туннель (loadCodeAssist timeout) • Нажмите «Перезапустить Antigravity в туннеле»";
+                    diagLines.Add(string.Format(
+                        "  ✗ [ПРЯМОЙ ВЫХОД БЕЗ ПРОКСИ] В логе зафиксирован loadCodeAssist TLS handshake timeout ({0}). Причина: {1}.",
+                        recency, string.Join("; ", causes.ToArray())));
+                    diagLines.Add("  💡 [РЕШЕНИЕ] Нажмите «Перезапустить Antigravity в туннеле» в главном окне, чтобы Electron Antigravity.exe и language_server унаследовали AG_LS_PROXY + HTTPS_PROXY + HTTP_PROXY.");
                 }
                 else if (hasOverload && minsAgo < 5)
                 {
@@ -4274,15 +4777,16 @@ namespace PixelTunnel
                 }
                 else if (hasNetTimeout && minsAgo < 5)
                 {
+                    if (staleAgRunning) _forceShowAgBannerOnNextCheck = true;
                     dotColor = ColRed;
                     statusBanner = string.Format("Таймаут сети в Antigravity ({0}) • Нажмите «Проверить и починить»", recency);
-                    diagLines.Add("  ✗ [ТАЙМАУТ СЕТИ В IDE] В логе language_server зафиксирован TLS handshake timeout / обрыв связи с Google (" + recency + "). Нажмите «Проверить и починить» для перевода IDE на рабочий маршрут.");
+                    diagLines.Add("  ✗ [ТАЙМАУТ СЕТИ В IDE] В логе language_server зафиксирован TLS handshake timeout / обрыв связи с Google (" + recency + "). Нажмите «Проверить и починить» или «Перезапустить Antigravity в туннеле».");
                 }
                 else
                 {
                     dotColor = IsLocalPortOpen(_activeHttpPort, 100) ? ColGreen : ColBlue;
                     statusBanner = string.Format("Шлюз :{0} • Потоков: {1} • Лог Antigravity: 200 OK ({2})", _activeHttpPort, activeConns, recency);
-                    diagLines.Add(string.Format("  ✓ [OK] Лог Antigravity ({0}): соединение 200 OK ({1}), активных потоков: {2}.", System.IO.Path.GetFileName(logFile), recency, activeConns));
+                    diagLines.Add(string.Format("  ✓ [OK] Лог Antigravity ({0}): соединение 200 OK ({1}), активных потоков: {2}.", fileName, recency, activeConns));
                 }
             }
             catch { }
@@ -4352,27 +4856,19 @@ namespace PixelTunnel
             try
             {
                 if (_agLeakGuardBanner == null) return;
-                if (!_isConnected || !_optAntigravity || _agBannerDismissed || _agRelaunchedForPort == _activeHttpPort || _tunnelConnectedUtc == DateTime.MinValue)
+                DateTime cutoffUtc = GetAntigravityStateCutoffUtc();
+                if (_tunnelConnectedUtc > cutoffUtc) cutoffUtc = _tunnelConnectedUtc;
+
+                if (!_isConnected || !_optAntigravity || cutoffUtc == DateTime.MinValue ||
+                    ((_agBannerDismissed || _agRelaunchedForPort == _activeHttpPort) && !_forceShowAgBannerOnNextCheck))
                 {
                     _agLeakGuardBanner.Visibility = Visibility.Collapsed;
                     return;
                 }
 
-                bool startedBeforeTunnel = false;
-                foreach (var p in Process.GetProcessesByName("Antigravity"))
-                {
-                    try
-                    {
-                        if (p.StartTime.ToUniversalTime() < _tunnelConnectedUtc.AddSeconds(-2))
-                        {
-                            startedBeforeTunnel = true;
-                            break;
-                        }
-                    }
-                    catch { }
-                }
-
-                _agLeakGuardBanner.Visibility = startedBeforeTunnel ? Visibility.Visible : Visibility.Collapsed;
+                bool startedBeforeCutoff = CountProcessesStartedBefore(new[] { "Antigravity" }, cutoffUtc) > 0;
+                if (!startedBeforeCutoff) _forceShowAgBannerOnNextCheck = false;
+                _agLeakGuardBanner.Visibility = startedBeforeCutoff ? Visibility.Visible : Visibility.Collapsed;
             }
             catch { }
         }
@@ -4435,12 +4931,8 @@ namespace PixelTunnel
                     catch { }
 
                     string proxyUrl = string.Format("http://127.0.0.1:{0}", port);
-                    try
-                    {
-                        Environment.SetEnvironmentVariable("AG_LS_PROXY", proxyUrl, EnvironmentVariableTarget.User);
-                        Environment.SetEnvironmentVariable("AG_LS_PROXY", proxyUrl, EnvironmentVariableTarget.Process);
-                    }
-                    catch { }
+                    SetAgLsProxyEnv(proxyUrl, true);
+                    BroadcastEnvironmentChange();
 
                     var psi = new ProcessStartInfo
                     {
@@ -4458,6 +4950,7 @@ namespace PixelTunnel
 
                 _agRelaunchedForPort = port;
                 _agBannerDismissed = true;
+                _forceShowAgBannerOnNextCheck = false;
                 RunOnUiThread(delegate
                 {
                     SetStatus(
@@ -5071,13 +5564,11 @@ namespace PixelTunnel
                 if (_isConnected && IsLocalPortOpen(_activeHttpPort, 150))
                 {
                     string proxyUrl = string.Format("http://127.0.0.1:{0}", _activeHttpPort);
-                    Environment.SetEnvironmentVariable("AG_LS_PROXY", proxyUrl, EnvironmentVariableTarget.User);
-                    Environment.SetEnvironmentVariable("AG_LS_PROXY", proxyUrl, EnvironmentVariableTarget.Process);
+                    SetAgLsProxyEnv(proxyUrl, true);
                 }
                 else
                 {
-                    Environment.SetEnvironmentVariable("AG_LS_PROXY", null, EnvironmentVariableTarget.User);
-                    Environment.SetEnvironmentVariable("AG_LS_PROXY", null, EnvironmentVariableTarget.Process);
+                    SetAgLsProxyEnv(null, true);
                 }
                 BroadcastEnvironmentChange();
 
@@ -5339,8 +5830,7 @@ namespace PixelTunnel
             {
                 DisableOrRestoreSystemProxy();
                 string proxyUrl = string.Format("http://127.0.0.1:{0}", _activeHttpPort);
-                Environment.SetEnvironmentVariable("AG_LS_PROXY", proxyUrl, EnvironmentVariableTarget.User);
-                Environment.SetEnvironmentVariable("AG_LS_PROXY", proxyUrl, EnvironmentVariableTarget.Process);
+                SetAgLsProxyEnv(proxyUrl, true);
                 BroadcastEnvironmentChange();
             }
         }
@@ -5383,8 +5873,7 @@ namespace PixelTunnel
 
                 PurgeGlobalCliProxyEnvVars();
                 string proxyUrl = string.Format("http://127.0.0.1:{0}", _activeHttpPort);
-                Environment.SetEnvironmentVariable("AG_LS_PROXY", proxyUrl, EnvironmentVariableTarget.User);
-                Environment.SetEnvironmentVariable("AG_LS_PROXY", proxyUrl, EnvironmentVariableTarget.Process);
+                SetAgLsProxyEnv(proxyUrl, true);
                 BroadcastEnvironmentChange();
             }
             catch { }
@@ -5584,12 +6073,11 @@ namespace PixelTunnel
                 PurgeGlobalCliProxyEnvVars();
                 if (has7890)
                 {
-                    Environment.SetEnvironmentVariable("AG_LS_PROXY", "http://127.0.0.1:7890", EnvironmentVariableTarget.User);
+                    SetAgLsProxyEnv("http://127.0.0.1:7890", false);
                 }
                 else
                 {
-                    Environment.SetEnvironmentVariable("AG_LS_PROXY", null, EnvironmentVariableTarget.User);
-                    Environment.SetEnvironmentVariable("AG_LS_PROXY", null, EnvironmentVariableTarget.Process);
+                    SetAgLsProxyEnv(null, true);
                 }
                 BroadcastEnvironmentChange();
 
@@ -5622,7 +6110,15 @@ namespace PixelTunnel
                 using (var client = new TcpClient())
                 {
                     var res = client.BeginConnect("127.0.0.1", port, null, null);
-                    bool ok = res.AsyncWaitHandle.WaitOne(TimeSpan.FromMilliseconds(timeoutMs));
+                    bool ok;
+                    try
+                    {
+                        ok = res.AsyncWaitHandle.WaitOne(TimeSpan.FromMilliseconds(timeoutMs));
+                    }
+                    finally
+                    {
+                        try { res.AsyncWaitHandle.Close(); } catch { }
+                    }
                     if (!ok) return false;
                     client.EndConnect(res);
                     return true;
@@ -5649,6 +6145,7 @@ namespace PixelTunnel
                 };
                 using (var p = Process.Start(psi))
                 {
+                    if (p == null) return "000";
                     string output = p.StandardOutput.ReadToEnd();
                     p.WaitForExit(timeoutSec * 1000 + 500);
                     return (output ?? "").Trim();
@@ -5869,6 +6366,7 @@ namespace PixelTunnel
 
                     _isConnected = true;
                     _tunnelConnectedUtc = DateTime.UtcNow;
+                    _lastTunnelConnectedUtc = _tunnelConnectedUtc;
                     var unusedPulseOnConn = RefreshAiPulseUiAsync(true);
                     _agBannerDismissed = false;
                     int shownMs = PixelCoreService.ActiveNodeLatencyMs > 0 ? PixelCoreService.ActiveNodeLatencyMs : (pingMs > 0 ? pingMs : 28);
@@ -6661,8 +7159,7 @@ namespace PixelTunnel
                                     if (autoFix)
                                     {
                                         string pUrl = string.Format("http://127.0.0.1:{0}", _activeHttpPort);
-                                        Environment.SetEnvironmentVariable("AG_LS_PROXY", pUrl, EnvironmentVariableTarget.User);
-                                        Environment.SetEnvironmentVariable("AG_LS_PROXY", pUrl, EnvironmentVariableTarget.Process);
+                                        SetAgLsProxyEnv(pUrl, true);
                                         PurgeGlobalCliProxyEnvVars();
                                         BroadcastEnvironmentChange();
                                         foreach (var p in Process.GetProcessesByName("language_server")) { try { p.Kill(); } catch { } }
@@ -6680,14 +7177,12 @@ namespace PixelTunnel
                                         if (_activeHttpPort != 7890 && IsLocalPortOpen(_activeHttpPort, 150))
                                         {
                                             string pUrl = string.Format("http://127.0.0.1:{0}", _activeHttpPort);
-                                            Environment.SetEnvironmentVariable("AG_LS_PROXY", pUrl, EnvironmentVariableTarget.User);
-                                            Environment.SetEnvironmentVariable("AG_LS_PROXY", pUrl, EnvironmentVariableTarget.Process);
+                                            SetAgLsProxyEnv(pUrl, true);
                                             report.AppendLine(string.Format("  ⚡ [АВТО-ФИКС] Битый :7890 удалён из AG_LS_PROXY -> перенаправлен на {0} + перезапущен language_server!", pUrl));
                                         }
                                         else
                                         {
-                                            Environment.SetEnvironmentVariable("AG_LS_PROXY", null, EnvironmentVariableTarget.User);
-                                            Environment.SetEnvironmentVariable("AG_LS_PROXY", null, EnvironmentVariableTarget.Process);
+                                            SetAgLsProxyEnv(null, true);
                                             report.AppendLine("  ⚡ [АВТО-ФИКС] Битый сторонний AG_LS_PROXY (127.0.0.1:7890) очищен + перезапущен language_server!");
                                         }
                                         PurgeGlobalCliProxyEnvVars();
@@ -6700,6 +7195,22 @@ namespace PixelTunnel
                                 else
                                 {
                                     report.AppendLine(string.Format("  ✓ [OK] Переменная AG_LS_PROXY настроена: {0}.", agLs));
+                                }
+                            }
+                            else if (_optAntigravity && _isConnected && IsLocalPortOpen(_activeHttpPort, 150))
+                            {
+                                issuesFound++;
+                                if (autoFix)
+                                {
+                                    string pUrl = string.Format("http://127.0.0.1:{0}", _activeHttpPort);
+                                    SetAgLsProxyEnv(pUrl, true);
+                                    BroadcastEnvironmentChange();
+                                    issuesFixed++;
+                                    report.AppendLine(string.Format("  ⚡ [АВТО-ФИКС] Переменная AG_LS_PROXY отсутствовала -> установлена: {0}.", pUrl));
+                                }
+                                else
+                                {
+                                    report.AppendLine("  ✗ [ПРОБЛЕМА АНТИГРАВИТИ] Переменная AG_LS_PROXY не установлена!");
                                 }
                             }
                         }
@@ -6844,15 +7355,72 @@ namespace PixelTunnel
                     report.AppendLine("  ✓ [OK] Терминал Antigravity & MCP-серверы (npx/uvx/Python) защищены изолированно.");
                 }
                 List<string> sanctionPatchLogs;
-                diagLsPatched = PatchAntigravitySanctionsAndProxy(out sanctionPatchLogs, autoFix);
-                if (diagLsPatched)
+                bool diagAnyPatchedNow;
+                diagLsPatched = PatchAntigravitySanctionsAndProxy(out sanctionPatchLogs, false, out diagAnyPatchedNow);
+                foreach (var sLog in sanctionPatchLogs)
                 {
-                    foreach (var sLog in sanctionPatchLogs)
+                    if (sLog.Contains("АВТО-ПАТЧ")) { issuesFound++; issuesFixed++; }
+                    else if (sLog.Contains("⚠") || sLog.Contains("✗") || sLog.Contains("ОТСУТСТВУЕТ")) { issuesFound++; }
+                    report.AppendLine(sLog);
+                }
+
+                bool envJustRepaired = false;
+                bool diagAgEnvLive;
+                int diagAgEnvPort;
+                string diagAgEnvVal = GetCurrentAgLsProxyState(out diagAgEnvLive, out diagAgEnvPort);
+                if (!string.IsNullOrEmpty(diagAgEnvVal) && diagAgEnvLive)
+                {
+                    report.AppendLine(string.Format("  ✓ [OK] AG_LS_PROXY env: {0} (порт :{1} активен).", diagAgEnvVal, diagAgEnvPort));
+                }
+                else if (_optAntigravity)
+                {
+                    if (_isConnected && IsLocalPortOpen(_activeHttpPort, 150) && autoFix)
                     {
-                        if (sLog.Contains("АВТО-ПАТЧ")) { issuesFound++; issuesFixed++; }
-                        report.AppendLine(sLog);
+                        string pUrl = string.Format("http://127.0.0.1:{0}", _activeHttpPort);
+                        SetAgLsProxyEnv(pUrl, true);
+                        BroadcastEnvironmentChange();
+                        envJustRepaired = true;
+                        issuesFound++;
+                        issuesFixed++;
+                        report.AppendLine(string.Format("  ⚡ [АВТО-ФИКС] AG_LS_PROXY env восстановлена -> {0}.", pUrl));
+                    }
+                    else
+                    {
+                        report.AppendLine(string.Format("  ℹ [ИНФО] AG_LS_PROXY env: {0}.", string.IsNullOrEmpty(diagAgEnvVal) ? "не задана" : (diagAgEnvVal + " (порт закрыт)")));
                     }
                 }
+
+                DateTime agCutoffUtc = GetAntigravityStateCutoffUtc();
+                int staleLsCount = CountProcessesStartedBefore(new[] { "language_server", "language_server_windows_x64" }, agCutoffUtc);
+                if (staleLsCount > 0 && (diagAnyPatchedNow || envJustRepaired))
+                {
+                    if (autoFix && !IsAiStreamActivelyFlowing())
+                    {
+                        int restarted = RestartStaleLanguageServers(agCutoffUtc);
+                        if (restarted > 0)
+                        {
+                            issuesFound++;
+                            issuesFixed++;
+                            report.AppendLine(string.Format("  ⚡ [АВТО-ФИКС] Перезапущено устаревших процессов language_server: {0} (работали со старым патчем/окружением).", restarted));
+                        }
+                    }
+                    else
+                    {
+                        issuesFound++;
+                        report.AppendLine(string.Format("  ⚠ [УСТАРЕВШИЙ LS] Обнаружен language_server ({0}), запущенный до патча/настройки AG_LS_PROXY.", staleLsCount));
+                    }
+                }
+
+                int staleAgCount = CountProcessesStartedBefore(new[] { "Antigravity" }, agCutoffUtc);
+                if (staleAgCount > 0 && _optAntigravity)
+                {
+                    issuesFound++;
+                    _forceShowAgBannerOnNextCheck = true;
+                    RunOnUiThread(delegate { CheckAntigravityPreTunnelState(); });
+                    report.AppendLine("  ⚠ [УСТАРЕВШИЙ ПРОЦЕСС IDE] Antigravity.exe запущен ДО включения туннеля / патча AG_LS_PROXY — дочерний language_server может не видеть переменные среды!");
+                    report.AppendLine("  💡 [СОВЕТ] Нажмите кнопку «Перезапустить Antigravity в туннеле» в главном окне, чтобы Antigravity.exe унаследовал AG_LS_PROXY + HTTPS_PROXY + HTTP_PROXY.");
+                }
+
                 var aiFixedList = HealAiEditorsAndServices(true, false, _optAntigravity, _optCursorAi, _optDiscordYt, _optSocialWeb);
                 foreach (var aiItem in aiFixedList)
                 {
@@ -6872,13 +7440,21 @@ namespace PixelTunnel
                 Color agLogCol;
                 List<string> agDiagLines;
                 InspectAntigravityLogs(out agLogBanner, out agLogCol, out agValUrl, out agDiagLines);
+                bool hasRelaunchTipInLogs = false;
                 foreach (var dl in agDiagLines)
                 {
+                    if (dl.IndexOf("Перезапустить Antigravity в туннеле", StringComparison.OrdinalIgnoreCase) >= 0)
+                        hasRelaunchTipInLogs = true;
+                    if (dl.Contains("✗")) issuesFound++;
                     report.AppendLine(dl);
                 }
 
-                // Если в логах language_server висит ошибка региона/сети (ColAmber/ColRed) и сейчас не идёт стрим ответа — мягко перезапустим фоновый language_server без закрытия окна IDE!
-                if (autoFix && (agLogCol == ColRed || (agLogBanner != null && (agLogBanner.IndexOf("ошибка", StringComparison.OrdinalIgnoreCase) >= 0 || agLogBanner.IndexOf("недоступ", StringComparison.OrdinalIgnoreCase) >= 0))) && !IsAiStreamActivelyFlowing())
+                // Если в логах language_server активно висит блок региона или loadCodeAssist TLS timeout и сейчас не идёт стрим ответа — мягко перезапустим фоновый language_server без закрытия окна IDE!
+                bool hasRouteOrTimeoutBanner = agLogBanner != null &&
+                    (agLogBanner.IndexOf("блок региона", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                     agLogBanner.IndexOf("loadCodeAssist timeout", StringComparison.OrdinalIgnoreCase) >= 0);
+
+                if (autoFix && hasRouteOrTimeoutBanner && !IsAiStreamActivelyFlowing())
                 {
                     int restartedLs = 0;
                     foreach (var lsName in new[] { "language_server", "language_server_windows_x64" })
@@ -6893,6 +7469,16 @@ namespace PixelTunnel
                         issuesFound++;
                         issuesFixed++;
                         report.AppendLine("  ⚡ [АВТО-СБРОС СЕССИИ] Перезапущен фоновый language_server без закрытия ваших вкладок -> зависший кэш ошибки очищен!");
+                    }
+                }
+
+                if ((staleAgCount > 0 || hasRelaunchTipInLogs) && _optAntigravity)
+                {
+                    _forceShowAgBannerOnNextCheck = true;
+                    RunOnUiThread(delegate { CheckAntigravityPreTunnelState(); });
+                    if (!hasRelaunchTipInLogs)
+                    {
+                        report.AppendLine("  💡 [СОВЕТ] Нажмите «Перезапустить Antigravity в туннеле», чтобы Electron Antigravity.exe гарантированно унаследовал AG_LS_PROXY + HTTPS_PROXY + HTTP_PROXY.");
                     }
                 }
 
@@ -6983,6 +7569,7 @@ namespace PixelTunnel
                             {
                                 _isConnected = true;
                                 _tunnelConnectedUtc = DateTime.UtcNow;
+                                _lastTunnelConnectedUtc = _tunnelConnectedUtc;
                                 if (_pingLabel != null)
                                 {
                                     _pingLabel.Text = "HEALED • OK";
@@ -7034,6 +7621,8 @@ namespace PixelTunnel
                         RunOnUiThreadSync(delegate
                         {
                             _isConnected = true;
+                            if (_tunnelConnectedUtc == DateTime.MinValue) _tunnelConnectedUtc = DateTime.UtcNow;
+                            _lastTunnelConnectedUtc = _tunnelConnectedUtc;
                             SetStatus(ColGreen, "Туннель активен • Antigravity разблокирован", string.Format("PWP-3 Шлюз :{0} ({1}) • CloudCode HTTP {2} [OK] • Сайты .RU напрямую", _activeHttpPort, PixelCoreService.ActiveNodeName ?? "NL", agCode));
                             ResetButtonState(true);
                             UpdateLicenseHintFromServer();
@@ -7227,21 +7816,47 @@ namespace PixelTunnel
             sb.AppendLine(line);
         }
 
-        private static string ReadLogTail(string path, int maxBytes)
+        private static string ReadLogSlice(string path, int maxBytes, bool fromStart)
         {
             try
             {
                 using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
                 {
-                    if (fs.Length > maxBytes)
-                        fs.Seek(fs.Length - maxBytes, SeekOrigin.Begin);
-                    using (var sr = new StreamReader(fs, Encoding.UTF8))
+                    if (!fromStart)
                     {
-                        return sr.ReadToEnd();
+                        if (fs.Length > maxBytes)
+                            fs.Seek(fs.Length - maxBytes, SeekOrigin.Begin);
+                        using (var sr = new StreamReader(fs, Encoding.UTF8))
+                        {
+                            return sr.ReadToEnd();
+                        }
+                    }
+                    else
+                    {
+                        int toRead = (int)Math.Min(fs.Length, (long)maxBytes);
+                        byte[] buf = new byte[toRead];
+                        int readTotal = 0;
+                        while (readTotal < toRead)
+                        {
+                            int n = fs.Read(buf, readTotal, toRead - readTotal);
+                            if (n <= 0) break;
+                            readTotal += n;
+                        }
+                        return Encoding.UTF8.GetString(buf, 0, readTotal);
                     }
                 }
             }
             catch { return ""; }
+        }
+
+        private static string ReadLogTail(string path, int maxBytes)
+        {
+            return ReadLogSlice(path, maxBytes, false);
+        }
+
+        private static string ReadLogHead(string path, int maxBytes)
+        {
+            return ReadLogSlice(path, maxBytes, true);
         }
 
         private void ResetButtonState(bool connected)
@@ -7510,7 +8125,15 @@ namespace PixelTunnel
                 using (var client = new TcpClient())
                 {
                     var result = client.BeginConnect(host, port, null, null);
-                    bool ok = result.AsyncWaitHandle.WaitOne(TimeSpan.FromMilliseconds(2200));
+                    bool ok;
+                    try
+                    {
+                        ok = result.AsyncWaitHandle.WaitOne(TimeSpan.FromMilliseconds(2200));
+                    }
+                    finally
+                    {
+                        try { result.AsyncWaitHandle.Close(); } catch { }
+                    }
                     if (!ok) return -1;
                     client.EndConnect(result);
                     sw.Stop();
@@ -7529,7 +8152,7 @@ namespace PixelTunnel
             {
                 var req = (HttpWebRequest)WebRequest.Create(subUrl);
                 req.Timeout = 5000;
-                req.UserAgent = "PixelTunnel/1.2";
+                req.UserAgent = "PixelTunnel/" + APP_VERSION;
                 using (var resp = (HttpWebResponse)req.GetResponse())
                 using (var sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
                 {
@@ -7971,7 +8594,7 @@ namespace PixelTunnel
                         Server = u.Host,
                         ResolvedIp = u.Host,
                         Port = u.Port > 0 ? u.Port : 2087,
-                        Sni = "www.amd.com",
+                        Sni = "www.microsoft.com",
                         TransportType = "pwp1",
                         Security = "pwp1-tls",
                         Remark = "PixelCore PWP-1 NL"
@@ -8179,7 +8802,7 @@ namespace PixelTunnel
                             string region = string.IsNullOrWhiteSpace(n.Region) ? "nl" : n.Region.Trim().ToLowerInvariant();
                             string sni = string.IsNullOrWhiteSpace(n.Sni) ? GetDefaultClusterHost() : n.Sni.Trim();
                             string path = string.IsNullOrWhiteSpace(n.UpgradePath) ? "/api/v3/telemetry/mux" : n.UpgradePath.Trim();
-                            string pwp4Path = n.SupportsMuxV3 ? "/api/v4/telemetry/mux" : "";
+                            string pwp4Path = n.SupportsMuxV3 ? "/api/v4/telemetry/events" : "";
                             string name = string.IsNullOrWhiteSpace(n.Name) ? n.Host : n.Name.Trim();
 
                             if (!first) sb.Append(", ");
@@ -8228,7 +8851,9 @@ namespace PixelTunnel
 
             if (IsClusterHost(server))
             {
-                if (string.Equals(server.Trim(), "node.pixelstore.space", StringComparison.OrdinalIgnoreCase))
+                if (string.Equals(server.Trim(), "node.pixelstore.space", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(server.Trim(), "201.34.152.97", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(server.Trim(), "147.45.135.71", StringComparison.OrdinalIgnoreCase))
                     server = GetDefaultClusterHost();
                 port = 443;
                 net = "pwp3";
@@ -8259,9 +8884,10 @@ namespace PixelTunnel
             }
 
             string directIpCidrs = "\"127.0.0.0/8\", \"10.0.0.0/8\", \"172.16.0.0/12\", \"192.168.0.0/16\", \"100.64.0.0/10\"";
-            if (!string.IsNullOrEmpty(node.ResolvedIp))
+            string effectiveDirectIp = IsClusterHost(node.Server) ? "185.103.103.162" : node.ResolvedIp;
+            if (!string.IsNullOrEmpty(effectiveDirectIp))
             {
-                directIpCidrs += ", \"" + EscapeJson(node.ResolvedIp) + "/32\"";
+                directIpCidrs += ", \"" + EscapeJson(effectiveDirectIp) + "/32\"";
             }
 
             string inboundsSection = string.Format(@"    {{

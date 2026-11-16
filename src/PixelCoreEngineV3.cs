@@ -980,8 +980,8 @@ namespace PixelTunnel
 
     public static class PixelCoreService
     {
-        public const string ENGINE_VERSION = "2.0.0";
-        private const string DEFAULT_HOST = "201.34.152.97";
+        public const string ENGINE_VERSION = "2.1.0";
+        private const string DEFAULT_HOST = "185.103.103.162";
         private const string DEFAULT_SNI = "ai.pixelstore.space";
         private const int WARM_POOL_TARGET = 2;
 
@@ -1127,7 +1127,6 @@ namespace PixelTunnel
         private static string[] _decoySnis = new string[]
         {
             "ai.pixelstore.space",
-            "www.amd.com",
             "www.apple.com",
             "www.microsoft.com",
             "dl.google.com"
@@ -1788,7 +1787,7 @@ namespace PixelTunnel
         private static void AddPixelClusterNodesLocked(string secret, string preferredSni)
         {
             string tlsSni = (string.IsNullOrEmpty(preferredSni) || string.Equals(preferredSni, "www.amd.com", StringComparison.OrdinalIgnoreCase))
-                ? DEFAULT_SNI
+                ? "www.microsoft.com"
                 : preferredSni;
 
             // 1. Основной порт 443 через Nginx SSL/TLS 1.3 + PWP-3 Мультиплексор (/api/v3/telemetry/mux)
@@ -1925,6 +1924,8 @@ namespace PixelTunnel
                     _nodes.Clear();
                     if ((string.IsNullOrEmpty(serverAddr) ||
                          string.Equals(serverAddr, DEFAULT_HOST, StringComparison.OrdinalIgnoreCase) ||
+                         string.Equals(serverAddr, "201.34.152.97", StringComparison.OrdinalIgnoreCase) ||
+                         string.Equals(serverAddr, "147.45.135.71", StringComparison.OrdinalIgnoreCase) ||
                          HostMatchesDomain(serverAddr, "pixelstore.space")) &&
                         !mPwpPort.Success)
                     {
@@ -2201,6 +2202,20 @@ namespace PixelTunnel
                 }
 
                 if (parsedNodes.Count == 0) return false;
+                var activeManifestNodes = new List<PixelServerNode>(parsedNodes.Count);
+                for (int ni = 0; ni < parsedNodes.Count; ni++)
+                {
+                    var pn = parsedNodes[ni];
+                    if (!string.Equals(pn.Host, "201.34.152.97", StringComparison.OrdinalIgnoreCase) &&
+                        !string.Equals(pn.Host, "147.45.135.71", StringComparison.OrdinalIgnoreCase))
+                    {
+                        activeManifestNodes.Add(pn);
+                    }
+                }
+                if (activeManifestNodes.Count > 0)
+                {
+                    parsedNodes = activeManifestNodes;
+                }
 
                 string[] spkiPins = ExtractJsonStrArray(json, "spki_sha256");
                 if (spkiPins == null || spkiPins.Length == 0) spkiPins = ExtractJsonStrArray(json, "cert_pins");
@@ -4874,6 +4889,27 @@ namespace PixelTunnel
             return false;
         }
 
+        private static string ResolveBenchmarkConnectTarget(string host)
+        {
+            if (string.IsNullOrEmpty(host)) return host;
+            IPAddress parsedIp;
+            if (IPAddress.TryParse(host, out parsedIp)) return host;
+            try
+            {
+                IPAddress[] addrs = Dns.GetHostAddresses(host);
+                if (addrs != null)
+                {
+                    foreach (IPAddress addr in addrs)
+                    {
+                        if (addr.AddressFamily == AddressFamily.InterNetwork)
+                            return addr.ToString();
+                    }
+                }
+            }
+            catch { }
+            return host;
+        }
+
         /// <summary>
         /// Параллельный турбо-бенчмарк всех узлов манифеста (реальный PWP-3 хендшейк + 36 КБ тест ТСПУ)
         /// с автоматическим закреплением самого быстрого рабочего маршрута под провайдера клиента.
@@ -4907,6 +4943,7 @@ namespace PixelTunnel
                         EffectiveSni = ResolveEffectiveSni(node, _sniRotationIndex)
                     };
 
+                    string connectTarget = ResolveBenchmarkConnectTarget(node.Host);
                     for (int benchAttempt = 0; benchAttempt < 2; benchAttempt++)
                     {
                         TcpClient tcp = new TcpClient();
@@ -4918,7 +4955,7 @@ namespace PixelTunnel
                             tcp.SendTimeout = timeoutMs;
 
                             Stopwatch sw = Stopwatch.StartNew();
-                            IAsyncResult ar = tcp.BeginConnect(node.Host, node.Port, null, null);
+                            IAsyncResult ar = tcp.BeginConnect(connectTarget, node.Port, null, null);
                             WaitHandle wh = ar.AsyncWaitHandle;
                             try
                             {
@@ -4926,6 +4963,10 @@ namespace PixelTunnel
                                 {
                                     try { tcp.Close(); } catch { }
                                     try { ((IDisposable)tcp).Dispose(); } catch { }
+                                    if (benchAttempt == 0)
+                                    {
+                                        continue;
+                                    }
                                     res.Ok = false;
                                     res.Error = "TCP таймаут";
                                     lock (_nodesLock)
@@ -5778,7 +5819,7 @@ namespace PixelTunnel
                     {
                         if (!await AwaitSocketTaskAsync(ssl.AuthenticateAsClientAsync(host), tcp, totalTimeoutMs - (int)sw.ElapsedMilliseconds, ct).ConfigureAwait(false))
                             return BuildAiPulseEntry("down", 0, (int)sw.ElapsedMilliseconds, host);
-                        byte[] req = Encoding.ASCII.GetBytes("HEAD / HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\nUser-Agent: PixelTunnel/2.0\r\n\r\n");
+                        byte[] req = Encoding.ASCII.GetBytes("HEAD / HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\nUser-Agent: PixelTunnel/" + ENGINE_VERSION + "\r\n\r\n");
                         if (!await AwaitSocketTaskAsync(ssl.WriteAsync(req, 0, req.Length), tcp, totalTimeoutMs - (int)sw.ElapsedMilliseconds, ct).ConfigureAwait(false))
                             return BuildAiPulseEntry("down", 0, (int)sw.ElapsedMilliseconds, host);
                         byte[] respBuf = new byte[256];
@@ -6066,7 +6107,7 @@ namespace PixelTunnel
             string resJson;
             if (UsingGoEngine)
             {
-                resJson = await QueryLocalEndpointAsync("POST", "/__pixelcore/v4/reload-rules", optionalBodyJson ?? "{}", 4000).ConfigureAwait(false);
+                resJson = await QueryLocalEndpointAsync("POST", "/__pixelcore/v4/reload-rules", optionalBodyJson ?? "", 4000).ConfigureAwait(false);
             }
             else
             {
@@ -6361,10 +6402,33 @@ namespace PixelTunnel
                 }
 
                 string tmpPath = exePath + ".tmp." + Process.GetCurrentProcess().Id.ToString(CultureInfo.InvariantCulture);
-                File.WriteAllBytes(tmpPath, rawExe);
-                if (File.Exists(exePath)) File.Delete(exePath);
-                File.Move(tmpPath, exePath);
-                return true;
+                try
+                {
+                    File.WriteAllBytes(tmpPath, rawExe);
+                    Exception lastMoveEx = null;
+                    bool moved = false;
+                    for (int attempt = 0; attempt < 5; attempt++)
+                    {
+                        try
+                        {
+                            if (File.Exists(exePath)) File.Delete(exePath);
+                            File.Move(tmpPath, exePath);
+                            moved = true;
+                            break;
+                        }
+                        catch (Exception mex)
+                        {
+                            lastMoveEx = mex;
+                            Thread.Sleep(80);
+                        }
+                    }
+                    if (!moved && lastMoveEx != null) throw lastMoveEx;
+                    return true;
+                }
+                finally
+                {
+                    try { if (File.Exists(tmpPath)) File.Delete(tmpPath); } catch { }
+                }
             }
             catch (Exception ex)
             {
@@ -6471,7 +6535,16 @@ namespace PixelTunnel
                 using (var tcp = new TcpClient())
                 {
                     var res = tcp.BeginConnect(IPAddress.Loopback, port, null, null);
-                    if (!res.AsyncWaitHandle.WaitOne(120)) return false;
+                    bool connected;
+                    try
+                    {
+                        connected = res.AsyncWaitHandle.WaitOne(120);
+                    }
+                    finally
+                    {
+                        try { res.AsyncWaitHandle.Close(); } catch { }
+                    }
+                    if (!connected) return false;
                     tcp.EndConnect(res);
                     tcp.ReceiveTimeout = 250;
                     tcp.SendTimeout = 250;
