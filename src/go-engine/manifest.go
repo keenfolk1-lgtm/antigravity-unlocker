@@ -533,10 +533,24 @@ func defaultManifestURLs(githubURL string, overrideEdgeURLs []string) []manifest
 	return urls
 }
 
-// FetchLatestManifest downloads PTM3 envelope via Edge/GitHub HTTPS first, then DoH TXT fallback (_v3.pixelstore.space).
-func FetchLatestManifest(ctx context.Context, resolver *DohResolver, opts ManifestVerifierOptions, githubURL string) (doc *ManifestDocument, src string, err error) {
-	dialFunc := func(dctx context.Context, network, addr string) (net.Conn, error) {
-		dialer := &net.Dialer{Timeout: 1800 * time.Millisecond}
+func isRawTCPDialError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var tcpErr *tcpConnectError
+	if errors.As(err, &tcpErr) {
+		return true
+	}
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && opErr.Op == "dial"
+}
+
+func newManifestHTTPClient(resolver *DohResolver, forcedSNI, decoySNI string) (*http.Client, func()) {
+	dialPlain := func(dctx context.Context, network, addr string) (net.Conn, error) {
+		dialer := &net.Dialer{
+			Timeout: 1800 * time.Millisecond,
+			Control: resolver.currentDialControl(),
+		}
 		host, port, serr := net.SplitHostPort(addr)
 		if serr != nil {
 			return dialer.DialContext(dctx, network, addr)
@@ -549,22 +563,85 @@ func FetchLatestManifest(ctx context.Context, resolver *DohResolver, opts Manife
 		return dialer.DialContext(dctx, network, addr)
 	}
 
-	defaultClient := &http.Client{
-		Timeout: 2500 * time.Millisecond,
-		Transport: &http.Transport{
-			DialContext: dialFunc,
-		},
+	tr := &http.Transport{
+		DialContext:       dialPlain,
+		ForceAttemptHTTP2: false,
 	}
-	edgeIPClient := &http.Client{
-		Timeout: 2500 * time.Millisecond,
-		Transport: &http.Transport{
-			DialContext: dialFunc,
-			TLSClientConfig: &tls.Config{
-				ServerName: DefaultSNI,
-				MinVersion: tls.VersionTLS12,
-			},
-		},
+	tr.DialTLSContext = func(dctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, serr := net.SplitHostPort(addr)
+		if serr != nil {
+			host = addr
+			port = "443"
+		}
+		dialHost := host
+		if resolver != nil && net.ParseIP(dialHost) == nil {
+			if ips, rerr := resolver.LookupHost(dctx, dialHost); rerr == nil && len(ips) > 0 {
+				dialHost = ips[0].String()
+			}
+		}
+		sni := host
+		if forcedSNI != "" {
+			sni = forcedSNI
+		}
+		if decoySNI != "" {
+			sni = decoySNI
+		}
+		ctrl := resolver.currentDialControl()
+		if isLoopbackHostOrIP(dialHost) {
+			d := &tls.Dialer{
+				NetDialer: &net.Dialer{Timeout: 1800 * time.Millisecond, Control: ctrl},
+				Config: &tls.Config{
+					ServerName: sni,
+					MinVersion: tls.VersionTLS12,
+				},
+			}
+			return d.DialContext(dctx, network, net.JoinHostPort(dialHost, port))
+		}
+		uOpts := UTLSDialOptions{
+			Address:        net.JoinHostPort(dialHost, port),
+			SNI:            sni,
+			Profile:        "chrome",
+			DPIProfile:     DPIProfileTlsRecordSplit,
+			EnableSplit:    true,
+			ForceHTTP1ALPN: true,
+			ConnectTimeout: 1800 * time.Millisecond,
+			DialControl:    ctrl,
+		}
+		if decoySNI != "" {
+			uOpts.MaskedDecoySNI = true
+			uOpts.Pins = []string{DefaultPinnedSPKISHA256}
+			uOpts.RequirePin = true
+		}
+		res, err := DialUTLS(dctx, uOpts)
+		if err == nil {
+			return res.Conn, nil
+		}
+		if !isRawTCPDialError(err) && !errors.Is(err, ErrCertPinMismatch) && !errors.Is(err, ErrMitmDetected) && dctx.Err() == nil {
+			uOpts.DPIProfile = DPIProfileComboMultiRecord
+			if res2, err2 := DialUTLS(dctx, uOpts); err2 == nil {
+				return res2.Conn, nil
+			} else {
+				return nil, err2
+			}
+		}
+		return nil, err
 	}
+
+	client := &http.Client{
+		Timeout:   2500 * time.Millisecond,
+		Transport: tr,
+	}
+	return client, tr.CloseIdleConnections
+}
+
+// FetchLatestManifest downloads PTM3 envelope via Edge/GitHub HTTPS first (with uTLS+Split and Decoy-SNI), then DoH TXT fallback (_v3.pixelstore.space).
+func FetchLatestManifest(ctx context.Context, resolver *DohResolver, opts ManifestVerifierOptions, githubURL string) (doc *ManifestDocument, src string, err error) {
+	defaultClient, closeDefault := newManifestHTTPClient(resolver, "", "")
+	defer closeDefault()
+	edgeIPClient, closeEdge := newManifestHTTPClient(resolver, DefaultSNI, "")
+	defer closeEdge()
+	decoyClient, closeDecoy := newManifestHTTPClient(resolver, DefaultSNI, "dl.google.com")
+	defer closeDecoy()
 
 	parseOpts := opts
 	parseOpts.VersionFilePath = ""
@@ -619,14 +696,25 @@ func FetchLatestManifest(ctx context.Context, resolver *DohResolver, opts Manife
 		}
 
 		c := defaultClient
-		if item.sni != "" && net.ParseIP(u.Hostname()) != nil {
+		isDirectEdgeIP := item.sni != "" && net.ParseIP(u.Hostname()) != nil
+		if isDirectEdgeIP {
 			c = edgeIPClient
 		}
 
 		resp, derr := c.Do(req)
+		if derr != nil && isDirectEdgeIP && !isRawTCPDialError(derr) && !isLoopbackHostOrIP(u.Hostname()) && ctx.Err() == nil {
+			reqCancel()
+			reqCtx, reqCancel = context.WithTimeout(ctx, 2200*time.Millisecond)
+			if req2, rerr2 := http.NewRequestWithContext(reqCtx, http.MethodGet, item.url, nil); rerr2 == nil {
+				req2.Host = item.sni
+				resp, derr = decoyClient.Do(req2)
+			}
+		}
 		if derr != nil {
 			reqCancel()
-			failedDialHosts[hostKey] = true
+			if isRawTCPDialError(derr) {
+				failedDialHosts[hostKey] = true
+			}
 			err = derr
 			continue
 		}

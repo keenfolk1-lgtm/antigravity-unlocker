@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -31,6 +32,8 @@ type LocalProxyServer struct {
 	resolver    *DohResolver
 	radar       *RouteRadar
 	xray        *XRayRunner
+	tun         *TUNController
+	tunMu       sync.Mutex
 	headless    bool
 	manifestVer int64
 	manifestSrc string
@@ -109,9 +112,131 @@ func NewLocalProxyServer(opts LocalProxyOptions) *LocalProxyServer {
 		initRev = cfg.V2.PACRev
 	}
 	srv.pacRev.Store(initRev)
+	srv.tun = NewTUNController(TUNOptions{
+		ClassifyFn: func(host string) RuleAction {
+			return srv.matcher.Classify(host)
+		},
+		Resolver: opts.Resolver,
+		Mux:      opts.Mux,
+		IsDirectIPFn: func(ip net.IP) bool {
+			return IsPrivateOrReservedIP(ip) || IsRussianIP(ip)
+		},
+		BypassNodeIPsFn: srv.collectBypassNodeIPs,
+		AllowRawVoiceUDPFn: func() bool {
+			cfg := srv.getConfig()
+			if cfg != nil && IsTrialOrFreeKey(cfg.ClientUUID) {
+				return false
+			}
+			return srv.matcher.AllowsRawVoiceUDP()
+		},
+		CanProxyUDPFn: func() bool {
+			cfg := srv.getConfig()
+			return cfg == nil || !IsTrialOrFreeKey(cfg.ClientUUID)
+		},
+	})
 	srv.xray = NewXRayRunner(srv.getConfig, opts.Mux, opts.Resolver, radar)
+	srv.xray.SetTUNStatusProvider(srv.tunStatusSnapshot)
+	if opts.Resolver != nil {
+		opts.Resolver.SetDialControlProvider(srv.currentDialControl)
+	}
+	if opts.Mux != nil {
+		opts.Mux.SetDialControlProvider(srv.currentDialControl)
+	}
 	srv.uiHandler = srv.buildWebUIHandler()
 	return srv
+}
+
+func (s *LocalProxyServer) currentDialControl() func(network, address string, c syscall.RawConn) error {
+	if s == nil || s.tun == nil {
+		return nil
+	}
+	return s.tun.PhysicalDialControl()
+}
+
+func (s *LocalProxyServer) tunStatusSnapshot() TUNStatusSnapshot {
+	if s == nil || s.tun == nil {
+		return TUNStatusSnapshot{Status: "stopped", AdapterName: TUNAdapterName}
+	}
+	return s.tun.Status()
+}
+
+func (s *LocalProxyServer) syncTUNState(want bool) {
+	if s == nil || s.tun == nil {
+		return
+	}
+	s.tunMu.Lock()
+	defer s.tunMu.Unlock()
+
+	cur := s.tun.Status()
+	if want {
+		if !cur.Active {
+			if err := s.tun.Start(); err == nil && s.resolver != nil {
+				s.resolver.CloseIdleConnections()
+			}
+		}
+		return
+	}
+	if cur.Active || cur.Enabled {
+		_ = s.tun.Stop()
+		if s.resolver != nil {
+			s.resolver.CloseIdleConnections()
+		}
+	}
+}
+
+func (s *LocalProxyServer) collectBypassNodeIPs() []net.IP {
+	cfg := s.getConfig()
+	var hosts []string
+	if cfg != nil {
+		if cfg.ActiveNode.Host != "" {
+			hosts = append(hosts, cfg.ActiveNode.Host)
+		}
+		for _, n := range cfg.Nodes {
+			if n.Host != "" {
+				hosts = append(hosts, n.Host)
+			}
+		}
+	}
+	hosts = append(hosts, DefaultHost)
+
+	var out []net.IP
+	seen := make(map[string]struct{})
+	addIP := func(ip net.IP) {
+		if ip == nil {
+			return
+		}
+		v4 := ip.To4()
+		if v4 == nil {
+			return
+		}
+		key := v4.String()
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		out = append(out, v4)
+	}
+	for _, h := range hosts {
+		h = strings.TrimSpace(h)
+		if h == "" {
+			continue
+		}
+		if ip := net.ParseIP(h); ip != nil {
+			addIP(ip)
+			continue
+		}
+		if s.resolver != nil {
+			rctx, rcancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+			ips, rerr := s.resolver.LookupHost(rctx, h)
+			rcancel()
+			if rerr == nil {
+				for _, ip := range ips {
+					addIP(ip)
+				}
+			}
+		}
+	}
+	return out
 }
 
 func (s *LocalProxyServer) LocalToken() string     { return s.localToken }
@@ -179,6 +304,9 @@ func (s *LocalProxyServer) Start() error {
 			_ = s.bindWSLBridge(wslIP, cfg.HTTPPort, cfg.SOCKSPort)
 		}
 	}
+	if cfg.V2.TunMode {
+		s.syncTUNState(true)
+	}
 	return nil
 }
 
@@ -222,10 +350,11 @@ func (s *LocalProxyServer) bindWSLBridge(ipStr string, httpPort, socksPort int) 
 	return nil
 }
 
-// Close closes all listeners safely.
+// Close closes all listeners and stops TUN safely.
 func (s *LocalProxyServer) Close() {
 	s.stopOnce.Do(func() {
 		close(s.stopCh)
+		s.syncTUNState(false)
 		if s.httpListener != nil {
 			_ = s.httpListener.Close()
 		}
@@ -479,6 +608,7 @@ func (s *LocalProxyServer) handleLegacyTelemetry(w http.ResponseWriter) {
 	totalUp := s.bytesUp.Load() + snap.BytesUp
 	totalDown := s.bytesDown.Load() + snap.BytesDown
 	manifestVer, manifestSrc := s.manifestInfo()
+	tunSnap := s.tunStatusSnapshot()
 
 	payload := map[string]any{
 		"engine":                EngineName,
@@ -491,8 +621,10 @@ func (s *LocalProxyServer) handleLegacyTelemetry(w http.ResponseWriter) {
 		"udp_assocs":            0,
 		"dpi_clienthello_split": cfg.ActiveNode.Frag || cfg.ActiveNode.EnableDpiSplit,
 		"dpi_profile":           cfg.V2.DPIProfile,
+		"dpi_strategy":          snap.DPIStrategy,
 		"anti_freeze_ok":        true,
-		"dpi_escalations":       0,
+		"dpi_escalations":       snap.AutoTunePromotions,
+		"doh_upstream":          snap.DoHUpstream,
 		"clock_offset_sec":      snap.ClockOffsetSec,
 		"license_tier":          tier,
 		"days_left":             snap.License.DaysLeft,
@@ -514,6 +646,13 @@ func (s *LocalProxyServer) handleLegacyTelemetry(w http.ResponseWriter) {
 		"instant_wake_count": snap.InstantWakeCount,
 		"pac_rev":            s.pacRev.Load(),
 		"wsl_bridge_ip":      s.wslBridgeIP,
+		"sticky_ai_node":     snap.StickyAINode,
+		"ai_migrations":      snap.AIMigrations,
+		"media_pool_conns":   snap.MediaPoolConns,
+		"tun_mode":           cfg.V2.TunMode,
+		"tun_active":         tunSnap.Active,
+		"tun_status":         tunSnap.Status,
+		"fakeip_entries":     tunSnap.FakeIPEntries,
 	}
 	writeJSON(w, http.StatusOK, payload)
 }
@@ -601,6 +740,7 @@ func (s *LocalProxyServer) writeV4Status(w http.ResponseWriter) {
 		tier = "PRO"
 	}
 	manifestVer, manifestSrc := s.manifestInfo()
+	tunSnap := s.tunStatusSnapshot()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":                    true,
 		"engine":                EngineName,
@@ -609,6 +749,9 @@ func (s *LocalProxyServer) writeV4Status(w http.ResponseWriter) {
 		"protocol":              snap.Protocol,
 		"utls_profile":          snap.UTLSProfile,
 		"dpi_profile":           cfg.V2.DPIProfile,
+		"dpi_strategy":          snap.DPIStrategy,
+		"dpi_escalations":       snap.AutoTunePromotions,
+		"doh_upstream":          snap.DoHUpstream,
 		"active_node":           snap.ActiveNode,
 		"active_role":           "ai",
 		"standby_node":          snap.StandbyNode,
@@ -633,6 +776,13 @@ func (s *LocalProxyServer) writeV4Status(w http.ResponseWriter) {
 		"custom_proxy_domains":  cfg.CustomProxy,
 		"custom_direct_domains": cfg.CustomDirect,
 		"proxy_all":             cfg.ProxyAll,
+		"sticky_ai_node":        snap.StickyAINode,
+		"ai_migrations":         snap.AIMigrations,
+		"media_pool_conns":      snap.MediaPoolConns,
+		"tun_mode":              cfg.V2.TunMode,
+		"tun_active":            tunSnap.Active,
+		"tun_status":            tunSnap.Status,
+		"fakeip_entries":        tunSnap.FakeIPEntries,
 	})
 }
 
@@ -642,6 +792,7 @@ func (s *LocalProxyServer) handleReloadRules(w http.ResponseWriter, r *http.Requ
 		CustomProxy  []string        `json:"custom_proxy_domains"`
 		CustomDirect []string        `json:"custom_direct_domains"`
 		ProxyAll     *bool           `json:"proxy_all"`
+		TunMode      *bool           `json:"tun_mode"`
 	}
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 512*1024))
 
@@ -690,6 +841,9 @@ func (s *LocalProxyServer) handleReloadRules(w http.ResponseWriter, r *http.Requ
 		if body.ProxyAll != nil {
 			cfg.ProxyAll = *body.ProxyAll
 		}
+		if body.TunMode != nil {
+			cfg.V2.TunMode = *body.TunMode
+		}
 		cfg.RebuildEffectiveRules()
 		if cfg.ConfigPath != "" && !s.headless {
 			_ = SaveConfig(cfg.ConfigPath, cfg)
@@ -704,6 +858,9 @@ func (s *LocalProxyServer) handleReloadRules(w http.ResponseWriter, r *http.Requ
 	cb := s.onRulesReloaded
 	s.mu.Unlock()
 
+	s.syncTUNState(cfg.V2.TunMode)
+	tunSnap := s.tunStatusSnapshot()
+
 	if cb != nil {
 		cb(cfg, newRev)
 	}
@@ -712,6 +869,9 @@ func (s *LocalProxyServer) handleReloadRules(w http.ResponseWriter, r *http.Requ
 		"pac_rev":        newRev,
 		"proxy_domains":  len(cfg.ProxyDomains),
 		"direct_domains": len(cfg.DirectDomains),
+		"tun_mode":       cfg.V2.TunMode,
+		"tun_active":     tunSnap.Active,
+		"tun_status":     tunSnap.Status,
 	})
 }
 
@@ -875,7 +1035,7 @@ func (s *LocalProxyServer) handleHTTPForward(w http.ResponseWriter, r *http.Requ
 
 	dialCtx, dialCancel := context.WithTimeout(r.Context(), 10*time.Second)
 	t0 := time.Now()
-	upstream, nodeUsed, err := s.dialUpstreamTCP(dialCtx, decision, host, port, isWSL)
+	upstream, nodeUsed, err := s.dialUpstreamTCPDetailed(dialCtx, &decision, host, port, isWSL)
 	dialCancel()
 	pingMs := time.Since(t0).Milliseconds()
 	errStr := ""
@@ -986,7 +1146,7 @@ func (s *LocalProxyServer) handleSOCKS5Conn(c net.Conn, isWSL bool) {
 		pid, proc := LookupProcessForConnection(c.RemoteAddr(), s.HTTPPort(), s.SOCKSPort())
 		t0 := time.Now()
 		dialCtx, cancelDial := context.WithTimeout(context.Background(), 15*time.Second)
-		upstream, nodeUsed, uerr := s.dialUpstreamTCP(dialCtx, decision, targetHost, targetPort, isWSL)
+		upstream, nodeUsed, uerr := s.dialUpstreamTCPDetailed(dialCtx, &decision, targetHost, targetPort, isWSL)
 		cancelDial()
 		lat := time.Since(t0).Milliseconds()
 		errStr := ""
@@ -1125,7 +1285,7 @@ func (s *LocalProxyServer) bridgeTCPConnection(ctx context.Context, client net.C
 	decision := s.matcher.Classify(host)
 	pid, proc := LookupProcessForConnection(client.RemoteAddr(), s.HTTPPort(), s.SOCKSPort())
 	t0 := time.Now()
-	upstream, nodeUsed, err := s.dialUpstreamTCP(ctx, decision, host, port, isWSL)
+	upstream, nodeUsed, err := s.dialUpstreamTCPDetailed(ctx, &decision, host, port, isWSL)
 	lat := time.Since(t0).Milliseconds()
 	errStr := ""
 	if err != nil {
@@ -1153,12 +1313,40 @@ func (s *LocalProxyServer) bridgeTCPConnection(ctx context.Context, client net.C
 }
 
 func (s *LocalProxyServer) dialUpstreamTCP(ctx context.Context, decision RuleAction, host string, port int, isWSL bool) (net.Conn, string, error) {
+	return s.dialUpstreamTCPDetailed(ctx, &decision, host, port, isWSL)
+}
+
+func (s *LocalProxyServer) dialUpstreamTCPDetailed(ctx context.Context, decision *RuleAction, host string, port int, isWSL bool) (net.Conn, string, error) {
+	if decision == nil {
+		decision = &RuleAction{Action: "DIRECT", Rule: "empty", Role: "ai"}
+	}
 	if port <= 0 || port > 65535 {
 		return nil, decision.Action, fmt.Errorf("invalid port %d", port)
 	}
 	if s.isSelfTarget(host, port) || (isWSL && s.isWSLRestrictedHost(host)) {
 		return nil, decision.Action, fmt.Errorf("blocked proxy target %s:%d", host, port)
 	}
+
+	var preResolvedIPs []net.IP
+	// Only for catch-all proxy_all (never override explicit ai/antigravity/custom_proxy rules),
+	// if host resolves exclusively to Russian ISP/cloud IPs, route DIRECT under rule "ru_cidr".
+	if decision.Action == "PROXY" && decision.Rule == "proxy_all" && net.ParseIP(host) == nil && s.resolver != nil {
+		if ips, err := s.resolver.LookupHost(ctx, host); err == nil && len(ips) > 0 {
+			allRU := true
+			for _, ip := range ips {
+				if !IsRussianIP(ip) {
+					allRU = false
+					break
+				}
+			}
+			if allRU {
+				decision.Action = "DIRECT"
+				decision.Rule = "ru_cidr"
+				preResolvedIPs = ips
+			}
+		}
+	}
+
 	if decision.Action == "PROXY" && s.mux != nil {
 		return s.mux.OpenStream(ctx, decision.Role, host, port)
 	}
@@ -1171,15 +1359,19 @@ func (s *LocalProxyServer) dialUpstreamTCP(ctx context.Context, decision RuleAct
 			return nil, "DIRECT", fmt.Errorf("blocked direct IP target %s:%d", ip.String(), port)
 		}
 	} else {
-		if s.resolver == nil {
-			return nil, "DIRECT", errors.New("doh resolver unavailable for direct hostname")
-		}
-		ips, err := s.resolver.LookupHost(ctx, host)
-		if err != nil || len(ips) == 0 {
-			if err == nil {
-				err = errors.New("doh returned no addresses")
+		ips := preResolvedIPs
+		if len(ips) == 0 {
+			if s.resolver == nil {
+				return nil, "DIRECT", errors.New("doh resolver unavailable for direct hostname")
 			}
-			return nil, "DIRECT", fmt.Errorf("doh resolve failed: %w", err)
+			var err error
+			ips, err = s.resolver.LookupHost(ctx, host)
+			if err != nil || len(ips) == 0 {
+				if err == nil {
+					err = errors.New("doh returned no addresses")
+				}
+				return nil, "DIRECT", fmt.Errorf("doh resolve failed: %w", err)
+			}
 		}
 		var chosen net.IP
 		for _, ip := range ips {
@@ -1195,7 +1387,10 @@ func (s *LocalProxyServer) dialUpstreamTCP(ctx context.Context, decision RuleAct
 		}
 		dialHost = chosen.String()
 	}
-	conn, err := (&net.Dialer{Timeout: 6 * time.Second}).DialContext(ctx, "tcp", net.JoinHostPort(dialHost, strconv.Itoa(port)))
+	conn, err := (&net.Dialer{
+		Timeout: 6 * time.Second,
+		Control: s.currentDialControl(),
+	}).DialContext(ctx, "tcp", net.JoinHostPort(dialHost, strconv.Itoa(port)))
 	return conn, "DIRECT", err
 }
 

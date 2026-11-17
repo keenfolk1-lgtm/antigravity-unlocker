@@ -11,8 +11,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -26,6 +29,9 @@ const (
 	dnsTypeTXT         uint16 = 16
 	dnsTypeAAAA        uint16 = 28
 	maxDohCacheEntries        = 512
+	dohStaleGrace             = 30 * time.Minute
+	dohStaggerDelay           = 350 * time.Millisecond
+	dohCooldownWindow         = 15 * time.Second
 )
 
 // DohEndpoint represents a direct-IP DoH resolver so system/ISP DNS is never consulted.
@@ -35,52 +41,199 @@ type DohEndpoint struct {
 }
 
 var defaultDohEndpoints = []DohEndpoint{
-	{URL: "https://1.1.1.1/dns-query", ServerName: "cloudflare-dns.com"},
 	{URL: "https://8.8.8.8/dns-query", ServerName: "dns.google"},
+	{URL: "https://9.9.9.9/dns-query", ServerName: "dns.quad9.net"},
+	{URL: "https://1.1.1.1/dns-query", ServerName: "cloudflare-dns.com"},
+	{URL: "https://1.0.0.1/dns-query", ServerName: "cloudflare-dns.com"},
+	{URL: "https://8.8.4.4/dns-query", ServerName: "dns.google"},
+	{URL: "https://149.112.112.112/dns-query", ServerName: "dns.quad9.net"},
 }
 
 type cachedDNS struct {
-	ips       []net.IP
-	txts      []string
-	expiresAt time.Time
+	ips        []net.IP
+	txts       []string
+	expiresAt  time.Time
+	staleUntil time.Time
 }
 
-// DohResolver resolves A/AAAA/TXT records strictly via direct-IP DNS-over-HTTPS (RFC 8484).
+type dohCall struct {
+	done chan struct{}
+	ips  []net.IP
+	err  error
+}
+
+// DohResolver resolves A/AAAA/TXT records strictly via direct-IP DNS-over-HTTPS (RFC 8484)
+// using uTLS + DPI record splitting, 350ms staggered failover racing, SWR cache, and singleflight.
 type DohResolver struct {
-	endpoints  []DohEndpoint
-	httpClient *http.Client
-	mu         sync.RWMutex
-	cache      map[string]cachedDNS
+	endpoints       []DohEndpoint
+	httpClient      *http.Client
+	mu              sync.RWMutex
+	cache           map[string]cachedDNS
+	inflight        map[string]*dohCall
+	cooldownMu      sync.Mutex
+	cooldownUntil   []int64
+	preferredIdx    atomic.Int32
+	activeUpstream  atomic.Value
+	dialCtrlMu      sync.RWMutex
+	dialControlFn   func(network, address string, c syscall.RawConn) error
+	dialControlProv func() func(network, address string, c syscall.RawConn) error
+}
+
+// SetDialControl sets a static socket Control callback for DoH dials (nil resets to default).
+func (r *DohResolver) SetDialControl(fn func(network, address string, c syscall.RawConn) error) {
+	if r == nil {
+		return
+	}
+	r.dialCtrlMu.Lock()
+	r.dialControlFn = fn
+	r.dialCtrlMu.Unlock()
+}
+
+// SetDialControlProvider registers a dynamic provider returning a socket Control callback only while TUN is active.
+func (r *DohResolver) SetDialControlProvider(fn func() func(network, address string, c syscall.RawConn) error) {
+	if r == nil {
+		return
+	}
+	r.dialCtrlMu.Lock()
+	r.dialControlProv = fn
+	r.dialCtrlMu.Unlock()
+}
+
+func (r *DohResolver) currentDialControl() func(network, address string, c syscall.RawConn) error {
+	if r == nil {
+		return nil
+	}
+	r.dialCtrlMu.RLock()
+	prov := r.dialControlProv
+	fn := r.dialControlFn
+	r.dialCtrlMu.RUnlock()
+	if prov != nil {
+		return prov()
+	}
+	return fn
+}
+
+// CloseIdleConnections drops pooled DoH transport sockets (e.g. after TUN toggle).
+func (r *DohResolver) CloseIdleConnections() {
+	if r != nil && r.httpClient != nil {
+		r.httpClient.CloseIdleConnections()
+	}
 }
 
 // NewDohResolver constructs an IP-direct DoH resolver with optional custom endpoints for testing.
 func NewDohResolver(endpoints []DohEndpoint, tlsConfig *tls.Config) *DohResolver {
 	eps := defaultDohEndpoints
 	if len(endpoints) > 0 {
-		eps = endpoints
+		eps = append([]DohEndpoint(nil), endpoints...)
 	}
+
+	sniByHost := make(map[string]string, len(eps))
+	for _, ep := range eps {
+		if u, err := url.Parse(ep.URL); err == nil && u.Hostname() != "" && ep.ServerName != "" {
+			sniByHost[strings.ToLower(u.Hostname())] = ep.ServerName
+		}
+	}
+
+	r := &DohResolver{
+		endpoints:     eps,
+		cache:         make(map[string]cachedDNS),
+		inflight:      make(map[string]*dohCall),
+		cooldownUntil: make([]int64, len(eps)),
+	}
+	r.activeUpstream.Store("")
+
 	tr := &http.Transport{
-		DialContext: (&net.Dialer{
-			Timeout:   4 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
+		DialContext: func(dctx context.Context, network, addr string) (net.Conn, error) {
+			return (&net.Dialer{
+				Timeout:   4 * time.Second,
+				KeepAlive: 30 * time.Second,
+				Control:   r.currentDialControl(),
+			}).DialContext(dctx, network, addr)
+		},
 		TLSHandshakeTimeout: 4 * time.Second,
 		DisableKeepAlives:   false,
 	}
 	if tlsConfig != nil {
 		tr.TLSClientConfig = tlsConfig.Clone()
+	} else {
+		tr.ForceAttemptHTTP2 = false
+		tr.DialTLSContext = func(dctx context.Context, network, addr string) (net.Conn, error) {
+			host, _, serr := net.SplitHostPort(addr)
+			if serr != nil {
+				host = addr
+			}
+			sni := sniByHost[strings.ToLower(host)]
+			if sni == "" {
+				sni = host
+			}
+			ctrl := r.currentDialControl()
+			if isLoopbackHostOrIP(host) {
+				d := &tls.Dialer{
+					NetDialer: &net.Dialer{Timeout: 2 * time.Second, KeepAlive: 30 * time.Second, Control: ctrl},
+					Config:    &tls.Config{ServerName: sni},
+				}
+				return d.DialContext(dctx, network, addr)
+			}
+			res, err := DialUTLS(dctx, UTLSDialOptions{
+				Address:        addr,
+				SNI:            sni,
+				Profile:        "chrome",
+				DPIProfile:     DPIProfileTlsRecordSplit,
+				EnableSplit:    true,
+				ForceHTTP1ALPN: true,
+				ConnectTimeout: 2000 * time.Millisecond,
+				DialControl:    ctrl,
+			})
+			if err == nil {
+				return res.Conn, nil
+			}
+			var tcpErr *tcpConnectError
+			if !errors.As(err, &tcpErr) && dctx.Err() == nil {
+				res2, err2 := DialUTLS(dctx, UTLSDialOptions{
+					Address:        addr,
+					SNI:            sni,
+					Profile:        "chrome",
+					DPIProfile:     DPIProfileComboMultiRecord,
+					EnableSplit:    true,
+					ForceHTTP1ALPN: true,
+					ConnectTimeout: 2000 * time.Millisecond,
+					DialControl:    ctrl,
+				})
+				if err2 == nil {
+					return res2.Conn, nil
+				}
+				return nil, err2
+			}
+			return nil, err
+		}
 	}
-	return &DohResolver{
-		endpoints: eps,
-		httpClient: &http.Client{
-			Timeout:   5 * time.Second,
-			Transport: tr,
-		},
-		cache: make(map[string]cachedDNS),
-	}
+	r.httpClient = &http.Client{Timeout: 5 * time.Second, Transport: tr}
+	return r
 }
 
-// LookupHost resolves IPv4/IPv6 addresses over DoH and rejects loopback/sinkhole IPs.
+func isLoopbackHostOrIP(host string) bool {
+	h := strings.TrimSpace(host)
+	if strings.EqualFold(h, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(h); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	return false
+}
+
+// ActiveUpstream returns the label of the last healthy DoH upstream endpoint.
+func (r *DohResolver) ActiveUpstream() string {
+	if r == nil {
+		return ""
+	}
+	if v, ok := r.activeUpstream.Load().(string); ok {
+		return v
+	}
+	return ""
+}
+
+// LookupHost resolves IPv4/IPv6 addresses over DoH (with SWR and singleflight) and rejects sinkhole IPs.
 func (r *DohResolver) LookupHost(ctx context.Context, host string) ([]net.IP, error) {
 	h := normalizeHostForMatch(host)
 	if h == "" {
@@ -94,28 +247,86 @@ func (r *DohResolver) LookupHost(ctx context.Context, host string) ([]net.IP, er
 	}
 
 	cacheKey := "A:" + h
-	r.mu.RLock()
-	if ent, ok := r.cache[cacheKey]; ok && time.Now().Before(ent.expiresAt) && len(ent.ips) > 0 {
+	now := time.Now()
+
+	r.mu.Lock()
+	if r.cache == nil {
+		r.cache = make(map[string]cachedDNS)
+	}
+	if r.inflight == nil {
+		r.inflight = make(map[string]*dohCall)
+	}
+	ent, ok := r.cache[cacheKey]
+	if ok && len(ent.ips) > 0 && now.Before(ent.expiresAt) {
 		out := append([]net.IP(nil), ent.ips...)
-		r.mu.RUnlock()
+		r.mu.Unlock()
 		return out, nil
 	}
-	r.mu.RUnlock()
-
-	ips, ttl, err := r.queryA(ctx, h)
-	if err != nil {
-		return nil, err
+	if ok && len(ent.ips) > 0 && now.Before(ent.staleUntil) {
+		out := append([]net.IP(nil), ent.ips...)
+		if _, pending := r.inflight[cacheKey]; !pending {
+			r.startSingleflightLocked(h, cacheKey, 4*time.Second)
+		}
+		r.mu.Unlock()
+		return out, nil
 	}
-	if ttl < 15*time.Second {
-		ttl = 15 * time.Second
+	var lastResortIPs []net.IP
+	if ok && len(ent.ips) > 0 {
+		lastResortIPs = append([]net.IP(nil), ent.ips...)
 	}
-	if ttl > 10*time.Minute {
-		ttl = 10 * time.Minute
+	call, pending := r.inflight[cacheKey]
+	if !pending {
+		call = r.startSingleflightLocked(h, cacheKey, 8*time.Second)
 	}
-	r.mu.Lock()
-	r.setCachedLocked(cacheKey, cachedDNS{ips: ips, expiresAt: time.Now().Add(ttl)})
 	r.mu.Unlock()
-	return append([]net.IP(nil), ips...), nil
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-call.done:
+		if call.err == nil && len(call.ips) > 0 {
+			return append([]net.IP(nil), call.ips...), nil
+		}
+		if len(lastResortIPs) > 0 {
+			return lastResortIPs, nil
+		}
+		return nil, call.err
+	}
+}
+
+func (r *DohResolver) startSingleflightLocked(host, cacheKey string, budget time.Duration) *dohCall {
+	call := &dohCall{done: make(chan struct{})}
+	r.inflight[cacheKey] = call
+	go func() {
+		qctx, cancel := context.WithTimeout(context.Background(), budget)
+		defer cancel()
+		ips, ttl, err := r.queryA(qctx, host)
+		if err == nil && len(ips) > 0 {
+			if ttl < 15*time.Second {
+				ttl = 15 * time.Second
+			}
+			if ttl > 10*time.Minute {
+				ttl = 10 * time.Minute
+			}
+			now := time.Now()
+			r.mu.Lock()
+			r.setCachedLocked(cacheKey, cachedDNS{
+				ips:        append([]net.IP(nil), ips...),
+				expiresAt:  now.Add(ttl),
+				staleUntil: now.Add(ttl + dohStaleGrace),
+			})
+			delete(r.inflight, cacheKey)
+			r.mu.Unlock()
+			call.ips = append([]net.IP(nil), ips...)
+		} else {
+			r.mu.Lock()
+			delete(r.inflight, cacheKey)
+			r.mu.Unlock()
+			call.err = err
+		}
+		close(call.done)
+	}()
+	return call
 }
 
 // LookupTXT queries TXT records over DoH (used for PTM3 signed manifest fallback).
@@ -152,7 +363,11 @@ func (r *DohResolver) LookupTXT(ctx context.Context, domain string) ([]string, e
 func (r *DohResolver) setCachedLocked(cacheKey string, entry cachedDNS) {
 	now := time.Now()
 	for k, v := range r.cache {
-		if !now.Before(v.expiresAt) {
+		evictAt := v.staleUntil
+		if evictAt.IsZero() {
+			evictAt = v.expiresAt
+		}
+		if !now.Before(evictAt) {
 			delete(r.cache, k)
 		}
 	}
@@ -227,25 +442,195 @@ type parsedDNSResp struct {
 	txts []string
 }
 
+type dohRaceOutcome struct {
+	epIdx int
+	res   parsedDNSResp
+	ttl   time.Duration
+	err   error
+}
+
+func (r *DohResolver) orderedEndpointIndices() []int {
+	n := len(r.endpoints)
+	if n == 0 {
+		return nil
+	}
+	pref := int(r.preferredIdx.Load())
+	nowMs := time.Now().UnixMilli()
+
+	r.cooldownMu.Lock()
+	defer r.cooldownMu.Unlock()
+
+	var healthy, cooled []int
+	usedPref := false
+	if pref >= 0 && pref < n {
+		if len(r.cooldownUntil) > pref && r.cooldownUntil[pref] > nowMs {
+			cooled = append(cooled, pref)
+		} else {
+			healthy = append(healthy, pref)
+		}
+		usedPref = true
+	}
+	for i := 0; i < n; i++ {
+		if usedPref && i == pref {
+			continue
+		}
+		if len(r.cooldownUntil) > i && r.cooldownUntil[i] > nowMs {
+			cooled = append(cooled, i)
+		} else {
+			healthy = append(healthy, i)
+		}
+	}
+	return append(healthy, cooled...)
+}
+
+func (r *DohResolver) markEndpointCooldown(epIdx int, d time.Duration) {
+	if epIdx < 0 || epIdx >= len(r.endpoints) {
+		return
+	}
+	until := time.Now().Add(d).UnixMilli()
+	r.cooldownMu.Lock()
+	if epIdx < len(r.cooldownUntil) {
+		r.cooldownUntil[epIdx] = until
+	}
+	r.cooldownMu.Unlock()
+}
+
+func (r *DohResolver) markEndpointSuccess(epIdx int) {
+	if epIdx < 0 || epIdx >= len(r.endpoints) {
+		return
+	}
+	r.cooldownMu.Lock()
+	if epIdx < len(r.cooldownUntil) {
+		r.cooldownUntil[epIdx] = 0
+	}
+	r.cooldownMu.Unlock()
+	r.preferredIdx.Store(int32(epIdx))
+	r.activeUpstream.Store(formatDohUpstreamLabel(r.endpoints[epIdx]))
+}
+
+func formatDohUpstreamLabel(ep DohEndpoint) string {
+	u, err := url.Parse(ep.URL)
+	host := ep.URL
+	if err == nil && u.Hostname() != "" {
+		host = u.Hostname()
+	}
+	if ep.ServerName != "" && !strings.EqualFold(ep.ServerName, host) {
+		return ep.ServerName + " (" + host + ")"
+	}
+	return host
+}
+
+func (r *DohResolver) querySingleEndpoint(ctx context.Context, epIdx int, pkt []byte, id uint16, qtype uint16) (parsedDNSResp, time.Duration, error) {
+	respPkt, err := r.postDohWire(ctx, r.endpoints[epIdx], pkt)
+	if err != nil {
+		return parsedDNSResp{}, 0, err
+	}
+	return parseDNSResponseWire(respPkt, id, qtype)
+}
+
 func (r *DohResolver) queryWire(ctx context.Context, name string, qtype uint16) (parsedDNSResp, time.Duration, error) {
 	pkt, id, err := buildDNSQueryWire(name, qtype)
 	if err != nil {
 		return parsedDNSResp{}, 0, err
 	}
-	var lastErr error
-	for _, ep := range r.endpoints {
-		respPkt, err := r.postDohWire(ctx, ep, pkt)
-		if err != nil {
-			lastErr = err
-			continue
+	ordered := r.orderedEndpointIndices()
+	if len(ordered) == 0 {
+		return parsedDNSResp{}, 0, ErrDohUnavailable
+	}
+	if len(ordered) == 1 {
+		res, ttl, qerr := r.querySingleEndpoint(ctx, ordered[0], pkt, id, qtype)
+		if qerr != nil {
+			if ctx.Err() == nil {
+				r.markEndpointCooldown(ordered[0], dohCooldownWindow)
+			}
+			return parsedDNSResp{}, 0, qerr
 		}
-		res, ttl, err := parseDNSResponseWire(respPkt, id, qtype)
-		if err != nil {
-			lastErr = err
-			continue
-		}
+		r.markEndpointSuccess(ordered[0])
 		return res, ttl, nil
 	}
+
+	raceCtx, raceCancel := context.WithCancel(ctx)
+	resCh := make(chan dohRaceOutcome, 2)
+	inflight := 0
+	launch := func(epIdx int) {
+		inflight++
+		go func() {
+			res, ttl, qerr := r.querySingleEndpoint(raceCtx, epIdx, pkt, id, qtype)
+			resCh <- dohRaceOutcome{epIdx: epIdx, res: res, ttl: ttl, err: qerr}
+		}()
+	}
+
+	drainRes := func(pending int) {
+		if pending <= 0 {
+			return
+		}
+		go func() {
+			for i := 0; i < pending; i++ {
+				<-resCh
+			}
+		}()
+	}
+
+	launch(ordered[0])
+	staggerTimer := time.NewTimer(dohStaggerDelay)
+	launchedSecond := false
+	var lastErr error
+
+	for inflight > 0 || !launchedSecond {
+		var timerCh <-chan time.Time
+		if !launchedSecond {
+			timerCh = staggerTimer.C
+		}
+		select {
+		case <-ctx.Done():
+			staggerTimer.Stop()
+			raceCancel()
+			drainRes(inflight)
+			return parsedDNSResp{}, 0, ctx.Err()
+
+		case <-timerCh:
+			launchedSecond = true
+			launch(ordered[1])
+
+		case out := <-resCh:
+			inflight--
+			if out.err == nil {
+				staggerTimer.Stop()
+				raceCancel()
+				drainRes(inflight)
+				r.markEndpointSuccess(out.epIdx)
+				return out.res, out.ttl, nil
+			}
+			lastErr = out.err
+			if ctx.Err() == nil {
+				r.markEndpointCooldown(out.epIdx, dohCooldownWindow)
+			}
+			if !launchedSecond {
+				staggerTimer.Stop()
+				launchedSecond = true
+				launch(ordered[1])
+			}
+		}
+	}
+	raceCancel()
+
+	for _, epIdx := range ordered[2:] {
+		if ctx.Err() != nil {
+			return parsedDNSResp{}, 0, ctx.Err()
+		}
+		aCtx, aCancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+		res, ttl, qerr := r.querySingleEndpoint(aCtx, epIdx, pkt, id, qtype)
+		aCancel()
+		if qerr == nil {
+			r.markEndpointSuccess(epIdx)
+			return res, ttl, nil
+		}
+		lastErr = qerr
+		if ctx.Err() == nil {
+			r.markEndpointCooldown(epIdx, dohCooldownWindow)
+		}
+	}
+
 	if lastErr == nil {
 		lastErr = ErrDohUnavailable
 	}

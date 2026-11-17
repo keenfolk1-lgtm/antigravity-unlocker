@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/binary"
@@ -11,6 +12,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
@@ -20,10 +22,25 @@ import (
 type DPIProfile int
 
 const (
-	DPIProfileStandardSplit  DPIProfile = 0
-	DPIProfileSniMicroChunk  DPIProfile = 1
-	DPIProfileTlsRecordSplit DPIProfile = 2
+	DPIProfileStandardSplit    DPIProfile = 0
+	DPIProfileSniMicroChunk    DPIProfile = 1
+	DPIProfileTlsRecordSplit   DPIProfile = 2
+	DPIProfileComboMultiRecord DPIProfile = 3
 )
+
+// String returns the canonical snake_case name of the DPI fragmentation profile.
+func (p DPIProfile) String() string {
+	switch p {
+	case DPIProfileSniMicroChunk:
+		return "sni_micro_chunk"
+	case DPIProfileTlsRecordSplit:
+		return "tls_record_split"
+	case DPIProfileComboMultiRecord:
+		return "combo_multi_record"
+	default:
+		return "standard_split"
+	}
+}
 
 var (
 	ErrCertPinMismatch = errors.New("tls certificate SPKI / X.509 pin mismatch")
@@ -64,7 +81,26 @@ func (c *RecordSplitConn) Write(b []byte) (int, error) {
 		return c.Conn.Write(b)
 	}
 
+	if tc, ok := c.Conn.(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
+	}
+
 	switch c.profile {
+	case DPIProfileComboMultiRecord:
+		records := MultiRecordSplitClientHello(b, c.sni)
+		segs := make([][]byte, 0, len(records)+1)
+		for i, rec := range records {
+			if i == 1 && len(rec) > 9 {
+				segs = append(segs, rec[:7], rec[7:])
+			} else {
+				segs = append(segs, rec)
+			}
+		}
+		if err := writeSegmentsJittered(c.Conn, segs); err != nil {
+			return 0, err
+		}
+		return len(b), nil
+
 	case DPIProfileTlsRecordSplit:
 		splitRecords := SplitTLSClientHelloRecord(b, c.sni)
 		if err := writeAllSegments(c.Conn, splitRecords, 2*time.Millisecond); err != nil {
@@ -97,6 +133,24 @@ func writeAllSegments(w net.Conn, segments [][]byte, gap time.Duration) error {
 			return err
 		}
 		if i+1 < len(segments) && gap > 0 {
+			time.Sleep(gap)
+		}
+	}
+	return nil
+}
+
+func writeSegmentsJittered(w net.Conn, segments [][]byte) error {
+	var rnd [1]byte
+	for i, seg := range segments {
+		if len(seg) == 0 {
+			continue
+		}
+		if _, err := w.Write(seg); err != nil {
+			return err
+		}
+		if i+1 < len(segments) {
+			_, _ = rand.Read(rnd[:])
+			gap := time.Duration(1+int(rnd[0]%3)) * time.Millisecond
 			time.Sleep(gap)
 		}
 	}
@@ -196,6 +250,60 @@ func SplitTLSClientHelloRecord(raw []byte, sni string) [][]byte {
 	return out
 }
 
+// MultiRecordSplitClientHello rewrites a single TLS 0x16 Handshake record into three valid
+// TLS records slicing across the SNI hostname boundaries while preserving trailing flight data.
+func MultiRecordSplitClientHello(raw []byte, sni string) [][]byte {
+	if len(raw) < 16 || raw[0] != 0x16 || raw[1] != 0x03 {
+		return [][]byte{raw}
+	}
+	recLen := int(binary.BigEndian.Uint16(raw[3:5]))
+	if recLen < 12 || 5+recLen > len(raw) {
+		return [][]byte{raw}
+	}
+	payload := raw[5 : 5+recLen]
+	verMajor, verMinor := raw[1], raw[2]
+
+	var cut1, cut2 int
+	if off, n := findSNIOffset(raw, sni); off >= 5 {
+		rel := off - 5
+		if rel > 4 && n >= 4 && rel+n <= len(payload) {
+			cut1 = rel + 1
+			cut2 = rel + 1 + (n-1)/2
+		}
+	}
+	if cut1 <= 0 || cut2 <= cut1 || cut2 >= len(payload) {
+		cut1 = len(payload) / 4
+		cut2 = len(payload) / 2
+	}
+	if cut1 < 1 {
+		cut1 = 1
+	}
+	if cut2 <= cut1 {
+		cut2 = cut1 + 1
+	}
+	if cut2 >= len(payload) {
+		return SplitTLSClientHelloRecord(raw, sni)
+	}
+
+	makeRec := func(seg []byte) []byte {
+		rec := make([]byte, 5+len(seg))
+		rec[0], rec[1], rec[2] = 0x16, verMajor, verMinor
+		binary.BigEndian.PutUint16(rec[3:5], uint16(len(seg)))
+		copy(rec[5:], seg)
+		return rec
+	}
+
+	out := [][]byte{
+		makeRec(payload[:cut1]),
+		makeRec(payload[cut1:cut2]),
+		makeRec(payload[cut2:]),
+	}
+	if 5+recLen < len(raw) {
+		out = append(out, raw[5+recLen:])
+	}
+	return out
+}
+
 func findSNIOffset(raw []byte, sni string) (int, int) {
 	if sni == "" {
 		return -1, 0
@@ -237,6 +345,7 @@ type UTLSDialOptions struct {
 	ForceHTTP1ALPN   bool           // rewrite uTLS ALPN to ["http/1.1"] while preserving browser JA3/JA4 shape
 	InsecureTestOnly bool
 	ConnectTimeout   time.Duration
+	DialControl      func(network, address string, c syscall.RawConn) error
 }
 
 // UTLSDialResult contains the connected TLS socket and inspected peer certificate summary.
@@ -312,7 +421,7 @@ func dialUTLSOnce(ctx context.Context, opts UTLSDialOptions, profileName string,
 	if onUTLSDialAttempt != nil {
 		onUTLSDialAttempt(profileName)
 	}
-	dialer := &net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}
+	dialer := &net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second, Control: opts.DialControl}
 	rawConn, err := dialer.DialContext(ctx, "tcp", opts.Address)
 	if err != nil {
 		return nil, &tcpConnectError{err: err}

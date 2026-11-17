@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -453,13 +454,20 @@ type MuxManager struct {
 	mu           sync.Mutex
 	cfg          *EngineConfig
 	resolver     *DohResolver
+	autoTuner    *DPIAutoTuner
 	rootCAs      *x509.CertPool
 	insecureTest bool
 	clockOffset  atomic.Int64
+	netFP        atomic.Value
 
 	sessions    map[string]*ClientMuxSession // role -> primary active session
 	standby     *ClientMuxSession            // pre-warmed backup session
 	standbyNode NodeConfig
+
+	selector        *SmartNodeSelector
+	mediaPool       *MediaSessionPool
+	mediaScaleMu    sync.Mutex
+	dialControlProv func() func(network, address string, c syscall.RawConn) error
 
 	nodeStatuses map[string]NodeProbeStatus
 	activeProto  string
@@ -494,19 +502,67 @@ type NodeProbeStatus struct {
 
 // NewMuxManager creates a MuxManager and starts background Instant Wake + standby pre-warming if enabled.
 func NewMuxManager(cfg *EngineConfig, resolver *DohResolver) *MuxManager {
+	sel := NewSmartNodeSelector()
 	m := &MuxManager{
 		cfg:          cfg,
 		resolver:     resolver,
+		autoTuner:    NewDPIAutoTuner(""),
 		sessions:     make(map[string]*ClientMuxSession),
 		nodeStatuses: make(map[string]NodeProbeStatus),
+		selector:     sel,
+		mediaPool:    NewMediaSessionPool(),
 		activeProto:  "PWP-4",
 		utlsProfile:  "HelloChrome_Auto",
 		stopCh:       make(chan struct{}),
 	}
+	sel.SetTransportDeps(resolver, nil, false, &m.clockOffset)
+	m.netFP.Store(computeLocalInterfaceFingerprint())
 	if cfg != nil && strings.EqualFold(cfg.V2.UTLSProfile, "firefox") {
 		m.utlsProfile = "HelloFirefox_Auto"
 	}
 	return m
+}
+
+// SetDialControlProvider registers a dynamic callback returning a socket Control hook while TUN is active.
+func (m *MuxManager) SetDialControlProvider(fn func() func(network, address string, c syscall.RawConn) error) {
+	m.mu.Lock()
+	m.dialControlProv = fn
+	m.mu.Unlock()
+}
+
+func (m *MuxManager) getDialControl() func(network, address string, c syscall.RawConn) error {
+	m.mu.Lock()
+	prov := m.dialControlProv
+	m.mu.Unlock()
+	if prov != nil {
+		return prov()
+	}
+	return nil
+}
+
+// SetAutoTuner sets a custom DPIAutoTuner (useful in isolated tests).
+func (m *MuxManager) SetAutoTuner(t *DPIAutoTuner) {
+	m.mu.Lock()
+	m.autoTuner = t
+	m.mu.Unlock()
+}
+
+func (m *MuxManager) getAutoTuner() *DPIAutoTuner {
+	m.mu.Lock()
+	t := m.autoTuner
+	m.mu.Unlock()
+	return t
+}
+
+func (m *MuxManager) currentNetFingerprint() string {
+	if v, ok := m.netFP.Load().(string); ok && v != "" {
+		return v
+	}
+	fp := computeLocalInterfaceFingerprint()
+	if fp != "" {
+		m.netFP.Store(fp)
+	}
+	return fp
 }
 
 // StartMonitors launches clock-jump + interface-change Instant Wake detector and standby warm loop.
@@ -535,6 +591,9 @@ func (m *MuxManager) Close() {
 		m.standby = nil
 	}
 	m.mu.Unlock()
+	if m.mediaPool != nil {
+		m.mediaPool.CloseAll()
+	}
 }
 
 // UpdateConfig replaces the active config safely (e.g., after manifest refresh or activation).
@@ -559,10 +618,19 @@ func (m *MuxManager) OpenStream(ctx context.Context, role, targetHost string, ta
 	if role == "" {
 		role = "ai"
 	}
-	sess, err := m.getOrConnectRole(ctx, role)
+	var sess *ClientMuxSession
+	var err error
+	if strings.EqualFold(role, "media") {
+		sess, err = m.getOrConnectMediaSession(ctx)
+	} else {
+		sess, err = m.getOrConnectRole(ctx, role)
+	}
 	if err != nil {
 		if sb := m.promoteStandby(role); sb != nil {
 			m.failoverCount.Add(1)
+			if strings.EqualFold(role, "media") && m.mediaPool != nil {
+				m.mediaPool.Add(sb)
+			}
 			if st, serr := sb.OpenTCPStream(targetHost, targetPort, 3*time.Second); serr == nil {
 				if !m.isStopped() {
 					go m.ensureStandby(context.Background())
@@ -573,11 +641,27 @@ func (m *MuxManager) OpenStream(ctx context.Context, role, targetHost string, ta
 		return nil, "", err
 	}
 
-	failoverBudget := time.Duration(m.failoverTimeoutMs()) * time.Millisecond
-	if failoverBudget <= 0 || failoverBudget > 140*time.Millisecond {
-		failoverBudget = 130 * time.Millisecond
+	cfgMs := m.failoverTimeoutMs()
+	if cfgMs <= 0 {
+		cfgMs = 1200
 	}
-	halfWait := failoverBudget / 2
+	synProbeWait := time.Duration(cfgMs/2) * time.Millisecond
+	if synProbeWait < 30*time.Millisecond {
+		synProbeWait = 30 * time.Millisecond
+	}
+	pingTimeout := synProbeWait
+	if m.selector != nil {
+		if rttMs := m.selector.NodeEWMA(sess.Node()); rttMs > 0 {
+			minSyn := time.Duration(3*rttMs+250) * time.Millisecond
+			if synProbeWait < minSyn {
+				synProbeWait = minSyn
+			}
+			minPing := time.Duration(3*rttMs+300) * time.Millisecond
+			if pingTimeout < minPing {
+				pingTimeout = minPing
+			}
+		}
+	}
 
 	type openRes struct {
 		st  *ClientMuxStream
@@ -585,23 +669,24 @@ func (m *MuxManager) OpenStream(ctx context.Context, role, targetHost string, ta
 	}
 	resCh := make(chan openRes, 1)
 	go func() {
-		st, oerr := sess.OpenTCPStream(targetHost, targetPort, 4*time.Second)
+		st, oerr := sess.OpenTCPStream(targetHost, targetPort, 8*time.Second)
 		resCh <- openRes{st: st, err: oerr}
 	}()
 
 	var st *ClientMuxStream
 	var serr error
-	timer := time.NewTimer(halfWait)
+	muxStalled := false
+	timer := time.NewTimer(synProbeWait)
 	select {
 	case r := <-resCh:
 		timer.Stop()
 		st, serr = r.st, r.err
 	case <-timer.C:
-		// If SynAck did not arrive quickly and standby is ready, probe link with Ping inside remaining budget.
-		if m.hasStandby() {
+		// If SynAck did not arrive in time, standby is ready, and no recent mux RX occurred, probe link with Ping.
+		if m.hasStandby() && sess.TimeSinceLastRx() >= synProbeWait/2 {
 			pingCh := make(chan error, 1)
 			go func() {
-				_, perr := sess.Ping(halfWait)
+				_, perr := sess.Ping(pingTimeout)
 				pingCh <- perr
 			}()
 			select {
@@ -609,6 +694,7 @@ func (m *MuxManager) OpenStream(ctx context.Context, role, targetHost string, ta
 				st, serr = r.st, r.err
 			case perr := <-pingCh:
 				if perr != nil {
+					muxStalled = true
 					serr = fmt.Errorf("primary mux stalled (SynAck+Ping): %w", perr)
 				} else {
 					r := <-resCh
@@ -625,12 +711,23 @@ func (m *MuxManager) OpenStream(ctx context.Context, role, targetHost string, ta
 		return st, sess.Node().Name, nil
 	}
 
+	// Per-stream reset on a live mux session (e.g. target port closed or policy block) must NOT close the mux session.
+	if !muxStalled && !sess.IsClosed() && errors.Is(serr, ErrMuxStreamReset) {
+		return nil, sess.Node().Name, serr
+	}
+
 	// If session died / SynAck+Ping stalled, promote pre-warmed standby immediately
 	_ = sess.Close()
+	if strings.EqualFold(role, "media") && m.mediaPool != nil {
+		m.mediaPool.PruneClosed()
+	}
 	m.clearRoleSession(role, sess)
 	if sb := m.promoteStandby(role); sb != nil {
 		m.failoverCount.Add(1)
-		st2, serr2 := sb.OpenTCPStream(targetHost, targetPort, 4*time.Second)
+		if strings.EqualFold(role, "media") && m.mediaPool != nil {
+			m.mediaPool.Add(sb)
+		}
+		st2, serr2 := sb.OpenTCPStream(targetHost, targetPort, 8*time.Second)
 		if serr2 == nil {
 			go m.ensureStandby(context.Background())
 			return st2, sb.Node().Name, nil
@@ -638,12 +735,18 @@ func (m *MuxManager) OpenStream(ctx context.Context, role, targetHost string, ta
 	}
 
 	// Re-dial primary pool as final fallback
-	sess2, derr := m.getOrConnectRole(ctx, role)
+	var sess2 *ClientMuxSession
+	var derr error
+	if strings.EqualFold(role, "media") {
+		sess2, derr = m.getOrConnectMediaSession(ctx)
+	} else {
+		sess2, derr = m.getOrConnectRole(ctx, role)
+	}
 	if derr != nil {
 		return nil, "", derr
 	}
 	m.failoverCount.Add(1)
-	st3, serr3 := sess2.OpenTCPStream(targetHost, targetPort, 4*time.Second)
+	st3, serr3 := sess2.OpenTCPStream(targetHost, targetPort, 8*time.Second)
 	if serr3 != nil {
 		return nil, "", serr3
 	}
@@ -675,7 +778,102 @@ func (m *MuxManager) GetOrConnectSession(ctx context.Context, role string) (*Cli
 	if role == "" {
 		role = "ai"
 	}
+	if strings.EqualFold(role, "media") {
+		return m.getOrConnectMediaSession(ctx)
+	}
 	return m.getOrConnectRole(ctx, role)
+}
+
+func (m *MuxManager) getOrConnectMediaSession(ctx context.Context) (*ClientMuxSession, error) {
+	if m.isStopped() {
+		return nil, errors.New("mux manager closed")
+	}
+	if m.mediaPool == nil {
+		return m.getOrConnectRole(ctx, "media")
+	}
+	best, shouldScale := m.mediaPool.PickBest()
+	if best != nil && !shouldScale {
+		return best, nil
+	}
+	if best == nil {
+		sess, err := m.getOrConnectRole(ctx, "media")
+		if err != nil {
+			return nil, err
+		}
+		m.mediaPool.Add(sess)
+		return sess, nil
+	}
+	if !m.mediaScaleMu.TryLock() {
+		return best, nil
+	}
+	defer m.mediaScaleMu.Unlock()
+
+	best2, shouldScale2 := m.mediaPool.PickBest()
+	if best2 != nil && !shouldScale2 {
+		return best2, nil
+	}
+	if best2 == nil {
+		sess, err := m.getOrConnectRole(ctx, "media")
+		if err != nil {
+			return nil, err
+		}
+		m.mediaPool.Add(sess)
+		return sess, nil
+	}
+
+	newSess, err := m.dialFreshMediaSession(ctx)
+	if err != nil || newSess == nil {
+		if !best2.IsClosed() {
+			return best2, nil
+		}
+		return nil, err
+	}
+	m.mediaPool.Add(newSess)
+	return newSess, nil
+}
+
+func (m *MuxManager) dialFreshMediaSession(ctx context.Context) (*ClientMuxSession, error) {
+	m.mu.Lock()
+	candidates := m.selectCandidateNodesLocked("media")
+	m.mu.Unlock()
+	if len(candidates) == 0 {
+		return nil, errors.New("no upstream nodes configured")
+	}
+
+	var lastErr error
+	for _, node := range candidates {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if m.isStopped() {
+			return nil, errors.New("mux manager closed")
+		}
+		t0 := time.Now()
+		sess, utlsProf, err := m.dialSessionWithFallback(ctx, node)
+		lat := time.Since(t0).Milliseconds()
+		m.recordNodeProbe(node, err == nil, lat, sess)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if m.isStopped() {
+			_ = sess.Close()
+			return nil, errors.New("mux manager closed")
+		}
+		m.mu.Lock()
+		if m.sessions["media"] == nil || m.sessions["media"].IsClosed() {
+			m.sessions["media"] = sess
+		}
+		if utlsProf != "" {
+			m.utlsProfile = utlsProf
+		}
+		m.mu.Unlock()
+		return sess, nil
+	}
+	if lastErr == nil {
+		lastErr = errors.New("all media candidates failed")
+	}
+	return nil, lastErr
 }
 
 // TriggerInstantWake closes stale sessions immediately, resets cached state, promotes/re-dials
@@ -705,6 +903,9 @@ func (m *MuxManager) TriggerInstantWake(reason string) (failoverMs int64, err er
 	for _, s := range toClose {
 		_ = s.Close()
 	}
+	if m.mediaPool != nil {
+		m.mediaPool.CloseAll()
+	}
 
 	wctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
@@ -726,7 +927,7 @@ func (m *MuxManager) failoverTimeoutMs() int {
 	if m.cfg != nil && m.cfg.V2.FailoverTimeoutMs > 0 {
 		return m.cfg.V2.FailoverTimeoutMs
 	}
-	return 150
+	return 1200
 }
 
 func (m *MuxManager) clearRoleSession(role string, target *ClientMuxSession) {
@@ -754,8 +955,12 @@ func (m *MuxManager) promoteStandbyLocked(role string) *ClientMuxSession {
 
 func (m *MuxManager) promoteStandby(role string) *ClientMuxSession {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.promoteStandbyLocked(role)
+	sb := m.promoteStandbyLocked(role)
+	m.mu.Unlock()
+	if sb != nil && m.selector != nil {
+		m.selector.NotifyConnected(role, sb.Node())
+	}
+	return sb
 }
 
 func (m *MuxManager) hasRoleDedicatedCandidateLocked(role string) bool {
@@ -832,6 +1037,12 @@ func (m *MuxManager) storeWinningSession(role string, gen uint64, sess *ClientMu
 		m.utlsProfile = utlsProf
 	}
 	m.mu.Unlock()
+	if m.selector != nil {
+		m.selector.NotifyConnected(role, sess.Node())
+	}
+	if strings.EqualFold(role, "media") && m.mediaPool != nil {
+		m.mediaPool.Add(sess)
+	}
 	return sess
 }
 
@@ -908,6 +1119,9 @@ func (m *MuxManager) getOrConnectRole(ctx context.Context, role string) (*Client
 		if sb := m.promoteStandbyLocked(role); sb != nil {
 			m.failoverCount.Add(1)
 			m.mu.Unlock()
+			if m.selector != nil {
+				m.selector.NotifyConnected(role, sb.Node())
+			}
 			go m.ensureStandby(context.Background())
 			return sb, nil
 		}
@@ -1165,6 +1379,18 @@ func (m *MuxManager) selectCandidateNodesLocked(role string) []NodeConfig {
 			addUnique(&general, n)
 		}
 	}
+	prefRegion := ""
+	if m.cfg != nil {
+		prefRegion = m.cfg.PreferredRegion
+	}
+	if m.selector != nil {
+		if len(roleMatched) > 1 {
+			roleMatched = m.selector.RankCandidates(role, prefRegion, roleMatched)
+		}
+		if len(general) > 1 {
+			general = m.selector.RankCandidates(role, prefRegion, general)
+		}
+	}
 	return append(roleMatched, general...)
 }
 
@@ -1194,6 +1420,7 @@ func (m *MuxManager) dialSessionWithFallback(ctx context.Context, node NodeConfi
 	utlsProf := "chrome"
 	dpiProf := DPIProfile(node.FragProfile)
 	var pins []string
+	var decoySNIs []string
 	if cfg != nil {
 		preferPWP4 = cfg.V2.PreferPWP4
 		if cfg.V2.UTLSProfile != "" {
@@ -1203,6 +1430,7 @@ func (m *MuxManager) dialSessionWithFallback(ctx context.Context, node NodeConfi
 			dpiProf = DPIProfile(cfg.V2.DPIProfile)
 		}
 		pins = append(pins, cfg.PinnedSPKI...)
+		decoySNIs = append(decoySNIs, cfg.DecoySNIs...)
 	}
 
 	// Resolve host strictly over DoH when node.Host is a domain name (zero ISP DNS fallback/leak).
@@ -1225,22 +1453,29 @@ func (m *MuxManager) dialSessionWithFallback(ctx context.Context, node NodeConfi
 	if sni == "" {
 		sni = DefaultSNI
 	}
-	maskedDecoy := net.ParseIP(node.Host) != nil && !strings.EqualFold(sni, DefaultSNI) && !strings.HasSuffix(strings.ToLower(sni), ".pixelstore.space")
+	targetAddr := net.JoinHostPort(dialHost, strconv.Itoa(port))
+	tuner := m.getAutoTuner()
+	netFP := m.currentNetFingerprint()
+	allowDecoy := !isWSHost(node) && len(pins) > 0 && !insecure
 
 	dialOnceTLS := func() (*UTLSDialResult, error) {
-		return DialUTLS(ctx, UTLSDialOptions{
-			Address:          net.JoinHostPort(dialHost, strconv.Itoa(port)),
+		res, _, derr := tuner.DialAdaptiveTLS(ctx, AdaptiveDialOptions{
+			Address:          targetAddr,
 			SNI:              sni,
-			Profile:          utlsProf,
-			DPIProfile:       dpiProf,
+			BaseUTLSProfile:  utlsProf,
+			BaseDPIProfile:   dpiProf,
 			EnableSplit:      node.Frag || node.EnableDpiSplit,
-			MaskedDecoySNI:   maskedDecoy,
+			DecoySNIs:        decoySNIs,
+			AllowDecoySNI:    allowDecoy,
 			Pins:             pins,
 			RequirePin:       len(pins) > 0 && rootCAs == nil && !insecure,
 			RootCAs:          rootCAs,
 			ForceHTTP1ALPN:   true,
 			InsecureTestOnly: insecure,
+			NetFingerprint:   netFP,
+			DialControl:      m.getDialControl(),
 		})
+		return res, derr
 	}
 
 	usePWP4 := preferPWP4 && node.Mux && !isWSHost(node)
@@ -1261,6 +1496,9 @@ func (m *MuxManager) dialSessionWithFallback(ctx context.Context, node NodeConfi
 				continue
 			}
 			if !errors.Is(pErr, ErrPWP4Unsupported) {
+				if !errors.Is(pErr, ErrLicenseRejected) && tuner != nil {
+					tuner.Invalidate(netFP, targetAddr)
+				}
 				// Non-version-mismatch error (e.g. license error)
 				return nil, "", pErr
 			}
@@ -1279,6 +1517,9 @@ func (m *MuxManager) dialSessionWithFallback(ctx context.Context, node NodeConfi
 		_ = dRes3.Conn.Close()
 		if errors.Is(pErr3, ErrClockResynced) && attempt == 0 {
 			continue
+		}
+		if !errors.Is(pErr3, ErrLicenseRejected) && tuner != nil {
+			tuner.Invalidate(netFP, targetAddr)
 		}
 		return nil, "", pErr3
 	}
@@ -1303,26 +1544,35 @@ func (m *MuxManager) recordNodeProbe(node NodeConfig, online bool, latMs int64, 
 		PWP4Ready: pwp4,
 	}
 	m.mu.Unlock()
+	if m.selector != nil {
+		m.selector.RecordProbe(node, online, latMs)
+	}
 }
 
 // Snapshot returns current mux status metrics for telemetry and /__pixelcore/v4/status.
 type MuxManagerSnapshot struct {
-	Connected        bool
-	Protocol         string
-	UTLSProfile      string
-	ActiveNode       string
-	StandbyNode      string
-	StandbyReady     bool
-	FailoverCount    int64
-	InstantWakeCount int64
-	LastWakeReason   string
-	LastWakeUnix     int64
-	MuxStreams       int
-	ClockOffsetSec   int64
-	License          LicenseMetadata
-	BytesUp          int64
-	BytesDown        int64
-	Nodes            []NodeProbeStatus
+	Connected          bool
+	Protocol           string
+	UTLSProfile        string
+	DPIStrategy        string
+	AutoTunePromotions int64
+	DoHUpstream        string
+	ActiveNode         string
+	StandbyNode        string
+	StandbyReady       bool
+	FailoverCount      int64
+	InstantWakeCount   int64
+	LastWakeReason     string
+	LastWakeUnix       int64
+	MuxStreams         int
+	ClockOffsetSec     int64
+	License            LicenseMetadata
+	BytesUp            int64
+	BytesDown          int64
+	StickyAINode       string
+	AIMigrations       int64
+	MediaPoolConns     int
+	Nodes              []NodeProbeStatus
 }
 
 func (m *MuxManager) Snapshot() MuxManagerSnapshot {
@@ -1338,6 +1588,13 @@ func (m *MuxManager) Snapshot() MuxManagerSnapshot {
 		LastWakeUnix:     m.lastWakeUnix,
 		ClockOffsetSec:   m.clockOffset.Load(),
 	}
+	if m.autoTuner != nil {
+		snap.DPIStrategy = m.autoTuner.ActiveStrategy()
+		snap.AutoTunePromotions = m.autoTuner.Promotions()
+	}
+	if m.resolver != nil {
+		snap.DoHUpstream = m.resolver.ActiveUpstream()
+	}
 	if s := m.sessions["ai"]; s != nil && !s.IsClosed() {
 		snap.Connected = true
 		snap.Protocol = s.Protocol()
@@ -1352,6 +1609,13 @@ func (m *MuxManager) Snapshot() MuxManagerSnapshot {
 		snap.StandbyNode = m.standby.Node().Name
 	} else {
 		snap.StandbyNode = m.standbyNode.Name
+	}
+	if m.selector != nil {
+		snap.StickyAINode = m.selector.StickyAINode()
+		snap.AIMigrations = m.selector.AIMigrations()
+	}
+	if m.mediaPool != nil {
+		snap.MediaPoolConns = m.mediaPool.Size()
 	}
 	for _, ns := range m.nodeStatuses {
 		snap.Nodes = append(snap.Nodes, ns)
@@ -1375,17 +1639,23 @@ func (m *MuxManager) instantWakeWatchLoop() {
 			delta := now.Sub(lastWall)
 			lastWall = now
 			if delta > 3*time.Second || delta < -3*time.Second {
+				fp := computeLocalInterfaceFingerprint()
+				m.netFP.Store(fp)
 				_, _ = m.TriggerInstantWake("clock_jump")
-				lastIfFingerprint = computeLocalInterfaceFingerprint()
+				lastIfFingerprint = fp
 				continue
 			}
 
 			// Check active interface IP changes
 			curFP := computeLocalInterfaceFingerprint()
 			if curFP != "" && lastIfFingerprint != "" && curFP != lastIfFingerprint {
+				m.netFP.Store(curFP)
 				lastIfFingerprint = curFP
 				_, _ = m.TriggerInstantWake("network_change")
 				continue
+			}
+			if curFP != "" {
+				m.netFP.Store(curFP)
 			}
 			lastIfFingerprint = curFP
 		}
@@ -1407,27 +1677,142 @@ func (m *MuxManager) standbyMaintenanceLoop() {
 			m.mu.Unlock()
 
 			if primary != nil && !primary.IsClosed() {
+				tPing := time.Now()
 				if _, err := primary.Ping(2 * time.Second); err != nil {
+					m.recordNodeProbe(primary.Node(), false, time.Since(tPing).Milliseconds(), primary)
 					_ = primary.Close()
 					m.clearRoleSession("ai", primary)
 					if newActive := m.promoteStandby("ai"); newActive != nil {
 						m.failoverCount.Add(1)
 					}
+				} else {
+					m.recordNodeProbe(primary.Node(), true, time.Since(tPing).Milliseconds(), primary)
+					m.checkAndMigrateAI(context.Background())
 				}
 			}
 
+			m.mu.Lock()
+			sb = m.standby
+			m.mu.Unlock()
 			if sb == nil || sb.IsClosed() {
 				m.ensureStandby(context.Background())
-			} else if _, err := sb.Ping(2 * time.Second); err != nil {
-				_ = sb.Close()
-				m.mu.Lock()
-				if m.standby == sb {
-					m.standby = nil
+			} else {
+				tSb := time.Now()
+				if _, err := sb.Ping(2 * time.Second); err != nil {
+					m.recordNodeProbe(sb.Node(), false, time.Since(tSb).Milliseconds(), sb)
+					_ = sb.Close()
+					m.mu.Lock()
+					if m.standby == sb {
+						m.standby = nil
+					}
+					m.mu.Unlock()
+					m.ensureStandby(context.Background())
+				} else {
+					m.recordNodeProbe(sb.Node(), true, time.Since(tSb).Milliseconds(), sb)
 				}
-				m.mu.Unlock()
-				m.ensureStandby(context.Background())
 			}
 		}
+	}
+}
+
+func (m *MuxManager) checkAndMigrateAI(ctx context.Context) {
+	if m.selector == nil || m.isStopped() {
+		return
+	}
+	m.mu.Lock()
+	primary := m.sessions["ai"]
+	sb := m.standby
+	cfg := m.cfg
+	rootCAs := m.rootCAs
+	insecure := m.insecureTest
+	candidates := m.selectCandidateNodesLocked("ai")
+	gen := m.connectGen.Load()
+	m.mu.Unlock()
+
+	if primary == nil || primary.IsClosed() || len(candidates) <= 1 {
+		return
+	}
+	m.selector.SetTransportDeps(m.resolver, rootCAs, insecure, &m.clockOffset)
+
+	pctx, pcancel := context.WithTimeout(ctx, 4*time.Second)
+	_, _ = m.selector.ProbeSessionAIPulse(pctx, primary, primary.Node(), cfg)
+	pcancel()
+
+	if !m.selector.ShouldMigrateAI(candidates) {
+		return
+	}
+
+	if sb != nil && !sb.IsClosed() && !sameEndpoint(sb.Node(), primary.Node()) {
+		sctx, scancel := context.WithTimeout(ctx, 4*time.Second)
+		sbPulse, sbErr := m.selector.ProbeSessionAIPulse(sctx, sb, sb.Node(), cfg)
+		scancel()
+		if sbErr == nil && !isAIPulseDegraded(sbPulse) {
+			var promoted *ClientMuxSession
+			m.mu.Lock()
+			if !m.isStopped() && m.connectGen.Load() == gen && m.sessions["ai"] == primary && m.standby == sb && !sb.IsClosed() {
+				promoted = m.promoteStandbyLocked("ai")
+			}
+			m.mu.Unlock()
+			if promoted != nil {
+				m.selector.NotifyConnected("ai", promoted.Node())
+				_ = primary.Close()
+				if !m.isStopped() {
+					go m.ensureStandby(context.Background())
+				}
+				return
+			}
+		}
+	}
+
+	prefRegion := ""
+	if cfg != nil {
+		prefRegion = cfg.PreferredRegion
+	}
+	ranked := m.selector.RankCandidates("ai", prefRegion, candidates)
+	for _, cand := range ranked {
+		if m.isStopped() || ctx.Err() != nil {
+			return
+		}
+		if sameEndpoint(cand, primary.Node()) {
+			continue
+		}
+		dctx, dcancel := context.WithTimeout(ctx, 6*time.Second)
+		t0 := time.Now()
+		newSess, utlsProf, err := m.dialSessionWithFallback(dctx, cand)
+		dcancel()
+		m.recordNodeProbe(cand, err == nil, time.Since(t0).Milliseconds(), newSess)
+		if err != nil || newSess == nil {
+			continue
+		}
+		pctx2, pcancel2 := context.WithTimeout(ctx, 4*time.Second)
+		pulse2, perr2 := m.selector.ProbeSessionAIPulse(pctx2, newSess, cand, cfg)
+		pcancel2()
+		if perr2 == nil && isAIPulseDegraded(pulse2) {
+			_ = newSess.Close()
+			continue
+		}
+
+		var replaced bool
+		m.mu.Lock()
+		if !m.isStopped() && m.connectGen.Load() == gen && m.sessions["ai"] == primary {
+			m.sessions["ai"] = newSess
+			m.activeProto = newSess.Protocol()
+			if utlsProf != "" {
+				m.utlsProfile = utlsProf
+			}
+			replaced = true
+		}
+		m.mu.Unlock()
+		if !replaced {
+			_ = newSess.Close()
+			return
+		}
+		m.selector.NotifyConnected("ai", newSess.Node())
+		_ = primary.Close()
+		if !m.isStopped() {
+			go m.ensureStandby(context.Background())
+		}
+		return
 	}
 }
 

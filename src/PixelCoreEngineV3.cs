@@ -980,7 +980,7 @@ namespace PixelTunnel
 
     public static class PixelCoreService
     {
-        public const string ENGINE_VERSION = "2.1.0";
+        public const string ENGINE_VERSION = "2.1.2";
         private const string DEFAULT_HOST = "185.103.103.162";
         private const string DEFAULT_SNI = "ai.pixelstore.space";
         private const int WARM_POOL_TARGET = 2;

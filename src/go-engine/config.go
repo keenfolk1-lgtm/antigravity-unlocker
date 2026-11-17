@@ -19,7 +19,7 @@ import (
 
 const (
 	EngineName    = "PixelCore_v4_Go"
-	EngineVersion = "2.1.0"
+	EngineVersion = "2.1.2"
 
 	DefaultHost              = "185.103.103.162"
 	DefaultSNI               = "ai.pixelstore.space"
@@ -106,16 +106,58 @@ var CategoryDomains = func() map[string][]string {
 	telegram := []string{
 		"telegram.org",
 		"t.me",
+		"tx.me",
 		"web.telegram.org",
 		"tdesktop.com",
 		"telegra.ph",
 		"telesco.pe",
+		"telegram-cdn.org",
+		"cdn-telegram.org",
+		"usercontent.dev",
 	}
 	media := make([]string, 0, len(discord)+len(youtube)+len(telegram)+3)
 	media = append(media, discord...)
 	media = append(media, youtube...)
 	media = append(media, telegram...)
 	media = append(media, "twitch.tv", "ttvnw.net", "jtvnw.net")
+
+	social := []string{
+		"x.com",
+		"twitter.com",
+		"twimg.com",
+		"t.co",
+		"instagram.com",
+		"cdninstagram.com",
+		"facebook.com",
+		"fbcdn.net",
+		"threads.net",
+		"tiktok.com",
+		"linkedin.com",
+		"spotify.com",
+		"spotify.net",
+		"scdn.co",
+		"spotifycdn.com",
+		"pscdn.co",
+		"byspotify.com",
+		"spotify.link",
+		"spotilocal.com",
+		"spclient.wg.spotify.com",
+		"apresolve.spotify.com",
+		"dealer.spotify.com",
+		"login5.spotify.com",
+		"accounts.spotify.com",
+		"open.spotify.com",
+		"akamaized.net",
+		"netflix.com",
+		"nflxvideo.net",
+		"notion.so",
+		"figma.com",
+		"canva.com",
+		"vercel.com",
+		"stripe.com",
+		"linear.app",
+	}
+	social = append(social, telegram...)
 
 	return map[string][]string{
 		"antigravity": {
@@ -211,42 +253,7 @@ var CategoryDomains = func() map[string][]string {
 		"discord":  discord,
 		"youtube":  youtube,
 		"telegram": telegram,
-		"social": {
-			"x.com",
-			"twitter.com",
-			"twimg.com",
-			"t.co",
-			"instagram.com",
-			"cdninstagram.com",
-			"facebook.com",
-			"fbcdn.net",
-			"threads.net",
-			"tiktok.com",
-			"linkedin.com",
-			"spotify.com",
-			"spotify.net",
-			"scdn.co",
-			"spotifycdn.com",
-			"pscdn.co",
-			"byspotify.com",
-			"spotify.link",
-			"spotilocal.com",
-			"spclient.wg.spotify.com",
-			"apresolve.spotify.com",
-			"dealer.spotify.com",
-			"login5.spotify.com",
-			"accounts.spotify.com",
-			"open.spotify.com",
-			"akamaized.net",
-			"netflix.com",
-			"nflxvideo.net",
-			"notion.so",
-			"figma.com",
-			"canva.com",
-			"vercel.com",
-			"stripe.com",
-			"linear.app",
-		},
+		"social":   social,
 	}
 }()
 
@@ -341,6 +348,7 @@ type V2Config struct {
 	StandbyEnabled    bool            `json:"standby_enabled"`
 	FailoverTimeoutMs int             `json:"failover_timeout_ms"`
 	WSLBridge         bool            `json:"wsl_bridge"`
+	TunMode           bool            `json:"tun_mode"`
 	SmartPAC          bool            `json:"smart_pac"`
 	PACRev            uint64          `json:"pac_rev,omitempty"`
 	ProxyAll          bool            `json:"proxy_all"`
@@ -438,7 +446,7 @@ func DefaultEngineConfig() *EngineConfig {
 			UTLSProfile:       "chrome",
 			DPIProfile:        0,
 			StandbyEnabled:    true,
-			FailoverTimeoutMs: 150,
+			FailoverTimeoutMs: 1200,
 			SmartPAC:          true,
 			PACRev:            1,
 			PreferRoleRouting: true,
@@ -476,6 +484,7 @@ type activeConfigRaw struct {
 		StandbyEnabled    *bool           `json:"standby_enabled"`
 		FailoverTimeoutMs *int            `json:"failover_timeout_ms"`
 		WSLBridge         *bool           `json:"wsl_bridge"`
+		TunMode           *bool           `json:"tun_mode"`
 		SmartPAC          *bool           `json:"smart_pac"`
 		PACRev            uint64          `json:"pac_rev"`
 		ProxyAll          *bool           `json:"proxy_all"`
@@ -528,6 +537,7 @@ type activeConfigRaw struct {
 	HTTPPort          int             `json:"http_port"`
 	SOCKSPort         int             `json:"socks_port"`
 	EnableWSLBridge   *bool           `json:"wsl_bridge"`
+	TunMode           *bool           `json:"tun_mode"`
 	Address           string          `json:"address"`
 	ID                string          `json:"id"`
 	ServerName        string          `json:"serverName"`
@@ -608,6 +618,9 @@ func LoadConfigBytes(raw []byte) (*EngineConfig, error) {
 	}
 	if doc.EnableWSLBridge != nil {
 		cfg.EnableWSLBridge = *doc.EnableWSLBridge
+	}
+	if doc.TunMode != nil {
+		cfg.V2.TunMode = *doc.TunMode
 	}
 	if doc.PreferredRegion != "" {
 		cfg.PreferredRegion = strings.TrimSpace(doc.PreferredRegion)
@@ -731,8 +744,16 @@ func LoadConfigBytes(raw []byte) (*EngineConfig, error) {
 		cfg.ActiveNode.PWP4Path = effectiveTopPWP4Path
 	}
 
-	// Normalize legacy Reality cluster keys (e.g., node.pixelstore.space:8443 with SNI www.amd.com)
-	// when no explicit PWP port or secret was supplied.
+	// Normalize legacy Reality cluster keys (e.g., 201.34.152.97 / node.pixelstore.space:8443 with SNI www.amd.com).
+	if normHost, wasLegacy := normalizeLegacyClusterHost(cfg.ActiveNode.Host); wasLegacy {
+		cfg.ActiveNode.Host = normHost
+		if !hasExplicitPWPPort && (cfg.ActiveNode.Port <= 0 || cfg.ActiveNode.Port == 8443 || cfg.ActiveNode.Port == 2053) {
+			cfg.ActiveNode.Port = 443
+		}
+		if strings.TrimSpace(cfg.ActiveNode.SNI) == "" || isLegacyDecoySNI(cfg.ActiveNode.SNI) {
+			cfg.ActiveNode.SNI = DefaultSNI
+		}
+	}
 	if hasExplicitEndpoint && isClusterHost(cfg.ActiveNode.Host) && !hasExplicitPWPPort && !hasExplicitSecret {
 		cfg.ActiveNode.Port = 443
 		if strings.HasPrefix(strings.ToLower(cfg.ActiveNode.Host), "ws.") {
@@ -744,6 +765,15 @@ func LoadConfigBytes(raw []byte) (*EngineConfig, error) {
 
 	if len(doc.Nodes) > 0 {
 		for i := range doc.Nodes {
+			if normHost, wasLegacy := normalizeLegacyClusterHost(doc.Nodes[i].Host); wasLegacy {
+				doc.Nodes[i].Host = normHost
+				if doc.Nodes[i].Port <= 0 || doc.Nodes[i].Port == 8443 || doc.Nodes[i].Port == 2053 {
+					doc.Nodes[i].Port = 443
+				}
+				if strings.TrimSpace(doc.Nodes[i].SNI) == "" || isLegacyDecoySNI(doc.Nodes[i].SNI) {
+					doc.Nodes[i].SNI = DefaultSNI
+				}
+			}
 			doc.Nodes[i].PWP4Path = normalizePWP4Path(doc.Nodes[i].PWP4Path)
 		}
 		cfg.Nodes = doc.Nodes
@@ -844,6 +874,9 @@ func LoadConfigBytes(raw []byte) (*EngineConfig, error) {
 			cfg.EnableWSLBridge = *doc.V2.WSLBridge
 			cfg.V2.WSLBridge = *doc.V2.WSLBridge
 		}
+		if doc.V2.TunMode != nil {
+			cfg.V2.TunMode = *doc.V2.TunMode
+		}
 		if doc.V2.SmartPAC != nil {
 			cfg.V2.SmartPAC = *doc.V2.SmartPAC
 		}
@@ -926,6 +959,27 @@ func normalizePWP4Path(p string) string {
 		return DefaultPWP4Path
 	}
 	return trimmed
+}
+
+func normalizeLegacyClusterHost(host string) (string, bool) {
+	raw := strings.TrimSpace(host)
+	clean := strings.ToLower(strings.Trim(raw, "[]"))
+	switch clean {
+	case "201.34.152.97", "147.45.135.71", "node.pixelstore.space":
+		return DefaultHost, true
+	default:
+		return raw, false
+	}
+}
+
+func isLegacyDecoySNI(sni string) bool {
+	clean := strings.ToLower(strings.Trim(strings.TrimSpace(sni), "[]"))
+	switch clean {
+	case "www.amd.com", "node.pixelstore.space", "201.34.152.97", "147.45.135.71":
+		return true
+	default:
+		return false
+	}
 }
 
 func isClusterHost(host string) bool {
@@ -1133,6 +1187,9 @@ func (cfg *EngineConfig) RebuildEffectiveRules() {
 	}
 
 	for _, d := range BuiltinDirectDomains {
+		addDirect(d)
+	}
+	for _, d := range RUEcosystemDomains {
 		addDirect(d)
 	}
 	for _, d := range cfg.DirectDomains {
@@ -1387,6 +1444,15 @@ func ParseKeyInput(raw string) (*ParsedKey, error) {
 			if sni == "" {
 				sni = q.Get("servername")
 			}
+			if normHost, wasLegacy := normalizeLegacyClusterHost(host); wasLegacy {
+				host = normHost
+				if port == 8443 || port == 2053 {
+					port = 443
+				}
+				if strings.TrimSpace(sni) == "" || isLegacyDecoySNI(sni) {
+					sni = DefaultSNI
+				}
+			}
 			if sni == "" {
 				sni = DefaultSNI
 			}
@@ -1427,16 +1493,86 @@ type RuleAction struct {
 	Role   string // "ai" or "media"
 }
 
+var telegramDCNets = func() []*net.IPNet {
+	cidrs := []string{
+		"149.154.160.0/20",
+		"91.108.4.0/22",
+		"91.108.8.0/22",
+		"91.108.12.0/22",
+		"91.108.16.0/22",
+		"91.108.20.0/22",
+		"91.108.56.0/22",
+		"91.105.192.0/23",
+		"185.76.151.0/24",
+	}
+	nets := make([]*net.IPNet, 0, len(cidrs))
+	for _, c := range cidrs {
+		if _, ipNet, err := net.ParseCIDR(c); err == nil {
+			nets = append(nets, ipNet)
+		}
+	}
+	return nets
+}()
+
+// IsTelegramDCIP returns true if ip is an IPv4 address belonging to an official Telegram MTProto DC CIDR.
+func IsTelegramDCIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	v4 := ip.To4()
+	if v4 == nil {
+		return false
+	}
+	for _, ipNet := range telegramDCNets {
+		if ipNet.Contains(v4) {
+			return true
+		}
+	}
+	return false
+}
+
+var discordVoiceNets = func() []*net.IPNet {
+	cidrs := []string{
+		"66.22.192.0/18",
+	}
+	nets := make([]*net.IPNet, 0, len(cidrs))
+	for _, c := range cidrs {
+		if _, ipNet, err := net.ParseCIDR(c); err == nil {
+			nets = append(nets, ipNet)
+		}
+	}
+	return nets
+}()
+
+// IsDiscordVoiceIP returns true if ip is an IPv4 address belonging to a known Discord Voice media CIDR.
+func IsDiscordVoiceIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	v4 := ip.To4()
+	if v4 == nil {
+		return false
+	}
+	for _, ipNet := range discordVoiceNets {
+		if ipNet.Contains(v4) {
+			return true
+		}
+	}
+	return false
+}
+
 // DomainRuleMatcher decides PROXY vs DIRECT synchronously with zero DNS lookups.
 type DomainRuleMatcher struct {
-	mu           sync.RWMutex
-	proxyAll     bool
-	exactDirect  map[string]struct{}
-	suffixDirect []string
-	exactProxy   map[string]string // domain -> rule label
-	suffixProxy  []suffixRule
-	aiSuffixes   []string
-	mediaSuffix  []string
+	mu                sync.RWMutex
+	proxyAll          bool
+	routeTelegramDC   bool
+	routeDiscordMedia bool
+	exactDirect       map[string]struct{}
+	suffixDirect      []string
+	exactProxy        map[string]string // domain -> rule label
+	suffixProxy       []suffixRule
+	aiSuffixes        []string
+	mediaSuffix       []string
 }
 
 type suffixRule struct {
@@ -1469,10 +1605,10 @@ func (m *DomainRuleMatcher) UpdateFromConfig(cfg *EngineConfig) {
 		"localhost.localdomain": {},
 	}
 	var suffixDirect []string
-	for _, pat := range cfg.DirectDomains {
+	addDirectRule := func(pat string) {
 		p := normalizeDomainPattern(pat)
 		if p == "" {
-			continue
+			return
 		}
 		if strings.HasPrefix(p, ".") {
 			suffixDirect = append(suffixDirect, p)
@@ -1480,6 +1616,12 @@ func (m *DomainRuleMatcher) UpdateFromConfig(cfg *EngineConfig) {
 			exactDirect[p] = struct{}{}
 			suffixDirect = append(suffixDirect, "."+p)
 		}
+	}
+	for _, pat := range RUEcosystemDomains {
+		addDirectRule(pat)
+	}
+	for _, pat := range cfg.DirectDomains {
+		addDirectRule(pat)
 	}
 
 	// Build labeled proxy map from categories + custom + explicit rules
@@ -1517,13 +1659,29 @@ func (m *DomainRuleMatcher) UpdateFromConfig(cfg *EngineConfig) {
 		addProxyRule(d, "custom_proxy")
 	}
 
+	routeTelegramDC := cfg.Categories["social"] || cfg.Categories["telegram"] || cfg.Categories["media"] || exactProxy["telegram.org"] != ""
+	routeDiscordMedia := cfg.Categories["media"] || cfg.Categories["discord"] || exactProxy["discord.media"] != "" || exactProxy["discord.com"] != ""
+
 	m.mu.Lock()
 	m.proxyAll = cfg.ProxyAll
+	m.routeTelegramDC = routeTelegramDC
+	m.routeDiscordMedia = routeDiscordMedia
 	m.exactDirect = exactDirect
 	m.suffixDirect = suffixDirect
 	m.exactProxy = exactProxy
 	m.suffixProxy = suffixProxy
 	m.mu.Unlock()
+}
+
+// AllowsRawVoiceUDP returns true when media/Discord voice routing is enabled for raw-IP voice UDP flows.
+func (m *DomainRuleMatcher) AllowsRawVoiceUDP() bool {
+	if m == nil {
+		return false
+	}
+	m.mu.RLock()
+	ok := m.proxyAll || m.routeDiscordMedia
+	m.mu.RUnlock()
+	return ok
 }
 
 // Classify decides PROXY vs DIRECT and AI vs Media role for host without any DNS call.
@@ -1533,10 +1691,23 @@ func (m *DomainRuleMatcher) Classify(host string) RuleAction {
 		return RuleAction{Action: "DIRECT", Rule: "empty", Role: "ai"}
 	}
 
-	// Always direct loopback / private / link-local IP literals
+	// Always direct loopback / private / link-local IP literals, and genuine Russian CIDRs
 	if ip := net.ParseIP(h); ip != nil {
 		if IsPrivateOrReservedIP(ip) {
 			return RuleAction{Action: "DIRECT", Rule: "private_ip", Role: "ai"}
+		}
+		if IsRussianIP(ip) {
+			return RuleAction{Action: "DIRECT", Rule: "ru_cidr", Role: "ai"}
+		}
+		m.mu.RLock()
+		routeTG := m.routeTelegramDC
+		routeDiscord := m.routeDiscordMedia
+		m.mu.RUnlock()
+		if routeTG && IsTelegramDCIP(ip) {
+			return RuleAction{Action: "PROXY", Rule: "telegram_dc", Role: "media"}
+		}
+		if routeDiscord && IsDiscordVoiceIP(ip) {
+			return RuleAction{Action: "PROXY", Rule: "discord_voice_ip", Role: "media"}
 		}
 	}
 

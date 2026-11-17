@@ -8,8 +8,8 @@ import (
 
 // GenerateSmartPACJS generates a zero-DNS Smart PAC script with ZERO dnsResolve() calls.
 // Matching rules:
-//   - .ru, .рф (.xn--p1ai), .su, .by, localhost, private CIDRs, direct list -> DIRECT
-//   - enabled proxy categories & custom proxy list (or proxy_all) -> PROXY <host>:<http>; SOCKS5 <host>:<socks>; DIRECT
+//   - .ru, .рф (.xn--p1ai), .su, .by, RU ecosystem domains, localhost, private CIDRs, direct list -> DIRECT
+//   - enabled proxy categories & custom proxy list (or proxy_all) -> PROXY <host>:<http>; SOCKS5 <host>:<socks>
 func GenerateSmartPACJS(cfg *EngineConfig, proxyHost string) string {
 	if proxyHost == "" {
 		proxyHost = "127.0.0.1"
@@ -31,18 +31,42 @@ func GenerateSmartPACJS(cfg *EngineConfig, proxyHost string) string {
 		proxyAll = cfg.ProxyAll
 	}
 
-	directJSON, _ := json.Marshal(directList)
+	mergedDirect := mergeUniquePACDomains(directList, RUEcosystemDomains)
+	if proxyList == nil {
+		proxyList = []string{}
+	}
+
+	routeTgDC := false
+	if cfg != nil && (cfg.Categories["social"] || cfg.Categories["telegram"] || cfg.Categories["media"]) {
+		routeTgDC = true
+	}
+	if !routeTgDC {
+		for _, p := range proxyList {
+			if normalizeDomainPattern(p) == "telegram.org" {
+				routeTgDC = true
+				break
+			}
+		}
+	}
+
+	directJSON, _ := json.Marshal(mergedDirect)
 	proxyJSON, _ := json.Marshal(proxyList)
-	proxyReturn := fmt.Sprintf("PROXY %s:%d; SOCKS5 %s:%d; DIRECT", proxyHost, httpPort, proxyHost, socksPort)
+	proxyReturn := fmt.Sprintf("PROXY %s:%d; SOCKS5 %s:%d", proxyHost, httpPort, proxyHost, socksPort)
 
 	var b strings.Builder
-	b.WriteString("// PixelTunnel Smart PAC v2.0 (Zero local DNS queries)\n")
+	b.WriteString("// PixelTunnel Smart PAC v2.1 (Zero local DNS queries)\n")
 	b.WriteString("var DIRECT_RULES = ")
 	b.Write(directJSON)
 	b.WriteString(";\nvar PROXY_RULES = ")
 	b.Write(proxyJSON)
 	b.WriteString(";\nvar PROXY_ALL = ")
 	if proxyAll {
+		b.WriteString("true")
+	} else {
+		b.WriteString("false")
+	}
+	b.WriteString(";\nvar ROUTE_TG_DC = ")
+	if routeTgDC {
 		b.WriteString("true")
 	} else {
 		b.WriteString("false")
@@ -76,6 +100,18 @@ function _isPrivateIPLiteral(h) {
   return false;
 }
 
+function _isTelegramDCIP(h) {
+  var m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
+  if (!m) return false;
+  var a = parseInt(m[1], 10), b = parseInt(m[2], 10), c = parseInt(m[3], 10), d = parseInt(m[4], 10);
+  if (a > 255 || b > 255 || c > 255 || d > 255) return false;
+  if (a === 149 && b === 154 && (c & 240) === 160) return true;
+  if (a === 91 && b === 108 && ((c & 252) === 4 || (c & 252) === 8 || (c & 252) === 12 || (c & 252) === 16 || (c & 252) === 20 || (c & 252) === 56)) return true;
+  if (a === 91 && b === 105 && (c & 254) === 192) return true;
+  if (a === 185 && b === 76 && c === 151) return true;
+  return false;
+}
+
 function FindProxyForURL(url, host) {
   var h = (host || '').toLowerCase().replace(/\.$/, '');
   if (!h || isPlainHostName(h) || _isPrivateIPLiteral(h)) {
@@ -86,6 +122,9 @@ function FindProxyForURL(url, host) {
   }
   for (var i = 0; i < DIRECT_RULES.length; i++) {
     if (_matchRule(h, DIRECT_RULES[i])) return 'DIRECT';
+  }
+  if (ROUTE_TG_DC && _isTelegramDCIP(h)) {
+    return PROXY_CHAIN;
   }
   if (PROXY_ALL) {
     return PROXY_CHAIN;
@@ -98,3 +137,27 @@ function FindProxyForURL(url, host) {
 `)
 	return b.String()
 }
+
+func mergeUniquePACDomains(lists ...[]string) []string {
+	total := 0
+	for _, list := range lists {
+		total += len(list)
+	}
+	seen := make(map[string]struct{}, total)
+	out := make([]string, 0, total)
+	for _, list := range lists {
+		for _, raw := range list {
+			norm := normalizeDomainPattern(raw)
+			if norm == "" {
+				continue
+			}
+			if _, ok := seen[norm]; ok {
+				continue
+			}
+			seen[norm] = struct{}{}
+			out = append(out, norm)
+		}
+	}
+	return out
+}
+

@@ -96,10 +96,13 @@ func TestDoHSinkholeGuardAndZeroDNSSmartPAC(t *testing.T) {
 	if strings.Contains(pac, "dnsResolve") {
 		t.Fatalf("PAC must NEVER contain dnsResolve calls")
 	}
-	for _, mustInclude := range []string{".ru", ".xn--p1ai", ".su", ".by", "PROXY 127.0.0.1:17890; SOCKS5 127.0.0.1:17891; DIRECT"} {
+	for _, mustInclude := range []string{".ru", ".xn--p1ai", ".su", ".by", "PROXY 127.0.0.1:17890; SOCKS5 127.0.0.1:17891"} {
 		if !strings.Contains(pac, mustInclude) {
 			t.Fatalf("PAC missing %q", mustInclude)
 		}
+	}
+	if strings.Contains(pac, "17891; DIRECT") {
+		t.Fatalf("PAC must not fall back to DIRECT after SOCKS5 proxy chain")
 	}
 
 	matcher := NewDomainRuleMatcher(cfg)

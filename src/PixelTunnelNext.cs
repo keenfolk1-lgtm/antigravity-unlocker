@@ -35,8 +35,8 @@ using ShapePath = System.Windows.Shapes.Path;
 [assembly: AssemblyTrademark("")]
 [assembly: AssemblyCulture("")]
 [assembly: ComVisible(false)]
-[assembly: AssemblyVersion("2.1.0.0")]
-[assembly: AssemblyFileVersion("2.1.0.0")]
+[assembly: AssemblyVersion("2.1.2.0")]
+[assembly: AssemblyFileVersion("2.1.2.0")]
 [assembly: System.Runtime.Versioning.TargetFramework(".NETFramework,Version=v4.8", FrameworkDisplayName = ".NET Framework 4.8")]
 
 namespace PixelTunnel
@@ -487,7 +487,7 @@ namespace PixelTunnel
         public static string GetFreeModeSentinelUri() { return "pwp3://free@ai.pixelstore.space:443#PixelTunnel-Free"; }
         private static string GetDefaultClusterHost() { return "ai.pixelstore.space"; }
 
-        public const string APP_VERSION = "2.1.0";
+        public const string APP_VERSION = "2.1.2";
         public const string IPC_PIPE_NAME = "Local\\PixelTunnel_IPC_v2";
         private const string CORE_EXE_NAME = "pixel-tun-core";
         private const int LOCAL_MIXED_PORT = 17890;
@@ -503,6 +503,7 @@ namespace PixelTunnel
         private static long _foreign7890DeadCheckedTicks = 0;
         private static bool _useSmartPacMode = true;
         private static bool _optWslBridge = false;
+        private static bool _optTunMode = false;
         private CancellationTokenSource _deepLinkPipeCts;
         private readonly string _initialDeepLinkUri;
         private int _pulseTickCounter = 0;
@@ -1132,6 +1133,7 @@ namespace PixelTunnel
             if (string.IsNullOrEmpty(flags)) return;
             _useSmartPacMode = !flags.Contains("PAC=0");
             _optWslBridge = flags.Contains("WSL=1");
+            _optTunMode = (flags.Contains("MEDIA=1") || flags.Contains("WEB=1")) && flags.Contains("TUN=1");
             var mReg = Regex.Match(flags, @"REG=(auto|nl|us)", RegexOptions.IgnoreCase);
             if (mReg.Success) _selectedRegion = mReg.Groups[1].Value.ToLowerInvariant();
         }
@@ -1936,7 +1938,7 @@ namespace PixelTunnel
 
             _pingLabel = new TextBlock
             {
-                Text = "SMART TUN",
+                Text = "PWP-4 MUX",
                 Foreground = new SolidColorBrush(ColText3),
                 FontFamily = new FontFamily("Consolas, monospace"),
                 FontSize = 11,
@@ -2303,7 +2305,47 @@ namespace PixelTunnel
                 out _chkMarkWeb,
                 delegate
                 {
-                    _optSocialWeb = !_optSocialWeb;
+                    if (!_optSocialWeb)
+                    {
+                        _optSocialWeb = true;
+                        if (IsAdministratorStatic())
+                        {
+                            if (_optTunMode || IsTelegramDesktopDetected())
+                            {
+                                _optTunMode = true;
+                            }
+                        }
+                        else if (!_optTunMode && IsTelegramDesktopDetected())
+                        {
+                            var uacRes = MessageBox.Show(
+                                this,
+                                "Браузерный Telegram, Spotify, Instagram и X работают сразу без прав администратора.\n\n" +
+                                "На компьютере обнаружен десктопный Telegram для Windows. Включить встроенный драйвер Wintun (TUN), чтобы приложение Telegram работало автоматически без ручной настройки прокси? (PixelTunnel перезапустится от имени Администратора)",
+                                "PixelTunnel — Десктопный Telegram (TUN)",
+                                MessageBoxButton.YesNo,
+                                MessageBoxImage.Question
+                            );
+                            if (uacRes == MessageBoxResult.Yes)
+                            {
+                                _optTunMode = true;
+                                UpdateCheckboxVisual(_chkBoxWeb, _chkMarkWeb, _iconBoxWeb, true, true);
+                                SaveCurrentState();
+                                RelaunchAsAdmin(_isConnected ? "--autoconnect" : "");
+                                if (!IsAdministratorStatic())
+                                {
+                                    _optTunMode = false;
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        _optSocialWeb = false;
+                        if (!_optDiscordYt)
+                        {
+                            _optTunMode = false;
+                        }
+                    }
                     UpdateCheckboxVisual(_chkBoxWeb, _chkMarkWeb, _iconBoxWeb, _optSocialWeb, true);
                     SaveCurrentState();
                     TriggerCategoryHotReloadIfConnected();
@@ -2315,35 +2357,77 @@ namespace PixelTunnel
             rulesStack.Children.Add(CreateToggleRow(
                 2,
                 "YouTube & Discord",
-                "Нужен наш PRO VPN (@p1xivpn_bot • iOS, Android, ПК)",
+                "YouTube 4K, Discord (текст + голос/TUN) • PRO (@p1xivpn_bot)",
                 false,
                 out _iconBoxMedia,
                 out _chkBoxMedia,
                 out _chkMarkMedia,
                 delegate
                 {
-                    if (!_optDiscordYt && !HasActiveProAccess())
+                    if (!_optDiscordYt)
                     {
-                        if (_inputBoxBorder != null && _inputBoxBorder.Visibility != Visibility.Visible)
+                        if (!HasActiveProAccess())
                         {
-                            AnimateDrawerOpen(_inputBoxBorder);
+                            if (_inputBoxBorder != null && _inputBoxBorder.Visibility != Visibility.Visible)
+                            {
+                                AnimateDrawerOpen(_inputBoxBorder);
+                            }
+                            var res = MessageBox.Show(
+                                this,
+                                "Antigravity, нейросети, Telegram, Spotify и соцсети работают в PixelTunnel полностью бесплатно и бессрочно!\n\n" +
+                                "Тяжёлый медиа-трафик (YouTube и голосовой Discord) доступен по персональному PRO-ключу из Telegram-бота @p1xivpn_bot (этот же ключ работает как полный VPN на iPhone, Android и ПК).\n\n" +
+                                "Открыть @p1xivpn_bot для получения PRO-ключа?",
+                                "PixelTunnel PRO — YouTube & Discord",
+                                MessageBoxButton.YesNo,
+                                MessageBoxImage.Information
+                            );
+                            if (res == MessageBoxResult.Yes)
+                            {
+                                try { Process.Start(new ProcessStartInfo(GetTelegramBotUrl()) { UseShellExecute = true }); } catch { }
+                            }
+                            return;
                         }
-                        var res = MessageBox.Show(
-                            this,
-                            "Antigravity, нейросети, Telegram, Spotify и соцсети работают в PixelTunnel полностью бесплатно и бессрочно!\n\n" +
-                            "Тяжёлый медиа-трафик (YouTube и голосовой Discord) доступен по персональному PRO-ключу из Telegram-бота @p1xivpn_bot (этот же ключ работает как полный VPN на iPhone, Android и ПК).\n\n" +
-                            "Открыть @p1xivpn_bot для получения PRO-ключа?",
-                            "PixelTunnel PRO — YouTube & Discord",
-                            MessageBoxButton.YesNo,
-                            MessageBoxImage.Information
-                        );
-                        if (res == MessageBoxResult.Yes)
+
+                        _optDiscordYt = true;
+                        if (IsAdministratorStatic())
                         {
-                            try { Process.Start(new ProcessStartInfo(GetTelegramBotUrl()) { UseShellExecute = true }); } catch { }
+                            _optTunMode = true;
                         }
-                        return;
+                        else
+                        {
+                            var uacRes = MessageBox.Show(
+                                this,
+                                "YouTube и текстовый/браузерный Discord работают сразу без прав администратора.\n\n" +
+                                "Включить также встроенный TUN-драйвер (Wintun) для голосовых каналов Discord и игр? Для этого PixelTunnel перезапустится от имени Администратора.",
+                                "PixelTunnel PRO — Голос Discord (TUN)",
+                                MessageBoxButton.YesNo,
+                                MessageBoxImage.Question
+                            );
+                            if (uacRes == MessageBoxResult.Yes)
+                            {
+                                _optTunMode = true;
+                                UpdateCheckboxVisual(_chkBoxMedia, _chkMarkMedia, _iconBoxMedia, true, true);
+                                SaveCurrentState();
+                                RelaunchAsAdmin(_isConnected ? "--autoconnect" : "");
+                                if (!IsAdministratorStatic())
+                                {
+                                    _optTunMode = false;
+                                }
+                            }
+                            else
+                            {
+                                _optTunMode = false;
+                            }
+                        }
                     }
-                    _optDiscordYt = !_optDiscordYt;
+                    else
+                    {
+                        _optDiscordYt = false;
+                        if (!(_optSocialWeb && IsAdministratorStatic() && IsTelegramDesktopDetected()))
+                        {
+                            _optTunMode = false;
+                        }
+                    }
                     UpdateCheckboxVisual(_chkBoxMedia, _chkMarkMedia, _iconBoxMedia, _optDiscordYt, true);
                     SaveCurrentState();
                     TriggerCategoryHotReloadIfConnected();
@@ -3048,6 +3132,23 @@ namespace PixelTunnel
                     StrokeLineJoin = PenLineJoin.Round
                 });
             }
+            else if (categoryId == 5)
+            {
+                // Row TUN: Wintun L3 System Tunnel — Network Shield + Routing Pulse
+                cv.Children.Add(new ShapePath
+                {
+                    Data = Geometry.Parse("M 12 2.5 L 4.5 5.8 V 11.5 C 4.5 16.5 7.7 20.8 12 22 C 16.3 20.8 19.5 16.5 19.5 11.5 V 5.8 Z"),
+                    Stroke = new SolidColorBrush(ColGreen),
+                    Fill = new SolidColorBrush(Color.FromArgb(40, 16, 185, 129)),
+                    StrokeThickness = 1.9,
+                    StrokeLineJoin = PenLineJoin.Round
+                });
+                cv.Children.Add(new ShapePath
+                {
+                    Data = Geometry.Parse("M 12.6 7.5 L 9.2 12.5 H 12.2 L 11.4 16.8 L 14.8 11.8 H 11.8 Z"),
+                    Fill = new SolidColorBrush(ColBlue)
+                });
+            }
             else
             {
                 // Row 4: Соцсети и заблокированные сайты — Global Orbital Mesh + Unblock Meridian
@@ -3271,9 +3372,11 @@ namespace PixelTunnel
         private static bool IsCustomPaidKey(string rawText)
         {
             if (string.IsNullOrWhiteSpace(rawText)) return false;
-            VlessNode n = ParseVlessUri(rawText.Trim());
+            string trimmed = rawText.Trim();
+            if (IsLegacyOrFreeKey(trimmed)) return false;
+            VlessNode n = ParseVlessUri(trimmed);
             if (n == null || string.IsNullOrEmpty(n.Uuid)) return false;
-            return !string.Equals(n.Uuid, "free", StringComparison.OrdinalIgnoreCase);
+            return !IsLegacyOrFreeKey(n.Uuid);
         }
 
         private void ApplyLicenseBarState(
@@ -3407,6 +3510,7 @@ namespace PixelTunnel
                 if (_optDiscordYt && _chkBoxMedia != null)
                 {
                     _optDiscordYt = false;
+                    _optTunMode = false;
                     UpdateCheckboxVisual(_chkBoxMedia, _chkMarkMedia, _iconBoxMedia, false, false);
                 }
                 ApplyLicenseBarState(
@@ -3660,6 +3764,7 @@ namespace PixelTunnel
                             _optSocialWeb = flags.Contains("WEB=1");
                             _useSmartPacMode = !flags.Contains("PAC=0");
                             _optWslBridge = flags.Contains("WSL=1");
+                            _optTunMode = flags.Contains("TUN=1");
                             var mReg = Regex.Match(flags, @"REG=(auto|nl|us)", RegexOptions.IgnoreCase);
                             if (mReg.Success)
                             {
@@ -3678,6 +3783,7 @@ namespace PixelTunnel
                             _optSocialWeb = false;
                             _useSmartPacMode = true;
                             _optWslBridge = false;
+                            _optTunMode = false;
                             migratedToV2 = true;
                         }
                         _optMcpTerminal = _optAntigravity;
@@ -3685,6 +3791,9 @@ namespace PixelTunnel
                         if (_chkBoxMcp != null) UpdateCheckboxVisual(_chkBoxMcp, _chkMarkMcp, _iconBoxMcp, _optMcpTerminal, false);
                         UpdateCheckboxVisual(_chkBoxAi, _chkMarkAi, _iconBoxAi, _optCursorAi, false);
                         if (_optDiscordYt && !HasActiveProAccess()) _optDiscordYt = false;
+                        bool wantsTunCategory = _optDiscordYt || (_optSocialWeb && (flags.Contains("TUN=1") || (IsAdministratorStatic() && IsTelegramDesktopDetected())));
+                        _optTunMode = wantsTunCategory && (flags.Contains("TUN=1") || IsAdministratorStatic());
+                        if (!_optDiscordYt && !_optSocialWeb) _optTunMode = false;
                         UpdateCheckboxVisual(_chkBoxMedia, _chkMarkMedia, _iconBoxMedia, _optDiscordYt, false);
                         UpdateCheckboxVisual(_chkBoxWeb, _chkMarkWeb, _iconBoxWeb, _optSocialWeb, false);
                         UpdateRegionSelectorVisuals();
@@ -3694,15 +3803,31 @@ namespace PixelTunnel
 
                 int daysLeft;
                 string autoTrialKey = EnsureAutoTrialKeyProvisioned(out daysLeft);
-                string curLoadedKey = _keyInput.Text ?? "";
+                string curLoadedKey = (_keyInput.Text ?? "").Trim();
+                bool keyMigrated = false;
                 if (string.IsNullOrWhiteSpace(curLoadedKey) ||
+                    IsLegacyOrFreeKey(curLoadedKey) ||
                     curLoadedKey.IndexOf("nln.rusweb.net", StringComparison.OrdinalIgnoreCase) >= 0 ||
                     curLoadedKey.IndexOf("#PixelTunnel-Trial", StringComparison.OrdinalIgnoreCase) >= 0)
                 {
-                    _keyInput.Text = autoTrialKey;
-                    SaveCurrentState();
+                    if (!string.Equals(curLoadedKey, autoTrialKey, StringComparison.Ordinal))
+                    {
+                        _keyInput.Text = autoTrialKey;
+                        keyMigrated = true;
+                    }
                 }
-                else if (migratedToV2)
+                else if (curLoadedKey.IndexOf("201.34.152.97", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                         curLoadedKey.IndexOf("147.45.135.71", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                         curLoadedKey.IndexOf("node.pixelstore.space", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    var parsedSaved = ParseVlessUri(curLoadedKey);
+                    if (parsedSaved != null && !string.IsNullOrWhiteSpace(parsedSaved.Uuid) && !IsLegacyOrFreeKey(parsedSaved.Uuid))
+                    {
+                        _keyInput.Text = string.Format("pwp4://{0}@ai.pixelstore.space:443#PixelTunnel-PRO", parsedSaved.Uuid.Trim());
+                        keyMigrated = true;
+                    }
+                }
+                if (keyMigrated || migratedToV2)
                 {
                     SaveCurrentState();
                 }
@@ -4326,7 +4451,7 @@ namespace PixelTunnel
             string[] data = new[]
             {
                 savedKey,
-                string.Format("V2=1;AG={0};MCP={1};AI={2};MEDIA={3};WEB={4};REG={5};PAC={6};WSL={7}",
+                string.Format("V2=1;AG={0};MCP={1};AI={2};MEDIA={3};WEB={4};REG={5};PAC={6};WSL={7};TUN={8}",
                     _optAntigravity ? 1 : 0,
                     _optMcpTerminal ? 1 : 0,
                     _optCursorAi ? 1 : 0,
@@ -4334,7 +4459,8 @@ namespace PixelTunnel
                     _optSocialWeb ? 1 : 0,
                     string.IsNullOrEmpty(_selectedRegion) ? "auto" : _selectedRegion,
                     _useSmartPacMode ? 1 : 0,
-                    _optWslBridge ? 1 : 0)
+                    _optWslBridge ? 1 : 0,
+                    _optTunMode ? 1 : 0)
             };
             try { File.WriteAllLines(_savedKeyPath, data, Encoding.UTF8); } catch { }
             try { File.WriteAllLines(GetFallbackSavedKeyPath(), data, Encoding.UTF8); } catch { }
@@ -4343,6 +4469,24 @@ namespace PixelTunnel
         public static bool IsAdministratorStatic()
         {
             return IsAdministrator();
+        }
+
+        private static bool IsTelegramDesktopDetected()
+        {
+            try
+            {
+                if (Process.GetProcessesByName("Telegram").Length > 0) return true;
+            }
+            catch { }
+            try
+            {
+                string appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+                if (!string.IsNullOrEmpty(appData) && File.Exists(System.IO.Path.Combine(appData, "Telegram Desktop", "Telegram.exe"))) return true;
+                string localApp = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+                if (!string.IsNullOrEmpty(localApp) && File.Exists(System.IO.Path.Combine(localApp, "Programs", "Telegram Desktop", "Telegram.exe"))) return true;
+            }
+            catch { }
+            return false;
         }
 
         private static bool IsAdministrator()
@@ -6170,16 +6314,22 @@ namespace PixelTunnel
                     if (ni.OperationalStatus != OperationalStatus.Up) continue;
                     string name = ni.Name ?? "";
                     string desc = ni.Description ?? "";
-                    if (name.IndexOf("PixelAG", StringComparison.OrdinalIgnoreCase) >= 0) continue;
+                    if (name.IndexOf("PixelAG", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        string.Equals(name, "PixelTunnel", StringComparison.OrdinalIgnoreCase) ||
+                        desc.IndexOf("PixelTunnel", StringComparison.OrdinalIgnoreCase) >= 0) continue;
 
                     if (desc.IndexOf("Wintun", StringComparison.OrdinalIgnoreCase) >= 0 ||
                         desc.IndexOf("WireGuard", StringComparison.OrdinalIgnoreCase) >= 0 ||
                         desc.IndexOf("Sing-Box", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        desc.IndexOf("sing-tun", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        desc.IndexOf("Clash", StringComparison.OrdinalIgnoreCase) >= 0 ||
                         name.IndexOf("PixelTUN", StringComparison.OrdinalIgnoreCase) >= 0 ||
                         name.IndexOf("Nekoray", StringComparison.OrdinalIgnoreCase) >= 0 ||
                         name.IndexOf("Hiddify", StringComparison.OrdinalIgnoreCase) >= 0 ||
                         name.IndexOf("Amnezia", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                        name.IndexOf("Outline", StringComparison.OrdinalIgnoreCase) >= 0)
+                        name.IndexOf("Outline", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        name.IndexOf("Clash", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        name.IndexOf("Mihomo", StringComparison.OrdinalIgnoreCase) >= 0)
                     {
                         detectedAdapterName = string.Format("{0} ({1})", name, desc);
                         return true;
@@ -6778,7 +6928,11 @@ namespace PixelTunnel
             string oauthCode,
             string yaCode,
             string thirdPartyAdapters,
-            bool lsSanctionPatched)
+            bool lsSanctionPatched,
+            bool optAg = true,
+            bool optAi = false,
+            bool optWeb = false,
+            bool optMedia = false)
         {
             long drift = PixelCoreService.ClockOffsetSeconds;
             string clockState = Math.Abs(drift) < 45L
@@ -6804,11 +6958,15 @@ namespace PixelTunnel
 
             var sb = new StringBuilder();
             sb.AppendLine(string.Format("[PixelTunnel v{0} • Паспорт диагностики]", APP_VERSION));
-            sb.AppendLine(string.Format("ОС: {0} ({1}) | Порты: :{2}/:{3} | Категории: AG={4}, MCP={5}",
+            sb.AppendLine(string.Format("ОС: {0} ({1}) | Порты: :{2}/:{3} | Категории: AG={4}, AI={5}, WEB={6}, MEDIA={7}, TUN={8}",
                 Environment.OSVersion.Version,
                 Environment.Is64BitOperatingSystem ? "x64" : "x86",
                 _activeHttpPort, _activeSocksPort,
-                "ON", _optMcpTerminal ? "ON" : "OFF"));
+                optAg ? "ON" : "OFF",
+                optAi ? "ON" : "OFF",
+                optWeb ? "ON" : "OFF",
+                optMedia ? "ON" : "OFF",
+                _optTunMode ? "ON" : "OFF"));
             sb.AppendLine(string.Format("Часы ПК: {0} | Hosts: {1} | SSL: {2}", clockState, hostsState, sslState));
             sb.AppendLine("Подписка: " + licInfo);
             sb.AppendLine(string.Format("Активный канал: {0} ({1}) • Anti-DPI: {2} (36KB={3}, эскалаций={4})",
@@ -6846,7 +7004,8 @@ namespace PixelTunnel
                 "",
                 _isConnected ? "OK" : "IDLE",
                 "-", "-", "OK",
-                tunName, lsOk);
+                tunName, lsOk,
+                _optAntigravity, _optCursorAi, _optSocialWeb, _optDiscordYt);
         }
 
         // ====================================================================
@@ -7004,6 +7163,7 @@ namespace PixelTunnel
                     diagThirdPartyTun = thirdPartyTun;
                     issuesFound++;
                     report.AppendLine("  ⚠ [ВНИМАНИЕ] Обнаружен сторонний виртуальный адаптер: " + thirdPartyTun);
+                    report.AppendLine("  💡 [СОВЕТ] Активный сторонний адаптер (например, PixelTUN / sing-tun / WireGuard) может перехватывать L3 UDP/Telegram/Discord трафик до PixelTunnel — отключите другой VPN-клиент на время работы.");
                     if (autoFix)
                     {
                         _preferSafeProxyMode = true;
@@ -7634,7 +7794,8 @@ namespace PixelTunnel
                 _lastSupportPassport = BuildCompactSupportPassport(
                     diagPoisonedHosts, diagHostsHealed, diagSslMitm,
                     diagNodeMatrix, diagAgCode, diagGemCode, diagOAuthCode, diagYaCode,
-                    diagThirdPartyTun, diagLsPatched);
+                    diagThirdPartyTun, diagLsPatched,
+                    _optAntigravity, _optCursorAi, _optSocialWeb, _optDiscordYt);
 
                 sw.Stop();
                 report.AppendLine(string.Format("\r\n╚══ Диагностика завершена за {0} мс | Найдено: {1} | Исправлено: {2} ══╝", sw.ElapsedMilliseconds, issuesFound, issuesFixed));
@@ -8277,7 +8438,8 @@ namespace PixelTunnel
                 },
                 { "custom_proxy_domains", ParseDomainCsv(prxCsv) },
                 { "custom_direct_domains", ParseDomainCsv(dirCsv) },
-                { "proxy_all", _optCursorAi || _optDiscordYt || _optSocialWeb }
+                { "proxy_all", false },
+                { "tun_mode", _optTunMode }
             };
             return MiniJson.Serialize(payload);
         }
@@ -8465,7 +8627,8 @@ namespace PixelTunnel
             {
                 string[] telegramList = new[]
                 {
-                    "telegram.org", "t.me", "web.telegram.org", "tdesktop.com", "telesco.pe", "telegra.ph"
+                    "telegram.org", "t.me", "tx.me", "web.telegram.org", "tdesktop.com", "telesco.pe", "telegra.ph",
+                    "telegram-cdn.org", "cdn-telegram.org", "usercontent.dev"
                 };
                 foreach (var d in telegramList) addDom(d);
             }
@@ -8527,6 +8690,24 @@ namespace PixelTunnel
             return sb.ToString();
         }
 
+        private static VlessNode NormalizeLegacyClusterNode(VlessNode node)
+        {
+            if (node == null || string.IsNullOrWhiteSpace(node.Server)) return node;
+            string s = node.Server.Trim();
+            if (string.Equals(s, "201.34.152.97", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(s, "147.45.135.71", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(s, "node.pixelstore.space", StringComparison.OrdinalIgnoreCase))
+            {
+                node.Server = GetDefaultClusterHost();
+                node.Port = 443;
+                node.Sni = "ai.pixelstore.space";
+                node.TransportType = "pwp3";
+                node.Flow = "";
+                node.ResolvedIp = "185.103.103.162";
+            }
+            return node;
+        }
+
         public static VlessNode ParseVlessUri(string uri)
         {
             try
@@ -8537,7 +8718,7 @@ namespace PixelTunnel
                     string userInfo = string.IsNullOrEmpty(u.UserInfo) ? "" : Uri.UnescapeDataString(u.UserInfo);
                     string pwpUuid = string.Equals(userInfo, "free", StringComparison.OrdinalIgnoreCase) ? "" : userInfo;
                     string pwpHost = string.IsNullOrEmpty(u.Host) ? GetDefaultClusterHost() : u.Host;
-                    return new VlessNode
+                    return NormalizeLegacyClusterNode(new VlessNode
                     {
                         Uuid = pwpUuid,
                         Server = pwpHost,
@@ -8548,13 +8729,13 @@ namespace PixelTunnel
                         Security = "pwp3-tls",
                         Flow = "",
                         Remark = "PixelTunnel PWP-4"
-                    };
+                    });
                 }
                 if (!string.IsNullOrWhiteSpace(uri) && Regex.IsMatch(uri.Trim(), @"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"))
                 {
                     string cleanUuid = uri.Trim().ToLowerInvariant();
                     string defHost = GetDefaultClusterHost();
-                    return new VlessNode
+                    return NormalizeLegacyClusterNode(new VlessNode
                     {
                         Uuid = LegacyTrialUuids.Contains(cleanUuid) ? "" : cleanUuid,
                         Server = defHost,
@@ -8565,13 +8746,13 @@ namespace PixelTunnel
                         Security = "pwp3-tls",
                         Flow = "",
                         Remark = "PixelTunnel PRO"
-                    };
+                    });
                 }
                 if (!string.IsNullOrWhiteSpace(uri) && Regex.IsMatch(uri.Trim(), @"^https://ai\.pixelstore\.space/sub/[A-Za-z0-9_-]{6,64}$", RegexOptions.IgnoreCase))
                 {
                     string defHost = GetDefaultClusterHost();
                     string subId = uri.Trim().Substring(uri.Trim().LastIndexOf('/') + 1);
-                    return new VlessNode
+                    return NormalizeLegacyClusterNode(new VlessNode
                     {
                         Uuid = subId,
                         Server = defHost,
@@ -8582,13 +8763,13 @@ namespace PixelTunnel
                         Security = "pwp3-tls",
                         Flow = "",
                         Remark = "PixelTunnel Sub"
-                    };
+                    });
                 }
                 if (!string.IsNullOrWhiteSpace(uri) && uri.StartsWith("pwp1://", StringComparison.OrdinalIgnoreCase))
                 {
                     Uri u = new Uri(uri);
                     string sec = string.IsNullOrEmpty(u.UserInfo) ? "" : Uri.UnescapeDataString(u.UserInfo);
-                    return new VlessNode
+                    return NormalizeLegacyClusterNode(new VlessNode
                     {
                         Uuid = sec,
                         Server = u.Host,
@@ -8598,7 +8779,7 @@ namespace PixelTunnel
                         TransportType = "pwp1",
                         Security = "pwp1-tls",
                         Remark = "PixelCore PWP-1 NL"
-                    };
+                    });
                 }
                 if (string.IsNullOrWhiteSpace(uri) || !uri.StartsWith("vless://", StringComparison.OrdinalIgnoreCase))
                     return null;
@@ -8692,7 +8873,7 @@ namespace PixelTunnel
                     catch { }
                 }
 
-                return node;
+                return NormalizeLegacyClusterNode(node);
             }
             catch
             {
@@ -8914,14 +9095,7 @@ namespace PixelTunnel
       }}
     }}", _activeHttpPort, _activeSocksPort);
 
-            string defaultOutboundRules = (routeWeb || routeMedia || routeAi)
-                ? @",
-      {
-        ""type"": ""field"",
-        ""outboundTag"": ""proxy"",
-        ""network"": ""tcp,udp""
-      }"
-                : @",
+            string defaultOutboundRules = @",
       {
         ""type"": ""field"",
         ""outboundTag"": ""direct"",
@@ -8934,6 +9108,8 @@ namespace PixelTunnel
     ""smart_pac"": {0},
     ""pac_rev"": {1},
     ""wsl_bridge"": {2},
+    ""tun_mode"": {10},
+    ""proxy_all"": false,
     ""local_token"": """",
     ""categories"": {{
       ""antigravity"": {3},
@@ -8956,7 +9132,8 @@ namespace PixelTunnel
                 routeWeb ? "true" : "false",
                 _optMcpTerminal ? "true" : "false",
                 JoinJsonStrings(ParseDomainCsv(prxCsv)),
-                JoinJsonStrings(ParseDomainCsv(dirCsv)));
+                JoinJsonStrings(ParseDomainCsv(dirCsv)),
+                _optTunMode ? "true" : "false");
 
             return string.Format(@"{{
   ""preferredRegion"": ""{16}"",

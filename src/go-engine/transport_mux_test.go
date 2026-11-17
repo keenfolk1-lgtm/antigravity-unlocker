@@ -1904,3 +1904,130 @@ func TestHappyEyeballs650msStaggerStandbyAndFallback(t *testing.T) {
 		}
 	})
 }
+
+func TestHighRTT160MsAndStreamResetDoNotKillMuxSession(t *testing.T) {
+	pCli, pSrv := net.Pipe()
+	defer pSrv.Close()
+	sCli, sSrv := net.Pipe()
+	defer sSrv.Close()
+
+	secret := "high-rtt-isolation-secret"
+	cNonce := hex.EncodeToString(bytes.Repeat([]byte{0x55}, 16))
+	sSalt := hex.EncodeToString(bytes.Repeat([]byte{0x66}, 16))
+
+	pRx, pTx, _ := NewPWP4ClientCiphers(secret, cNonce, sSalt)
+	sRx, sTx, _ := NewPWP4ClientCiphers(secret, cNonce, sSalt)
+	mat, _ := DerivePWP4KeyMaterial(secret, cNonce, sSalt)
+
+	srvSideRx, _ := newPWP4Cipher(mat[0:32], mat[64:80])
+	srvSideTx, _ := newPWP4Cipher(mat[32:64], mat[80:96])
+
+	// Primary mock server: delays SynAck by 190ms (simulating 160ms+ RTT), rejects "blocked.example.com"
+	// with per-stream FrameRst, echoes Data on normal streams, and replies to FramePing.
+	var pWriteMu sync.Mutex
+	sendPrimary := func(ft byte, sid uint32, pl []byte) {
+		out, err := srvSideTx.SealFrame(ft, sid, pl)
+		if err != nil {
+			return
+		}
+		pWriteMu.Lock()
+		_, _ = pSrv.Write(out)
+		pWriteMu.Unlock()
+	}
+	go func() {
+		br := bufio.NewReader(pSrv)
+		for {
+			ft, sid, payload, _, err := srvSideRx.OpenFrame(br, nil)
+			if err != nil {
+				return
+			}
+			switch ft {
+			case FrameSynTCP:
+				host := ""
+				if len(payload) > 1 && int(payload[0])+1 <= len(payload) {
+					host = string(payload[1 : 1+int(payload[0])])
+				}
+				go func(streamID uint32, target string) {
+					if target == "blocked.example.com" {
+						time.Sleep(25 * time.Millisecond)
+						sendPrimary(FrameRst, streamID, []byte{0x01})
+						return
+					}
+					time.Sleep(190 * time.Millisecond)
+					sendPrimary(FrameSynAck, streamID, nil)
+				}(sid, host)
+			case FrameData:
+				sendPrimary(FrameData, sid, payload)
+			case FramePing:
+				sendPrimary(FramePong, sid, payload)
+			}
+		}
+	}()
+
+	// Standby server drains frames (should NEVER be promoted during this test).
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			if _, err := sSrv.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+
+	cfg := DefaultEngineConfig()
+	cfg.V2.FailoverTimeoutMs = 150 // Even with low config budget, 160ms EWMA RTT must raise probe wait.
+	mux := NewMuxManager(cfg, nil)
+	defer mux.Close()
+
+	primaryNode := NodeConfig{Name: "NL-HighRTT", Host: "10.0.0.10", Port: 443}
+	mux.selector.RecordProbe(primaryNode, true, 160)
+
+	primarySess := NewClientMuxSession(pCli, bufio.NewReader(pCli), &pwp4ClientCodec{rx: pRx, tx: pTx}, primaryNode, LicenseMetadata{Proto: "PWP-4"})
+	standbySess := NewClientMuxSession(sCli, bufio.NewReader(sCli), &pwp4ClientCodec{rx: sRx, tx: sTx}, NodeConfig{Name: "Standby-Idle", Host: "10.0.0.11", Port: 443}, LicenseMetadata{Proto: "PWP-4"})
+
+	mux.mu.Lock()
+	mux.sessions["ai"] = primarySess
+	mux.standby = standbySess
+	mux.standbyNode = standbySess.Node()
+	mux.mu.Unlock()
+
+	// 1. 190ms SynAck on a 160ms-RTT node must succeed on primarySess without failing over.
+	st1, usedNode, err := mux.OpenStream(context.Background(), "ai", "daily-cloudcode-pa.googleapis.com", 443)
+	if err != nil {
+		t.Fatalf("expected 190ms SynAck on 160ms RTT node to succeed, got err=%v", err)
+	}
+	defer st1.Close()
+	if usedNode != "NL-HighRTT" {
+		t.Fatalf("expected stream on primary NL-HighRTT, got %q", usedNode)
+	}
+	if mux.Snapshot().FailoverCount != 0 || primarySess.IsClosed() {
+		t.Fatalf("expected zero failovers and primarySess open, got failovers=%d closed=%v", mux.Snapshot().FailoverCount, primarySess.IsClosed())
+	}
+
+	// Verify active stream #1 works before stream #2 reset.
+	if _, err := st1.Write([]byte("before-rst")); err != nil {
+		t.Fatalf("st1 write before rst: %v", err)
+	}
+	buf1 := make([]byte, 10)
+	if _, err := io.ReadFull(st1, buf1); err != nil || string(buf1) != "before-rst" {
+		t.Fatalf("st1 echo before rst: %q err=%v", string(buf1), err)
+	}
+
+	// 2. Per-stream FrameRst on stream #2 must return ErrMuxStreamReset WITHOUT closing primarySess or st1.
+	_, rstNode, rstErr := mux.OpenStream(context.Background(), "ai", "blocked.example.com", 443)
+	if !errors.Is(rstErr, ErrMuxStreamReset) {
+		t.Fatalf("expected ErrMuxStreamReset for rejected stream, got node=%q err=%v", rstNode, rstErr)
+	}
+	if primarySess.IsClosed() || mux.Snapshot().FailoverCount != 0 {
+		t.Fatalf("per-stream FrameRst must NOT close primarySess or promote standby: closed=%v failovers=%d", primarySess.IsClosed(), mux.Snapshot().FailoverCount)
+	}
+
+	// 3. Stream #1 must continue transferring data uninterrupted after stream #2's FrameRst.
+	if _, err := st1.Write([]byte("after-rst!")); err != nil {
+		t.Fatalf("st1 write after rst: %v", err)
+	}
+	buf2 := make([]byte, 10)
+	if _, err := io.ReadFull(st1, buf2); err != nil || string(buf2) != "after-rst!" {
+		t.Fatalf("st1 echo after rst failed: %q err=%v", string(buf2), err)
+	}
+}

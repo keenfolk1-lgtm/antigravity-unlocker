@@ -149,12 +149,13 @@ type XRayCard struct {
 
 // XRayReport is the complete 6-card Diagnostics 4.0 payload with local report text only (NO #PT codes).
 type XRayReport struct {
-	OK         bool       `json:"ok"`
-	CheckedAt  int64      `json:"checked_at"`
-	DurationMs int64      `json:"duration_ms"`
-	Overall    string     `json:"overall"` // "ok", "warn", "fail"
-	Cards      []XRayCard `json:"cards"`
-	ReportText string     `json:"report_text"`
+	OK         bool               `json:"ok"`
+	CheckedAt  int64              `json:"checked_at"`
+	DurationMs int64              `json:"duration_ms"`
+	Overall    string             `json:"overall"` // "ok", "warn", "fail"
+	Cards      []XRayCard         `json:"cards"`
+	TUNStatus  *TUNStatusSnapshot `json:"tun_status,omitempty"`
+	ReportText string             `json:"report_text"`
 }
 
 type aiPulseCall struct {
@@ -168,6 +169,7 @@ type XRayRunner struct {
 	mux         *MuxManager
 	resolver    *DohResolver
 	radar       *RouteRadar
+	tunFn       func() TUNStatusSnapshot
 	pulseMu     sync.Mutex
 	cachedPulse *AIPulseResponse
 	pulseExp    time.Time
@@ -181,6 +183,13 @@ func NewXRayRunner(cfgFn func() *EngineConfig, mux *MuxManager, resolver *DohRes
 		mux:      mux,
 		resolver: resolver,
 		radar:    radar,
+	}
+}
+
+// SetTUNStatusProvider registers a callback to include live TUN status in Diagnostics 4.0 reports.
+func (x *XRayRunner) SetTUNStatusProvider(fn func() TUNStatusSnapshot) {
+	if x != nil {
+		x.tunFn = fn
 	}
 }
 
@@ -376,6 +385,7 @@ func (x *XRayRunner) fetchNodeAIPulse(ctx context.Context, cfg *EngineConfig) (*
 		ForceHTTP1ALPN:   true,
 		InsecureTestOnly: insecure,
 		ConnectTimeout:   4 * time.Second,
+		DialControl:      x.resolver.currentDialControl(),
 	})
 	if err != nil {
 		return nil, false
@@ -503,6 +513,10 @@ func (x *XRayRunner) RunXRay(ctx context.Context) *XRayReport {
 		Overall:    overall,
 		Cards:      cards,
 	}
+	if x.tunFn != nil {
+		st := x.tunFn()
+		rep.TUNStatus = &st
+	}
 	rep.ReportText = FormatLocalDiagnosticReport(rep, cfg, x.mux, x.radar)
 	return rep
 }
@@ -518,6 +532,7 @@ func (x *XRayRunner) cardISPHosts(ctx context.Context) XRayCard {
 	dohOK := false
 	sinkhole := false
 	var resolvedIP string
+	var dohUpstream string
 	if x.resolver != nil {
 		ips, err := x.resolver.LookupHost(ctx, DefaultSNI)
 		if err == nil && len(ips) > 0 {
@@ -526,6 +541,7 @@ func (x *XRayRunner) cardISPHosts(ctx context.Context) XRayCard {
 		} else if err != nil && strings.Contains(err.Error(), ErrSinkholeIP.Error()) {
 			sinkhole = true
 		}
+		dohUpstream = x.resolver.ActiveUpstream()
 	}
 	lat := time.Since(t0).Milliseconds()
 	card.LatencyMs = lat
@@ -536,6 +552,9 @@ func (x *XRayRunner) cardISPHosts(ctx context.Context) XRayCard {
 		"doh_ms":        lat,
 		"dns_sinkhole":  sinkhole,
 		"resolved_ip":   resolvedIP,
+	}
+	if dohUpstream != "" {
+		card.Metrics["doh_upstream"] = dohUpstream
 	}
 	switch {
 	case len(blockedHosts) > 0 || sinkhole:
@@ -651,29 +670,47 @@ func (x *XRayRunner) cardUTLSMITM(ctx context.Context, cfg *EngineConfig) XRayCa
 	}
 	rootCAs := getRootCAsFromMux(x.mux)
 	insecure := isInsecureTestFromMux(x.mux)
-	res, err := DialUTLS(ctx, UTLSDialOptions{
+	var tuner *DPIAutoTuner
+	var netFP string
+	if x.mux != nil {
+		tuner = x.mux.getAutoTuner()
+		netFP = x.mux.currentNetFingerprint()
+	}
+	res, usedStrat, err := tuner.DialAdaptiveTLS(ctx, AdaptiveDialOptions{
 		Address:          net.JoinHostPort(dialHost, strconv.Itoa(port)),
 		SNI:              sni,
-		Profile:          cfg.V2.UTLSProfile,
-		DPIProfile:       DPIProfile(cfg.V2.DPIProfile),
+		BaseUTLSProfile:  cfg.V2.UTLSProfile,
+		BaseDPIProfile:   DPIProfile(cfg.V2.DPIProfile),
 		EnableSplit:      true,
+		DecoySNIs:        cfg.DecoySNIs,
+		AllowDecoySNI:    !isWSHost(cfg.ActiveNode) && len(cfg.PinnedSPKI) > 0 && !insecure,
 		Pins:             cfg.PinnedSPKI,
 		RequirePin:       len(cfg.PinnedSPKI) > 0 && rootCAs == nil && !insecure,
 		RootCAs:          rootCAs,
 		ForceHTTP1ALPN:   true,
 		InsecureTestOnly: insecure,
-		ConnectTimeout:   4 * time.Second,
+		StepTimeout:      2000 * time.Millisecond,
+		NetFingerprint:   netFP,
+		DialControl:      x.resolver.currentDialControl(),
 	})
 	lat := time.Since(t0).Milliseconds()
 	card.LatencyMs = lat
+	promotions := int64(0)
+	if tuner != nil {
+		promotions = tuner.Promotions()
+	}
 	if err != nil {
 		mitm := strings.Contains(err.Error(), ErrCertPinMismatch.Error()) || strings.Contains(err.Error(), ErrMitmDetected.Error())
 		card.Status = "fail"
 		card.Metrics = map[string]any{
-			"utls_profile":  prof,
-			"spki_pin_ok":   false,
-			"mitm_detected": mitm,
-			"error":         err.Error(),
+			"utls_profile":        prof,
+			"spki_pin_ok":         false,
+			"mitm_detected":       mitm,
+			"autotune_promotions": promotions,
+			"error":               err.Error(),
+		}
+		if tuner != nil && tuner.ActiveStrategy() != "" {
+			card.Metrics["dpi_strategy"] = tuner.ActiveStrategy()
 		}
 		if mitm {
 			card.Summary = fmt.Sprintf("Possible SSL MITM or SPKI mismatch: %v", err)
@@ -685,17 +722,19 @@ func (x *XRayRunner) cardUTLSMITM(ctx context.Context, cfg *EngineConfig) XRayCa
 	_ = res.Conn.Close()
 	avMitm := looksLikeAVMitmIssuer(res.Issuer)
 	card.Metrics = map[string]any{
-		"utls_profile":  res.Profile,
-		"spki_pin_ok":   res.PinMatched,
-		"mitm_detected": avMitm,
-		"issuer":        res.Issuer,
-		"spki_sha256":   res.SPKISHA256,
+		"utls_profile":        res.Profile,
+		"dpi_strategy":        usedStrat.Label(),
+		"autotune_promotions": promotions,
+		"spki_pin_ok":         res.PinMatched,
+		"mitm_detected":       avMitm,
+		"issuer":              res.Issuer,
+		"spki_sha256":         res.SPKISHA256,
 	}
 	if avMitm {
 		card.Status = "warn"
-		card.Summary = fmt.Sprintf("%s; AV SSL scanner issuer detected (%s)", res.Profile, res.Issuer)
+		card.Summary = fmt.Sprintf("%s [%s]; AV SSL scanner issuer detected (%s)", res.Profile, usedStrat.Label(), res.Issuer)
 	} else {
-		card.Summary = fmt.Sprintf("%s, SPKI pin valid=%v (%dms)", res.Profile, res.PinMatched, lat)
+		card.Summary = fmt.Sprintf("%s [%s], SPKI pin valid=%v (%dms)", res.Profile, usedStrat.Label(), res.PinMatched, lat)
 	}
 	return card
 }
@@ -826,7 +865,29 @@ func FormatLocalDiagnosticReport(rep *XRayReport, cfg *EngineConfig, mux *MuxMan
 		snap := mux.Snapshot()
 		b.WriteString(fmt.Sprintf("Node: %s | Protocol: %s | uTLS: %s | Standby: %v (%s) | Failovers: %d | Wakes: %d\n",
 			snap.ActiveNode, snap.Protocol, snap.UTLSProfile, snap.StandbyReady, snap.StandbyNode, snap.FailoverCount, snap.InstantWakeCount))
+		if snap.DPIStrategy != "" || snap.DoHUpstream != "" {
+			b.WriteString(fmt.Sprintf("Bypass: DPI=%s (escalations=%d) | DoH=%s\n",
+				snap.DPIStrategy, snap.AutoTunePromotions, snap.DoHUpstream))
+		}
+		b.WriteString(fmt.Sprintf("SmartRouting: sticky_ai_node=%s | ai_migrations=%d | media_pool_conns=%d\n",
+			snap.StickyAINode, snap.AIMigrations, snap.MediaPoolConns))
 	}
+	tunMode := false
+	if cfg != nil {
+		tunMode = cfg.V2.TunMode
+	}
+	tunActive := false
+	tunStatus := "stopped"
+	fakeIPEntries := 0
+	if rep != nil && rep.TUNStatus != nil {
+		tunActive = rep.TUNStatus.Active
+		if rep.TUNStatus.Status != "" {
+			tunStatus = rep.TUNStatus.Status
+		}
+		fakeIPEntries = rep.TUNStatus.FakeIPEntries
+	}
+	b.WriteString(fmt.Sprintf("TUN: tun_mode=%v | tun_active=%v | tun_status=%s | fakeip_entries=%d\n",
+		tunMode, tunActive, tunStatus, fakeIPEntries))
 	if cfg != nil {
 		b.WriteString(fmt.Sprintf("Ports: HTTP 127.0.0.1:%d | SOCKS5 127.0.0.1:%d\n\n", cfg.HTTPPort, cfg.SOCKSPort))
 	}

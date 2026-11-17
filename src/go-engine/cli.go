@@ -92,7 +92,7 @@ func printCLIUsage() {
 	fmt.Printf(`PixelTunnel %s (%s/%s)
 
 Usage:
-  pixeltunnel start [--config <path>] [--headless] [--no-system-proxy] [--watch-stdin]
+  pixeltunnel start [--config <path>] [--headless] [--no-system-proxy] [--watch-stdin] [--tun]
   pixeltunnel stop
   pixeltunnel status
   pixeltunnel doctor [--json]
@@ -107,6 +107,7 @@ type startEngineOptions struct {
 	Headless        bool
 	NoSysProxy      bool
 	WatchStdin      bool
+	TunMode         bool
 	Stdin           io.Reader
 	LocalToken      string
 	ManifestVerPath string
@@ -122,6 +123,7 @@ func cmdStart(args []string) int {
 	headless := fs.Bool("headless", false, "Run headless without Web-UI or OS proxy mutation")
 	noSysProxy := fs.Bool("no-system-proxy", false, "Skip OS PAC/IDE proxy configuration")
 	watchStdin := fs.Bool("watch-stdin", false, "Exit when stdin pipe closes (disabled by default for -H=windowsgui safety)")
+	tunMode := fs.Bool("tun", false, "Enable system-wide Wintun TUN mode (requires Administrator on Windows)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -149,12 +151,17 @@ func cmdStart(args []string) int {
 		}
 	}
 
+	if *tunMode {
+		cfg.V2.TunMode = true
+	}
+
 	return runStartEngine(startEngineOptions{
 		Config:          cfg,
 		ConfigPath:      resolvedCfgPath,
 		Headless:        *headless,
 		NoSysProxy:      *noSysProxy,
 		WatchStdin:      *watchStdin,
+		TunMode:         *tunMode || cfg.V2.TunMode,
 		Stdin:           os.Stdin,
 		ManifestVerPath: defaultManifestVerPath(),
 		ManifestFetcher: func(ctx context.Context, resolver *DohResolver, opts ManifestVerifierOptions) (*ManifestDocument, string, error) {
@@ -167,6 +174,9 @@ func runStartEngine(opts startEngineOptions) int {
 	cfg := opts.Config
 	if cfg == nil {
 		cfg = DefaultEngineConfig()
+	}
+	if opts.TunMode {
+		cfg.V2.TunMode = true
 	}
 	resolver := NewDohResolver(nil, nil)
 	muxMgr := NewMuxManager(cfg, resolver)

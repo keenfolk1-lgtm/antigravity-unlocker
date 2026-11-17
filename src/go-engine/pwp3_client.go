@@ -195,6 +195,7 @@ var (
 	ErrClockResynced   = errors.New("clock drift compensated from server date")
 	ErrLicenseRejected = errors.New("license rejected by edge server")
 	ErrPWP4Unsupported = errors.New("node does not support PWP-4")
+	ErrMuxStreamReset  = errors.New("mux stream reset by remote peer")
 )
 
 // ClientMuxSession multiplexes client TCP and UDP streams over either PWP-4 or PWP-3.
@@ -205,7 +206,8 @@ type ClientMuxSession struct {
 	node        NodeConfig
 	proto       string
 	meta        LicenseMetadata
-	writeMu     sync.Mutex
+	scheduler   *muxPriorityScheduler
+	schedOnce   sync.Once
 	streamsMu   sync.RWMutex
 	streams     map[uint32]*ClientMuxStream
 	udpMu       sync.RWMutex
@@ -231,6 +233,7 @@ func NewClientMuxSession(conn net.Conn, br *bufio.Reader, codec MuxCodec, node N
 		node:        node,
 		proto:       codec.ProtocolName(),
 		meta:        meta,
+		scheduler:   newMuxPriorityScheduler(),
 		streams:     make(map[uint32]*ClientMuxStream),
 		udpHandlers: make(map[uint32]func(string, int, []byte)),
 		doneCh:      make(chan struct{}),
@@ -240,6 +243,25 @@ func NewClientMuxSession(conn net.Conn, br *bufio.Reader, codec MuxCodec, node N
 	s.lastRxTs.Store(time.Now().UnixNano())
 	go s.readLoop()
 	return s
+}
+
+func (s *ClientMuxSession) ensureScheduler() *muxPriorityScheduler {
+	s.schedOnce.Do(func() {
+		if s.scheduler == nil {
+			s.scheduler = newMuxPriorityScheduler()
+		}
+	})
+	return s.scheduler
+}
+
+// FastLaneFrames returns the count of control, UDP, and small interactive data frames written.
+func (s *ClientMuxSession) FastLaneFrames() int64 {
+	return s.ensureScheduler().fastFrames.Load()
+}
+
+// BulkLaneFrames returns the count of large (> QoSSmallDataThreshold) data frames written.
+func (s *ClientMuxSession) BulkLaneFrames() int64 {
+	return s.ensureScheduler().bulkFrames.Load()
 }
 
 func (s *ClientMuxSession) Protocol() string             { return s.proto }
@@ -253,12 +275,22 @@ func (s *ClientMuxSession) ActiveStreamCount() int {
 	return len(s.streams)
 }
 
+// TimeSinceLastRx returns how long ago any valid mux frame arrived on this session.
+func (s *ClientMuxSession) TimeSinceLastRx() time.Duration {
+	ts := s.lastRxTs.Load()
+	if ts <= 0 {
+		return time.Since(time.Time{})
+	}
+	return time.Since(time.Unix(0, ts))
+}
+
 // Close closes the mux session and all active streams.
 func (s *ClientMuxSession) Close() error {
 	if s.closed.Swap(true) {
 		return nil
 	}
 	close(s.doneCh)
+	s.ensureScheduler().close()
 	err := s.conn.Close()
 
 	s.streamsMu.Lock()
@@ -281,8 +313,13 @@ func (s *ClientMuxSession) writeFrame(frameType byte, streamID uint32, flags byt
 	if s.closed.Load() {
 		return io.ErrClosedPipe
 	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
+	sched := s.ensureScheduler()
+	fast := isFastLaneFrame(frameType, len(payload))
+	if !sched.acquire(fast) {
+		return io.ErrClosedPipe
+	}
+	defer sched.release()
+
 	if s.closed.Load() {
 		return io.ErrClosedPipe
 	}
@@ -291,8 +328,10 @@ func (s *ClientMuxSession) writeFrame(frameType byte, streamID uint32, flags byt
 	_ = s.conn.SetWriteDeadline(time.Time{})
 	if err != nil {
 		go s.Close()
+		return err
 	}
-	return err
+	sched.recordSent(fast)
+	return nil
 }
 
 // Ping measures round-trip ping latency over the mux control plane.
@@ -343,7 +382,7 @@ func (s *ClientMuxSession) OpenTCPStream(targetHost string, targetPort int, synA
 		return nil, errors.New("invalid mux target host/port")
 	}
 	if synAckTimeout <= 0 {
-		synAckTimeout = 4 * time.Second
+		synAckTimeout = 8 * time.Second
 	}
 
 	streamID := s.nextID.Add(2)
@@ -472,7 +511,7 @@ func (s *ClientMuxSession) readLoop() {
 			if st != nil {
 				st.peerClosed.Store(true)
 			}
-			s.removeStream(streamID, io.ErrUnexpectedEOF)
+			s.removeStream(streamID, fmt.Errorf("%w: %w", io.ErrUnexpectedEOF, ErrMuxStreamReset))
 
 		case FrameWinUpdate:
 			if len(payload) >= 4 {
@@ -719,11 +758,15 @@ func (st *ClientMuxStream) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
+	maxSlice := QoSBulkSliceSize
+	if maxSlice > MaxMuxChunkSize {
+		maxSlice = MaxMuxChunkSize
+	}
 	total := 0
 	for total < len(p) {
 		want := len(p) - total
-		if want > MaxMuxChunkSize {
-			want = MaxMuxChunkSize
+		if want > maxSlice {
+			want = maxSlice
 		}
 
 		st.winMu.Lock()
