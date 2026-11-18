@@ -1,12 +1,24 @@
-# PixelTunnel v2.1.0 — Open-Source Cross-Platform Unlocker
+# PixelTunnel v2.1.3 — Open-Source AI & IDE Unlocker (Antigravity, Cursor, Claude Code, Windsurf)
+
+[![Release](https://img.shields.io/github/v/release/keenfolk1-lgtm/antigravity-unlocker?label=release&color=2ea44f)](https://github.com/keenfolk1-lgtm/antigravity-unlocker/releases/latest)
+[![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)](https://github.com/keenfolk1-lgtm/antigravity-unlocker/releases/latest)
+[![Microsoft WDSI](https://img.shields.io/badge/Microsoft%20Defender-WDSI%20Verified%20Clean-2ea44f)](https://github.com/keenfolk1-lgtm/antigravity-unlocker/releases/tag/v2.1.3)
+[![Website](https://img.shields.io/badge/site-pixelstore.space-111827)](https://pixelstore.space/)
+[![Telegram](https://img.shields.io/badge/Telegram-@p1xivpn__bot-26A5E4)](https://t.me/p1xivpn_bot)
+
+**Open-source cross-platform split-tunneling proxy & IDE region-unlocker** for **Windows**, **macOS**, and **Linux**. Fixes `location is not supported`, OAuth2 login, MCP servers, and API timeouts in **Google Antigravity IDE**, **Cursor**, **Claude Code**, **Gemini CLI**, **Codex CLI**, **Windsurf**, **ChatGPT**, and **Claude** using a native **Chrome uTLS** Go engine, **PWP-4 AEAD** transport, and **Zero-DNS Smart PAC** — without breaking local Russian/CIS sites or conflicting with **Zapret (`winws`)** / **GoodbyeDPI**.
 
 Лёгкий и полностью открытый клиент для **Windows**, **macOS** и **Linux** с точечной маршрутизацией трафика (Smart PAC / Split-Tunneling), нативным движком **Chrome uTLS** и шифрованным мультиплексированным транспортом **PWP-4 AEAD**.
 
-## Что нового в v2.1.0
-- **Универсальный патчер `language_server` Antigravity (`P1` / `P2` / `P3`)**: поддержка всех вариантов сигнатур `HTTPS_PROXY`/`https_proxy` с независимой проверкой и автоматическим обновлением бинарников.
-- **Стабильность мультиплексора PWP-4**: авто-исправление пути `/api/v4/telemetry/events` в старых конфигах, отказ от преждевременного half-close на длинных gRPC/HTTP2 стримах и увеличенный таймаут uTLS-рукопожатия без лишних фейловеров.
-- **Бережная неразрушающая диагностика**: построчный анализ лога Antigravity без ложных тревог на штатных строках запуска и без принудительного перезапуска уже пропатченного и живого `language_server` с активной сессией.
-- **Очистка устаревших узлов и SNI**: удаление выведенных из строя IP и неактуальных SNI (замена `www.amd.com` на `www.microsoft.com`) с пред-резолвом DNS для стабильного бенчмарка узлов.
+- 🌐 **Официальный сайт / Подписки**: [pixelstore.space](https://pixelstore.space/)
+- 🤖 **Telegram-бот (PRO-ключи, YouTube, Discord, iOS/Android)**: [@p1xivpn_bot](https://t.me/p1xivpn_bot)
+- 📦 **Скачать готовый билд**: [GitHub Releases (v2.1.3)](https://github.com/keenfolk1-lgtm/antigravity-unlocker/releases/latest)
+
+## Что нового в v2.1.3
+- **Совместимость с `zapret` (`winws.exe`), `GoodbyeDPI` и `ByeDPI`**: автоматическое обнаружение активных WinDivert/DPI-утилит и переключение TLS-рукопожатия в режим `No-Split` без двойной фрагментации пакетов (шаг адаптации увеличен до `3500 мс`).
+- **Корректная работа со всеми ключами `@p1xivpn_bot` и чужих VPN**: полная нормализация Reality-ключей `node.pixelstore.space`, мгновенный возврат понятных ошибок лицензии (`DEVICE_LIMIT`, `KEY_EXPIRED`, `INVALID_KEY`) и защита от чужих ключей (`vmess://`, `ss://`, сторонний `vless://`) с кнопкой «Сбросить на FREE».
+- **Оптимизация ОЗУ и проверка Microsoft Defender**: жёсткий лимит памяти Go-ядра (`GOMEMLIMIT=96MiB`), увеличенный таймаут запуска под облачной проверкой Defender (`8 с`), устранена реентерабельность фонового цикла и случайное включение TUN без PRO-подписки. Заявка на сборку `v2.1.3` проверена Microsoft Security Intelligence (`Submission Completed — детект удалён`).
+- **Встроенная диагностика без `curl.exe`**: HTTP-зонды работают напрямую через `HttpWebRequest`, подписанный офлайн-манифест `nodes_v3.enc` вшит в сборку, а в конце отчёта выводится готовый список **«Рекомендации (что сделать сейчас)»**.
 
 ## Ключевые возможности v2.0+
 - **Транспорт PWP-4 AEAD (`ChaCha20-Poly1305` + `HKDF-SHA256`)**: аутентифицированное шифрование кадров, маскировка длины кадра с проверкой целостности (AD), padding и автоматический rekey сессии — с прозрачным fallback на **PWP-3** для обратной совместимости.
