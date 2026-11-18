@@ -4,12 +4,14 @@
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)](https://github.com/keenfolk1-lgtm/antigravity-unlocker/releases/latest)
 [![Microsoft WDSI](https://img.shields.io/badge/Microsoft%20Defender-WDSI%20Verified%20Clean-2ea44f)](https://github.com/keenfolk1-lgtm/antigravity-unlocker/releases/tag/v2.1.3)
 [![Website](https://img.shields.io/badge/site-pixelstore.space-111827)](https://pixelstore.space/)
-[![Telegram](https://img.shields.io/badge/Telegram-@p1xivpn__bot-26A5E4)](https://t.me/p1xivpn_bot)
+[![Telegram Channel](https://img.shields.io/badge/Channel-@pixel__antigravity__fix-26A5E4)](https://t.me/pixel_antigravity_fix)
+[![Telegram Bot](https://img.shields.io/badge/VPN%20Bot-@p1xivpn__bot-26A5E4)](https://t.me/p1xivpn_bot)
 
 **Open-source cross-platform split-tunneling proxy & IDE region-unlocker** for **Windows**, **macOS**, and **Linux**. Fixes `location is not supported`, OAuth2 login, MCP servers, and API timeouts in **Google Antigravity IDE**, **Cursor**, **Claude Code**, **Gemini CLI**, **Codex CLI**, **Windsurf**, **ChatGPT**, and **Claude** using a native **Chrome uTLS** Go engine, **PWP-4 AEAD** transport, and **Zero-DNS Smart PAC** — without breaking local Russian/CIS sites or conflicting with **Zapret (`winws`)** / **GoodbyeDPI**.
 
 Лёгкий и полностью открытый клиент для **Windows**, **macOS** и **Linux** с точечной маршрутизацией трафика (Smart PAC / Split-Tunneling), нативным движком **Chrome uTLS** и шифрованным мультиплексированным транспортом **PWP-4 AEAD**.
 
+- 📢 **Telegram-канал по обходу (обновления, гайды и помощь)**: [t.me/pixel_antigravity_fix](https://t.me/pixel_antigravity_fix)
 - 🌐 **Официальный сайт / Подписки**: [pixelstore.space](https://pixelstore.space/)
 - 🤖 **Telegram-бот (PRO-ключи, YouTube, Discord, iOS/Android)**: [@p1xivpn_bot](https://t.me/p1xivpn_bot)
 - 📦 **Скачать готовый билд**: [GitHub Releases (v2.1.3)](https://github.com/keenfolk1-lgtm/antigravity-unlocker/releases/latest)
