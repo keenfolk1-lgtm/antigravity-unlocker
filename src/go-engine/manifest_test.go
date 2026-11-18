@@ -486,8 +486,8 @@ func TestFilterRetiredManifestNodesAndSingleNodeGuard(t *testing.T) {
 }
 
 func TestV210DefaultsAndClusterHostNormalization(t *testing.T) {
-	if EngineVersion != "2.1.2" {
-		t.Fatalf("expected EngineVersion=2.1.2, got %q", EngineVersion)
+	if EngineVersion != "2.1.3" {
+		t.Fatalf("expected EngineVersion=2.1.3, got %q", EngineVersion)
 	}
 	if DefaultHost != "185.103.103.162" {
 		t.Fatalf("expected DefaultHost=185.103.103.162, got %q", DefaultHost)
@@ -510,5 +510,14 @@ func TestV210DefaultsAndClusterHostNormalization(t *testing.T) {
 		if !isClusterHost(h) {
 			t.Fatalf("expected isClusterHost(%q) == true", h)
 		}
+	}
+
+	botRealityURI := "vless://5d7e9ad2-b895-4dd3-860f-6d542ea0a9ab@node.pixelstore.space:8443?encryption=none&flow=xtls-rprx-vision&fp=firefox&pbk=tpS42yy-Vplmpekqxwh-Nra-VLkPMBu9FMQW-PYd-yY&security=reality&sid=71309f430123dc15&sni=www.microsoft.com&spx=%2F53b70130cac5350&type=tcp#PixelNode"
+	parsed, err := ParseKeyInput(botRealityURI)
+	if err != nil {
+		t.Fatalf("ParseKeyInput(%q): %v", botRealityURI, err)
+	}
+	if parsed.Host != DefaultHost || parsed.Port != 443 || parsed.SNI != DefaultSNI {
+		t.Fatalf("expected @p1xivpn_bot Reality URI to normalize to %s:443 (SNI=%s), got %s:%d (SNI=%s)", DefaultHost, DefaultSNI, parsed.Host, parsed.Port, parsed.SNI)
 	}
 }

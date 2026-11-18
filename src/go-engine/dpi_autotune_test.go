@@ -833,3 +833,43 @@ func TestDohResolver_StaggeredRaceSWRAndSingleflight(t *testing.T) {
 		}
 	})
 }
+
+func TestAdaptiveLadderZapretCoexistenceNoSplitFirst(t *testing.T) {
+	if defaultAdaptiveStepTimeout < 3500*time.Millisecond {
+		t.Fatalf("expected defaultAdaptiveStepTimeout >= 3500ms, got %v", defaultAdaptiveStepTimeout)
+	}
+
+	tuner := NewDPIAutoTuner("")
+	ladder, hadCached := tuner.BuildAdaptiveLadder(AdaptiveDialOptions{
+		Address:            "185.103.103.162:443",
+		SNI:                DefaultSNI,
+		BaseUTLSProfile:    "chrome",
+		BaseDPIProfile:     DPIProfileStandardSplit,
+		EnableSplit:        true,
+		ExternalDesyncTool: "zapret (winws)",
+		AllowDecoySNI:      true,
+		Pins:               []string{DefaultPinnedSPKISHA256},
+	})
+	if hadCached {
+		t.Fatalf("expected hadCached=false for empty tuner")
+	}
+	if len(ladder) < 3 {
+		t.Fatalf("expected non-empty ladder, got %+v", ladder)
+	}
+	if !ladder[0].DisableSplit || ladder[0].Label() != "nosplit/chrome" {
+		t.Fatalf("expected first strategy under zapret to be nosplit/chrome (DisableSplit=true), got %+v (label=%q)", ladder[0], ladder[0].Label())
+	}
+	if !ladder[1].DisableSplit || ladder[1].Label() != "nosplit/firefox" {
+		t.Fatalf("expected second strategy under zapret to be nosplit/firefox (DisableSplit=true), got %+v (label=%q)", ladder[1], ladder[1].Label())
+	}
+	hasSplitFallback := false
+	for _, st := range ladder[2:] {
+		if !st.DisableSplit {
+			hasSplitFallback = true
+			break
+		}
+	}
+	if !hasSplitFallback {
+		t.Fatalf("expected split fallback strategies after nosplit entries, got %+v", ladder)
+	}
+}

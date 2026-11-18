@@ -169,6 +169,11 @@ func (s *LocalProxyServer) syncTUNState(want bool) {
 
 	cur := s.tun.Status()
 	if want {
+		select {
+		case <-s.stopCh:
+			return
+		default:
+		}
 		if !cur.Active {
 			if err := s.tun.Start(); err == nil && s.resolver != nil {
 				s.resolver.CloseIdleConnections()
@@ -305,7 +310,7 @@ func (s *LocalProxyServer) Start() error {
 		}
 	}
 	if cfg.V2.TunMode {
-		s.syncTUNState(true)
+		go s.syncTUNState(true)
 	}
 	return nil
 }
@@ -628,11 +633,14 @@ func (s *LocalProxyServer) handleLegacyTelemetry(w http.ResponseWriter) {
 		"clock_offset_sec":      snap.ClockOffsetSec,
 		"license_tier":          tier,
 		"days_left":             snap.License.DaysLeft,
+		"hours_left":            snap.License.HoursLeft,
 		"devices_used":          snap.License.DevicesUsed,
 		"devices_max":           snap.License.DevicesMax,
 		"speed_mbps":            0.0,
 		"latest_version":        EngineVersion,
-		"license_error":         "",
+		"license_error":         snap.LastLicenseError,
+		"last_error":            snap.LastConnectError,
+		"external_desync":       DetectExternalPacketDesyncTool(),
 		"uptime_sec":            int64(time.Since(s.startedAt).Seconds()),
 		"active_connections":    s.activeConns.Load(),
 		"bytes_up":              totalUp,
@@ -766,6 +774,12 @@ func (s *LocalProxyServer) writeV4Status(w http.ResponseWriter) {
 		"wsl_bridge_ip":         s.wslBridgeIP,
 		"license_tier":          tier,
 		"days_left":             snap.License.DaysLeft,
+		"hours_left":            snap.License.HoursLeft,
+		"devices_used":          snap.License.DevicesUsed,
+		"devices_max":           snap.License.DevicesMax,
+		"license_error":         snap.LastLicenseError,
+		"last_error":            snap.LastConnectError,
+		"external_desync":       DetectExternalPacketDesyncTool(),
 		"manifest_ver":          manifestVer,
 		"manifest_src":          manifestSrc,
 		"uptime_sec":            int64(time.Since(s.startedAt).Seconds()),

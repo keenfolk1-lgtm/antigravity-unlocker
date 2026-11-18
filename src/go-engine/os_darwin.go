@@ -178,3 +178,8 @@ func listMacNetworkServices() ([]string, error) {
 	}
 	return svcs, nil
 }
+
+// DetectExternalPacketDesyncTool is a Windows-specific WinDivert probe (empty on macOS).
+func DetectExternalPacketDesyncTool() string {
+	return ""
+}

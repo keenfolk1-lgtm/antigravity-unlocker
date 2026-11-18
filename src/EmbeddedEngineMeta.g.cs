@@ -3,8 +3,8 @@ namespace PixelTunnel
 {
     internal static class EmbeddedEngineMeta
     {
-        public const string ExpectedSha256 = "253cdb46fee5cc3a9e6af5c772d71e71f15099e064bac3c4dc699320f81a7bd0";
-        public const string EngineVersion = "2.1.2";
+        public const string ExpectedSha256 = "4da1b22d9fe207ba65d5035f1cf97cda9c3ce67d861fdd787c01f16ea1cbf3ac";
+        public const string EngineVersion = "2.1.3";
         public const string ResourceName = "PixelTunnel.pixelcore_utls.gz";
     }
 }

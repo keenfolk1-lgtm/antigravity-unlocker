@@ -477,6 +477,8 @@ type MuxManager struct {
 	instantWakeCount atomic.Int64
 	lastWakeReason   string
 	lastWakeUnix     int64
+	lastLicenseErr   string
+	lastConnectErr   string
 	connectGen       atomic.Uint64
 
 	// Optional hook to customize dialing in unit tests without live network.
@@ -1017,6 +1019,36 @@ func findAlternateHostIndex(candidates []NodeConfig, primaryIdx int) int {
 	return -1
 }
 
+func extractLicenseErrorCode(err error) string {
+	if err == nil || !errors.Is(err, ErrLicenseRejected) {
+		return ""
+	}
+	up := strings.ToUpper(err.Error())
+	switch {
+	case strings.Contains(up, "DEVICE_LIMIT"):
+		return "DEVICE_LIMIT"
+	case strings.Contains(up, "KEY_EXPIRED"):
+		return "KEY_EXPIRED"
+	case strings.Contains(up, "RATE_LIMITED"):
+		return "RATE_LIMITED"
+	default:
+		return "INVALID_KEY"
+	}
+}
+
+func (m *MuxManager) recordDialFailure(err error) {
+	if m == nil || err == nil {
+		return
+	}
+	licCode := extractLicenseErrorCode(err)
+	m.mu.Lock()
+	m.lastConnectErr = err.Error()
+	if licCode != "" {
+		m.lastLicenseErr = licCode
+	}
+	m.mu.Unlock()
+}
+
 func (m *MuxManager) storeWinningSession(role string, gen uint64, sess *ClientMuxSession, utlsProf string) *ClientMuxSession {
 	m.mu.Lock()
 	if m.isStopped() {
@@ -1027,6 +1059,8 @@ func (m *MuxManager) storeWinningSession(role string, gen uint64, sess *ClientMu
 	// If Instant Wake bumped generation during dial, still keep an already healthy role session or replace cleanly
 	if m.connectGen.Load() != gen && m.sessions[role] != nil && !m.sessions[role].IsClosed() {
 		existing := m.sessions[role]
+		m.lastLicenseErr = ""
+		m.lastConnectErr = ""
 		m.mu.Unlock()
 		_ = sess.Close()
 		return existing
@@ -1036,6 +1070,8 @@ func (m *MuxManager) storeWinningSession(role string, gen uint64, sess *ClientMu
 	if utlsProf != "" {
 		m.utlsProfile = utlsProf
 	}
+	m.lastLicenseErr = ""
+	m.lastConnectErr = ""
 	m.mu.Unlock()
 	if m.selector != nil {
 		m.selector.NotifyConnected(role, sess.Node())
@@ -1069,6 +1105,10 @@ func (m *MuxManager) finishSecondRacer(resCh <-chan pwpDialOutcome, inflight int
 }
 
 func (m *MuxManager) dialSequentialCandidates(ctx context.Context, role string, gen uint64, candidates []NodeConfig, tried []bool, lastErr error) (*ClientMuxSession, error) {
+	if errors.Is(lastErr, ErrLicenseRejected) {
+		m.recordDialFailure(lastErr)
+		return nil, lastErr
+	}
 	for i, node := range candidates {
 		if tried != nil && tried[i] {
 			continue
@@ -1085,6 +1125,10 @@ func (m *MuxManager) dialSequentialCandidates(ctx context.Context, role string, 
 		m.recordNodeProbe(node, err == nil, lat, sess)
 		if err != nil {
 			lastErr = err
+			m.recordDialFailure(err)
+			if errors.Is(err, ErrLicenseRejected) {
+				return nil, err
+			}
 			continue
 		}
 		stored := m.storeWinningSession(role, gen, sess, utlsProf)
@@ -1264,6 +1308,15 @@ func (m *MuxManager) getOrConnectRole(ctx context.Context, role string) (*Client
 				return stored, nil
 			}
 			lastErr = out.err
+			m.recordDialFailure(out.err)
+			if errors.Is(out.err, ErrLicenseRejected) {
+				if staggerPending {
+					staggerTimer.Stop()
+					staggerPending = false
+				}
+				drainAbandoned()
+				return nil, out.err
+			}
 			if staggerPending {
 				staggerTimer.Stop()
 				staggerPending = false
@@ -1460,20 +1513,21 @@ func (m *MuxManager) dialSessionWithFallback(ctx context.Context, node NodeConfi
 
 	dialOnceTLS := func() (*UTLSDialResult, error) {
 		res, _, derr := tuner.DialAdaptiveTLS(ctx, AdaptiveDialOptions{
-			Address:          targetAddr,
-			SNI:              sni,
-			BaseUTLSProfile:  utlsProf,
-			BaseDPIProfile:   dpiProf,
-			EnableSplit:      node.Frag || node.EnableDpiSplit,
-			DecoySNIs:        decoySNIs,
-			AllowDecoySNI:    allowDecoy,
-			Pins:             pins,
-			RequirePin:       len(pins) > 0 && rootCAs == nil && !insecure,
-			RootCAs:          rootCAs,
-			ForceHTTP1ALPN:   true,
-			InsecureTestOnly: insecure,
-			NetFingerprint:   netFP,
-			DialControl:      m.getDialControl(),
+			Address:            targetAddr,
+			SNI:                sni,
+			BaseUTLSProfile:    utlsProf,
+			BaseDPIProfile:     dpiProf,
+			EnableSplit:        node.Frag || node.EnableDpiSplit,
+			ExternalDesyncTool: DetectExternalPacketDesyncTool(),
+			DecoySNIs:          decoySNIs,
+			AllowDecoySNI:      allowDecoy,
+			Pins:               pins,
+			RequirePin:         len(pins) > 0 && rootCAs == nil && !insecure,
+			RootCAs:            rootCAs,
+			ForceHTTP1ALPN:     true,
+			InsecureTestOnly:   insecure,
+			NetFingerprint:     netFP,
+			DialControl:        m.getDialControl(),
 		})
 		return res, derr
 	}
@@ -1572,6 +1626,8 @@ type MuxManagerSnapshot struct {
 	StickyAINode       string
 	AIMigrations       int64
 	MediaPoolConns     int
+	LastLicenseError   string
+	LastConnectError   string
 	Nodes              []NodeProbeStatus
 }
 
@@ -1587,6 +1643,8 @@ func (m *MuxManager) Snapshot() MuxManagerSnapshot {
 		LastWakeReason:   m.lastWakeReason,
 		LastWakeUnix:     m.lastWakeUnix,
 		ClockOffsetSec:   m.clockOffset.Load(),
+		LastLicenseError: m.lastLicenseErr,
+		LastConnectError: m.lastConnectErr,
 	}
 	if m.autoTuner != nil {
 		snap.DPIStrategy = m.autoTuner.ActiveStrategy()

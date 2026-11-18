@@ -2031,3 +2031,36 @@ func TestHighRTT160MsAndStreamResetDoNotKillMuxSession(t *testing.T) {
 		t.Fatalf("st1 echo after rst failed: %q err=%v", string(buf2), err)
 	}
 }
+
+func TestMuxLicenseRejectedFailsFastAndRecordsSnapshot(t *testing.T) {
+	cfg := DefaultEngineConfig()
+	cfg.Nodes = []NodeConfig{
+		{Name: "Node-A", Region: "nl", Host: "10.0.0.1", Port: 443, Mux: true, Roles: []string{"ai", "media"}},
+		{Name: "Node-B", Region: "nl", Host: "10.0.0.2", Port: 443, Mux: true, Roles: []string{"ai", "media"}},
+		{Name: "Node-C", Region: "us", Host: "10.0.0.3", Port: 443, Mux: true, Roles: []string{"ai", "media"}},
+	}
+	mux := NewMuxManager(cfg, nil)
+	defer mux.Close()
+
+	var dials atomic.Int32
+	mux.dialNodeOverride = func(ctx context.Context, node NodeConfig, forcePWP3 bool) (*ClientMuxSession, string, error) {
+		dials.Add(1)
+		return nil, "", fmt.Errorf("%w: HTTP 403 DEVICE_LIMIT (3/3)", ErrLicenseRejected)
+	}
+
+	_, _, err := mux.OpenStream(context.Background(), "ai", "daily-cloudcode-pa.googleapis.com", 443)
+	if !errors.Is(err, ErrLicenseRejected) {
+		t.Fatalf("expected ErrLicenseRejected, got %v", err)
+	}
+	// Happy Eyeballs launches candidate 0 immediately (and candidate 1 after stagger if slower); it must abort remaining sequential nodes immediately.
+	if got := dials.Load(); got > 2 {
+		t.Fatalf("expected fail-fast on ErrLicenseRejected without probing sequential candidate 3, got %d dials", got)
+	}
+	snap := mux.Snapshot()
+	if snap.LastLicenseError != "DEVICE_LIMIT" {
+		t.Fatalf("expected Snapshot().LastLicenseError=DEVICE_LIMIT, got %+v", snap)
+	}
+	if !strings.Contains(snap.LastConnectError, "DEVICE_LIMIT") {
+		t.Fatalf("expected Snapshot().LastConnectError to retain DEVICE_LIMIT detail, got %q", snap.LastConnectError)
+	}
+}

@@ -980,7 +980,7 @@ namespace PixelTunnel
 
     public static class PixelCoreService
     {
-        public const string ENGINE_VERSION = "2.1.2";
+        public const string ENGINE_VERSION = "2.1.3";
         private const string DEFAULT_HOST = "185.103.103.162";
         private const string DEFAULT_SNI = "ai.pixelstore.space";
         private const int WARM_POOL_TARGET = 2;
@@ -1173,8 +1173,12 @@ namespace PixelTunnel
             public string Error;
         }
 
+        private static string _lastUsedEngineLabel = "Не запускался";
+        private static string _lastGoEngineFailureReason = "";
         public static bool UsingGoEngine { get; private set; }
         public static string GoEngineFallbackReason { get; private set; }
+        public static string LastUsedEngineLabel { get { return _lastUsedEngineLabel; } private set { _lastUsedEngineLabel = value ?? ""; } }
+        public static string LastGoEngineFailureReason { get { return _lastGoEngineFailureReason; } private set { _lastGoEngineFailureReason = value ?? ""; } }
         public static string ActiveEngineLabel { get { return UsingGoEngine ? ("Go uTLS (Chrome v" + ENGINE_VERSION + ")") : ("C# Fallback (v" + ENGINE_VERSION + ")"); } }
         public static string ActiveLocalControlToken { get { return _localControlToken ?? ""; } }
         public static int ActivePacRevision { get { return _pacRevision; } }
@@ -1530,6 +1534,101 @@ namespace PixelTunnel
             return false;
         }
 
+        private static readonly object _extDesyncLock = new object();
+        private static DateTime _extDesyncCheckedUtc = DateTime.MinValue;
+        private static string _extDesyncCached = "";
+
+        public static string DetectExternalDesyncProcess()
+        {
+            lock (_extDesyncLock)
+            {
+                if (_extDesyncCheckedUtc != DateTime.MinValue && (DateTime.UtcNow - _extDesyncCheckedUtc).TotalSeconds < 5.0)
+                    return _extDesyncCached;
+            }
+
+            string found = "";
+            var targets = new KeyValuePair<string, string>[]
+            {
+                new KeyValuePair<string, string>("winws", "zapret (winws)"),
+                new KeyValuePair<string, string>("winws2", "zapret (winws2)"),
+                new KeyValuePair<string, string>("goodbyedpi", "goodbyedpi"),
+                new KeyValuePair<string, string>("ciadpi", "byedpi"),
+                new KeyValuePair<string, string>("byedpi", "byedpi"),
+                new KeyValuePair<string, string>("spoofdpi", "spoofdpi")
+            };
+            foreach (var kv in targets)
+            {
+                Process[] procs = null;
+                try
+                {
+                    procs = Process.GetProcessesByName(kv.Key);
+                    if (procs != null && procs.Length > 0)
+                    {
+                        found = kv.Value;
+                        break;
+                    }
+                }
+                catch { }
+                finally
+                {
+                    if (procs != null)
+                    {
+                        for (int i = 0; i < procs.Length; i++)
+                        {
+                            try { if (procs[i] != null) procs[i].Dispose(); } catch { }
+                        }
+                    }
+                }
+            }
+
+            lock (_extDesyncLock)
+            {
+                _extDesyncCached = found;
+                _extDesyncCheckedUtc = DateTime.UtcNow;
+            }
+            return found;
+        }
+
+        public static bool EnsureEmbeddedManifestLoaded()
+        {
+            try
+            {
+                var asm = Assembly.GetExecutingAssembly();
+                using (Stream st = asm.GetManifestResourceStream("PixelTunnel.nodes_v3.enc"))
+                {
+                    if (st == null) return false;
+                    using (var sr = new StreamReader(st, Encoding.ASCII))
+                    {
+                        string raw = sr.ReadToEnd();
+                        return TryApplySignedManifestEnvelope(raw, "embedded", false);
+                    }
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        public static bool IsKnownManifestHost(string host)
+        {
+            if (string.IsNullOrWhiteSpace(host)) return false;
+            string clean = host.Trim().Trim('[', ']');
+            lock (_nodesLock)
+            {
+                for (int i = 0; i < _nodes.Count; i++)
+                {
+                    var n = _nodes[i];
+                    if (n != null && !string.IsNullOrEmpty(n.Host) &&
+                        string.Equals(n.Host.Trim().Trim('[', ']'), clean, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
         private static void EnsureManifestSecretsLoaded(int maxWaitMs = 5000)
         {
             try
@@ -1539,6 +1638,8 @@ namespace PixelTunnel
                     _persistedManifestVersion = LoadPersistedManifestVersion();
                 if (!HasAnyNodeWithSecret())
                     TryLoadCachedManifest();
+                if (!HasAnyNodeWithSecret())
+                    EnsureEmbeddedManifestLoaded();
                 if (HasAnyNodeWithSecret() || !_enableRemoteManifestFetch) return;
 
                 Task t;
@@ -1649,6 +1750,8 @@ namespace PixelTunnel
                 }
                 BuildDefaultNodesIfEmpty();
                 TryLoadCachedManifest();
+                if (!HasAnyNodeWithSecret())
+                    EnsureEmbeddedManifestLoaded();
                 EnsurePowerModeHook();
 
                 CancellationToken token = _cts.Token;
@@ -1671,6 +1774,8 @@ namespace PixelTunnel
                 {
                     UsingGoEngine = true;
                     GoEngineFallbackReason = "";
+                    LastUsedEngineLabel = "Go uTLS v4 (Chrome/Firefox)";
+                    LastGoEngineFailureReason = "";
                     ActiveProtocol = "Go uTLS (Chrome)";
                     IsRunning = true;
                     Task.Run(() => GoTelemetryPollLoopAsync(token));
@@ -1679,6 +1784,8 @@ namespace PixelTunnel
 
                 UsingGoEngine = false;
                 GoEngineFallbackReason = goFallbackReason ?? "C# Fallback активен";
+                LastUsedEngineLabel = "C# Fallback (SChannel)";
+                LastGoEngineFailureReason = GoEngineFallbackReason;
 
                 _mainListener = new TcpListener(IPAddress.Loopback, _localPort);
                 _mainListener.Start(512);
@@ -2153,7 +2260,11 @@ namespace PixelTunnel
                     if (effectiveNow.Year >= 2025)
                     {
                         if (issuedDto.UtcDateTime > effectiveNow.AddDays(2)) return false;
-                        if (issuedDto.UtcDateTime < effectiveNow.AddDays(-180)) return false;
+                        if (!string.Equals(sourceLabel, "embedded", StringComparison.OrdinalIgnoreCase) &&
+                            issuedDto.UtcDateTime < effectiveNow.AddDays(-180))
+                        {
+                            return false;
+                        }
                     }
                 }
 
@@ -2703,9 +2814,11 @@ namespace PixelTunnel
                             node.UseTls &&
                             !node.ProbeVerified;
 
-            int maxAttempts = (_enableDpiFragment && node.EnableDpiSplit && node.UseTls) ? 2 : 1;
+            bool hasExtDesync = !string.IsNullOrEmpty(DetectExternalDesyncProcess());
+            int maxAttempts = ((_enableDpiFragment && node.EnableDpiSplit && node.UseTls) || hasExtDesync) ? 2 : 1;
             for (int attempt = 0; attempt < maxAttempts; attempt++)
             {
+                bool disableSplitThisAttempt = hasExtDesync && attempt == 0;
                 TcpClient tcp = new TcpClient();
                 Pwp3MuxClient mux = null;
                 try
@@ -2743,7 +2856,7 @@ namespace PixelTunnel
                     Stream transport = HandshakeWithServer(
                         tcp, node, true,
                         out enc, out dec, out nativeTlsBulk, out negotiatedMuxV3,
-                        effectiveSni, profileToUse);
+                        effectiveSni, profileToUse, disableSplitThisAttempt);
                     sw.Stop();
 
                     if (!negotiatedMuxV3)
@@ -4226,13 +4339,14 @@ namespace PixelTunnel
             out bool nativeTlsBulk,
             out bool negotiatedMuxV3,
             string overrideSni = null,
-            int dpiProfile = -1)
+            int dpiProfile = -1,
+            bool disableDpiSplit = false)
         {
             string sniHost = string.IsNullOrEmpty(overrideSni) ? node.Sni : overrideSni;
             int prof = (dpiProfile >= 0) ? dpiProfile : _activeDpiProfile;
 
             DpiFragmentingStream fragStream = new DpiFragmentingStream(serverTcp.GetStream(), sniHost, prof);
-            fragStream.FragmentActive = _enableDpiFragment && node.EnableDpiSplit;
+            fragStream.FragmentActive = !disableDpiSplit && _enableDpiFragment && node.EnableDpiSplit;
             Stream transportStream = fragStream;
 
             if (node.UseTls)
@@ -5267,6 +5381,19 @@ namespace PixelTunnel
                 if (!string.IsNullOrEmpty(tier)) ServerLicenseTier = tier;
                 int dl = MiniJson.GetInt(obj, "days_left", int.MinValue);
                 if (dl != int.MinValue) ServerDaysLeft = dl;
+                int hl = MiniJson.GetInt(obj, "hours_left", int.MinValue);
+                if (hl != int.MinValue) ServerHoursLeft = hl;
+                int du = MiniJson.GetInt(obj, "devices_used", -1);
+                if (du >= 0) ServerDevicesUsed = du;
+                int dm = MiniJson.GetInt(obj, "devices_max", -1);
+                if (dm >= 0) ServerDevicesMax = dm;
+                string licErr = MiniJson.GetStr(obj, "license_error");
+                if (!string.IsNullOrEmpty(licErr))
+                    LastLicenseError = licErr;
+                else if (MiniJson.GetBool(obj, "connected", false))
+                    LastLicenseError = "";
+                string connErr = MiniJson.GetStr(obj, "last_error");
+                if (connErr != null) LastConnectError = connErr;
                 int mv = MiniJson.GetInt(obj, "manifest_ver", 0);
                 if (mv > 0) ManifestVersion = mv;
                 string ms = MiniJson.GetStr(obj, "manifest_src");
@@ -6471,6 +6598,7 @@ namespace PixelTunnel
                     {
                         psi.EnvironmentVariables["PIXEL_LOCAL_TOKEN"] = localToken;
                     }
+                    psi.EnvironmentVariables["GOMEMLIMIT"] = "96MiB";
 
                     Process proc = Process.Start(psi);
                     if (proc == null)
@@ -6498,7 +6626,7 @@ namespace PixelTunnel
                     _goProc = proc;
 
                     Stopwatch sw = Stopwatch.StartNew();
-                    while (sw.ElapsedMilliseconds < 2500)
+                    while (sw.ElapsedMilliseconds < 8000)
                     {
                         if (proc.HasExited)
                         {
@@ -6516,7 +6644,7 @@ namespace PixelTunnel
                     }
 
                     StopLocked();
-                    failReason = "Go uTLS не поднял локальный порт за 2.5с — активирован C# Fallback";
+                    failReason = "Go uTLS не поднял локальный порт за 8с (возможна проверка антивирусом Windows Defender) — активирован C# Fallback";
                     return false;
                 }
                 catch (Exception ex)
@@ -6580,7 +6708,7 @@ namespace PixelTunnel
             {
                 try
                 {
-                    if (!_goProc.HasExited && !_goProc.WaitForExit(300))
+                    if (!_goProc.HasExited && !_goProc.WaitForExit(2200))
                     {
                         _goProc.Kill();
                         _goProc.WaitForExit(400);

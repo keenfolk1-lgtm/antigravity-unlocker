@@ -8,8 +8,12 @@ import (
 	"net"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 var (
@@ -186,4 +190,63 @@ func HealIDEConfigurations(httpPort int, enable bool, headless bool) {
 	if headless {
 		return
 	}
+}
+
+var (
+	extDesyncMu     sync.Mutex
+	extDesyncCached string
+	extDesyncAt     time.Time
+)
+
+// DetectExternalPacketDesyncTool inspects running Windows processes via CreateToolhelp32Snapshot
+// (cached for 5 seconds, zero subprocesses) to detect active packet-splitting tools like Zapret or GoodbyeDPI.
+func DetectExternalPacketDesyncTool() string {
+	extDesyncMu.Lock()
+	if !extDesyncAt.IsZero() && time.Since(extDesyncAt) < 5*time.Second {
+		cached := extDesyncCached
+		extDesyncMu.Unlock()
+		return cached
+	}
+	extDesyncMu.Unlock()
+
+	detected := ""
+	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if err == nil {
+		var pe windows.ProcessEntry32
+		pe.Size = uint32(unsafe.Sizeof(pe))
+		if windows.Process32First(snap, &pe) == nil {
+			for {
+				exe := strings.ToLower(strings.TrimSpace(windows.UTF16ToString(pe.ExeFile[:])))
+				switch exe {
+				case "winws.exe", "winws2.exe":
+					detected = "zapret (winws)"
+				case "goodbyedpi.exe":
+					if detected == "" {
+						detected = "goodbyedpi"
+					}
+				case "ciadpi.exe", "byedpi.exe":
+					if detected == "" {
+						detected = "byedpi"
+					}
+				case "spoofdpi.exe":
+					if detected == "" {
+						detected = "spoofdpi"
+					}
+				}
+				if detected == "zapret (winws)" {
+					break
+				}
+				if windows.Process32Next(snap, &pe) != nil {
+					break
+				}
+			}
+		}
+		_ = windows.CloseHandle(snap)
+	}
+
+	extDesyncMu.Lock()
+	extDesyncCached = detected
+	extDesyncAt = time.Now()
+	extDesyncMu.Unlock()
+	return detected
 }

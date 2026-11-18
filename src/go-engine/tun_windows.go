@@ -482,6 +482,7 @@ func (c *TUNController) writeWintunPacket(pkt []byte) error {
 func (c *TUNController) wintunRXLoop(sess uintptr, readWait windows.Handle) {
 	defer c.wg.Done()
 	handles := []windows.Handle{readWait, c.stopEvent}
+	rxBuf := make([]byte, 65536)
 
 	for c.active.Load() {
 		var pktSize uint32
@@ -497,15 +498,15 @@ func (c *TUNController) wintunRXLoop(sess uintptr, readWait windows.Handle) {
 			return
 		}
 
-		var pkt []byte
+		n := 0
 		if pktSize > 0 && pktSize <= 65536 {
-			pkt = make([]byte, pktSize)
-			_, _, _ = procRtlMoveMemory.Call(uintptr(unsafe.Pointer(&pkt[0])), ptr, uintptr(pktSize))
+			n = int(pktSize)
+			_, _, _ = procRtlMoveMemory.Call(uintptr(unsafe.Pointer(&rxBuf[0])), ptr, uintptr(pktSize))
 		}
 		_, _, _ = c.wintun.releaseReceivePkt.Call(sess, ptr)
 
-		if len(pkt) > 0 && c.processor != nil {
-			c.processor.ProcessPacket(pkt)
+		if n > 0 && c.processor != nil {
+			c.processor.ProcessPacket(rxBuf[:n])
 		}
 	}
 }

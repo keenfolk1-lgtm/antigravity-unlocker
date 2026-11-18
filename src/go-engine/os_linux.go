@@ -276,3 +276,8 @@ func HealIDEConfigurations(httpPort int, enable bool, headless bool) {
 		_ = patchIDESettingsFile(filepath.Join(cfgDir, ide, "User", "settings.json"), httpPort, enable)
 	}
 }
+
+// DetectExternalPacketDesyncTool is a Windows-specific WinDivert probe (empty on Linux).
+func DetectExternalPacketDesyncTool() string {
+	return ""
+}

@@ -21,15 +21,16 @@ import (
 const (
 	maxAutoTuneCacheEntries    = 64
 	autoTuneCacheTTL           = 7 * 24 * time.Hour
-	defaultAdaptiveStepTimeout = 1600 * time.Millisecond
+	defaultAdaptiveStepTimeout = 3500 * time.Millisecond
 )
 
 // DPIStrategy identifies one TLS ClientHello fragmentation + uTLS + optional Decoy-SNI combination.
 type DPIStrategy struct {
-	DPIProfile  DPIProfile `json:"dpi_profile"`
-	UTLSProfile string     `json:"utls_profile"`
-	UseDecoySNI bool       `json:"use_decoy_sni"`
-	DecoySNI    string     `json:"decoy_sni,omitempty"`
+	DPIProfile   DPIProfile `json:"dpi_profile"`
+	UTLSProfile  string     `json:"utls_profile"`
+	DisableSplit bool       `json:"disable_split,omitempty"`
+	UseDecoySNI  bool       `json:"use_decoy_sni"`
+	DecoySNI     string     `json:"decoy_sni,omitempty"`
 }
 
 // Label formats the strategy into a concise human/telemetry string.
@@ -39,6 +40,9 @@ func (s DPIStrategy) Label() string {
 		prof = "chrome"
 	}
 	base := s.DPIProfile.String() + "/" + prof
+	if s.DisableSplit {
+		base = "nosplit/" + prof
+	}
 	if s.UseDecoySNI && strings.TrimSpace(s.DecoySNI) != "" {
 		return "decoy:" + strings.ToLower(strings.TrimSpace(s.DecoySNI)) + "+" + base
 	}
@@ -280,21 +284,22 @@ func (t *DPIAutoTuner) saveSnapshotToDisk(entries map[string]cachedDPIStrategy) 
 
 // AdaptiveDialOptions configures the adaptive TLS/DPI escalation ladder.
 type AdaptiveDialOptions struct {
-	Address          string
-	SNI              string
-	BaseUTLSProfile  string
-	BaseDPIProfile   DPIProfile
-	EnableSplit      bool
-	DecoySNIs        []string
-	AllowDecoySNI    bool
-	Pins             []string
-	RequirePin       bool
-	RootCAs          *x509.CertPool
-	ForceHTTP1ALPN   bool
-	InsecureTestOnly bool
-	StepTimeout      time.Duration
-	NetFingerprint   string
-	DialControl      func(network, address string, c syscall.RawConn) error
+	Address            string
+	SNI                string
+	BaseUTLSProfile    string
+	BaseDPIProfile     DPIProfile
+	EnableSplit        bool
+	ExternalDesyncTool string
+	DecoySNIs          []string
+	AllowDecoySNI      bool
+	Pins               []string
+	RequirePin         bool
+	RootCAs            *x509.CertPool
+	ForceHTTP1ALPN     bool
+	InsecureTestOnly   bool
+	StepTimeout        time.Duration
+	NetFingerprint     string
+	DialControl        func(network, address string, c syscall.RawConn) error
 }
 
 // BuildAdaptiveLadder returns deduplicated bypass strategies ordered from cached/fast to Auto Decoy-SNI.
@@ -305,11 +310,12 @@ func (t *DPIAutoTuner) BuildAdaptiveLadder(opts AdaptiveDialOptions) ([]DPIStrat
 		primaryUTLS = "firefox"
 		altUTLS = "chrome"
 	}
+	extDesync := strings.TrimSpace(opts.ExternalDesyncTool) != ""
 
 	if !opts.EnableSplit && !opts.AllowDecoySNI {
 		return []DPIStrategy{
-			{DPIProfile: opts.BaseDPIProfile, UTLSProfile: primaryUTLS},
-			{DPIProfile: opts.BaseDPIProfile, UTLSProfile: altUTLS},
+			{DPIProfile: opts.BaseDPIProfile, UTLSProfile: primaryUTLS, DisableSplit: extDesync || !opts.EnableSplit},
+			{DPIProfile: opts.BaseDPIProfile, UTLSProfile: altUTLS, DisableSplit: extDesync || !opts.EnableSplit},
 		}, false
 	}
 
@@ -332,6 +338,21 @@ func (t *DPIAutoTuner) BuildAdaptiveLadder(opts AdaptiveDialOptions) ([]DPIStrat
 		}
 	}
 
+	// If zapret/GoodbyeDPI/ByeDPI is active on the host, try NoSplit ClientHello FIRST
+	// so PixelTunnel does not double-fragment TLS records on top of WinDivert desync.
+	if extDesync {
+		appendUnique(DPIStrategy{
+			DPIProfile:   DPIProfileStandardSplit,
+			UTLSProfile:  primaryUTLS,
+			DisableSplit: true,
+		})
+		appendUnique(DPIStrategy{
+			DPIProfile:   DPIProfileStandardSplit,
+			UTLSProfile:  altUTLS,
+			DisableSplit: true,
+		})
+	}
+
 	// Step 1: Configured / fast profile on native SNI.
 	appendUnique(DPIStrategy{
 		DPIProfile:  opts.BaseDPIProfile,
@@ -351,6 +372,15 @@ func (t *DPIAutoTuner) BuildAdaptiveLadder(opts AdaptiveDialOptions) ([]DPIStrat
 		DPIProfile:  DPIProfileSniMicroChunk,
 		UTLSProfile: altUTLS,
 	})
+
+	// Fallback NoSplit before Decoy-SNI for environments with strict middleboxes or unadvertised desync.
+	if !extDesync {
+		appendUnique(DPIStrategy{
+			DPIProfile:   DPIProfileStandardSplit,
+			UTLSProfile:  primaryUTLS,
+			DisableSplit: true,
+		})
+	}
 
 	// Step 3: Auto Decoy-SNI with SPKI pin verification.
 	if opts.AllowDecoySNI && len(opts.Pins) > 0 && !opts.InsecureTestOnly {
@@ -461,7 +491,7 @@ func (t *DPIAutoTuner) DialAdaptiveTLS(ctx context.Context, opts AdaptiveDialOpt
 			maskedDecoy = true
 		}
 
-		enableSplit := opts.EnableSplit || idx > 0 || cand.UseDecoySNI
+		enableSplit := !cand.DisableSplit && (opts.EnableSplit || idx > 0 || cand.UseDecoySNI)
 
 		stepCtx, stepCancel := context.WithTimeout(ctx, stepTimeout)
 		res, err := dialUTLSOnce(stepCtx, UTLSDialOptions{

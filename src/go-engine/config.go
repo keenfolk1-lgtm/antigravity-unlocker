@@ -19,7 +19,7 @@ import (
 
 const (
 	EngineName    = "PixelCore_v4_Go"
-	EngineVersion = "2.1.2"
+	EngineVersion = "2.1.3"
 
 	DefaultHost              = "185.103.103.162"
 	DefaultSNI               = "ai.pixelstore.space"
@@ -975,7 +975,7 @@ func normalizeLegacyClusterHost(host string) (string, bool) {
 func isLegacyDecoySNI(sni string) bool {
 	clean := strings.ToLower(strings.Trim(strings.TrimSpace(sni), "[]"))
 	switch clean {
-	case "www.amd.com", "node.pixelstore.space", "201.34.152.97", "147.45.135.71":
+	case "www.amd.com", "www.microsoft.com", "node.pixelstore.space", "201.34.152.97", "147.45.135.71":
 		return true
 	default:
 		return false
