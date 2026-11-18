@@ -7,7 +7,7 @@
 [![Telegram Channel](https://img.shields.io/badge/Channel-@pixel__antigravity__fix-26A5E4)](https://t.me/pixel_antigravity_fix)
 [![Telegram Bot](https://img.shields.io/badge/VPN%20Bot-@p1xivpn__bot-26A5E4)](https://t.me/p1xivpn_bot)
 
-**Open-source cross-platform split-tunneling proxy & IDE region-unlocker** for **Windows**, **macOS**, and **Linux**. Fixes `location is not supported`, OAuth2 login, MCP servers, and API timeouts in **Google Antigravity IDE**, **Cursor**, **Claude Code**, **Gemini CLI**, **Codex CLI**, **Windsurf**, **ChatGPT**, and **Claude** using a native **Chrome uTLS** Go engine, **PWP-4 AEAD** transport, and **Zero-DNS Smart PAC** — without breaking local Russian/CIS sites or conflicting with **Zapret (`winws`)** / **GoodbyeDPI**.
+**Open-source cross-platform split-tunneling proxy & region unlocker** for **Windows**, **macOS**, and **Linux**. Fixes `location is not supported`, OAuth2 login, MCP servers, and API timeouts in **Google Antigravity 2.0 / IDE**, **Cursor**, **Claude Code**, **Gemini CLI**, **Codex CLI**, **Windsurf**, **ChatGPT**, and **Claude** using a native **Chrome uTLS** Go engine, **PWP-4 AEAD** transport, and **Zero-DNS Smart PAC** — without breaking local Russian/CIS sites or conflicting with **Zapret (`winws`)** / **GoodbyeDPI**.
 
 Лёгкий и полностью открытый клиент для **Windows**, **macOS** и **Linux** с точечной маршрутизацией трафика (Smart PAC / Split-Tunneling), нативным движком **Chrome uTLS** и шифрованным мультиплексированным транспортом **PWP-4 AEAD**.
 
@@ -15,6 +15,14 @@
 - 🌐 **Официальный сайт / Подписки**: [pixelstore.space](https://pixelstore.space/)
 - 🤖 **Telegram-бот (PRO-ключи, YouTube, Discord, iOS/Android)**: [@p1xivpn_bot](https://t.me/p1xivpn_bot)
 - 📦 **Скачать готовый билд**: [GitHub Releases (v2.1.3)](https://github.com/keenfolk1-lgtm/antigravity-unlocker/releases/latest)
+
+<p align="center">
+  <img src="docs/ui.png" alt="PixelTunnel v2.1.3 UI" width="380" />
+  <br />
+  <sub>Интерфейс PixelTunnel v2.1.3 (Windows WPF + встроенное Go uTLS ядро)</sub>
+</p>
+
+![Схема маршрутизации PixelTunnel](docs/architecture.png)
 
 ## Что нового в v2.1.3
 - **Совместимость с `zapret` (`winws.exe`), `GoodbyeDPI` и `ByeDPI`**: автоматическое обнаружение активных WinDivert/DPI-утилит и переключение TLS-рукопожатия в режим `No-Split` без двойной фрагментации пакетов (шаг адаптации увеличен до `3500 мс`).
