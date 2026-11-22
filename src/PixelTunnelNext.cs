@@ -35,8 +35,8 @@ using ShapePath = System.Windows.Shapes.Path;
 [assembly: AssemblyTrademark("")]
 [assembly: AssemblyCulture("")]
 [assembly: ComVisible(false)]
-[assembly: AssemblyVersion("2.1.3.0")]
-[assembly: AssemblyFileVersion("2.1.3.0")]
+[assembly: AssemblyVersion("2.1.4.0")]
+[assembly: AssemblyFileVersion("2.1.4.0")]
 [assembly: System.Runtime.Versioning.TargetFramework(".NETFramework,Version=v4.8", FrameworkDisplayName = ".NET Framework 4.8")]
 
 namespace PixelTunnel
@@ -487,7 +487,7 @@ namespace PixelTunnel
         public static string GetFreeModeSentinelUri() { return "pwp3://free@ai.pixelstore.space:443#PixelTunnel-Free"; }
         private static string GetDefaultClusterHost() { return "ai.pixelstore.space"; }
 
-        public const string APP_VERSION = "2.1.3";
+        public const string APP_VERSION = "2.1.4";
         public const string IPC_PIPE_NAME = "Local\\PixelTunnel_IPC_v2";
         private const string CORE_EXE_NAME = "pixel-tun-core";
         private const int LOCAL_MIXED_PORT = 17890;
@@ -2356,8 +2356,8 @@ namespace PixelTunnel
 
             rulesStack.Children.Add(CreateToggleRow(
                 1,
-                "ChatGPT, Claude, Cursor и нейросети",
-                "Copilot, Midjourney, Suno, ElevenLabs, Perplexity",
+                "ChatGPT, Claude, AI Studio и нейросети",
+                "Google AI Studio, Gemini, Cursor, Copilot, Midjourney, Suno, Perplexity",
                 false,
                 out _iconBoxAi,
                 out _chkBoxAi,
@@ -6873,8 +6873,9 @@ namespace PixelTunnel
                 string[] targetSuffixes = new[]
                 {
                     "antigravity.google", "antigravity-unleash.goog", "googleapis.com", "google.com",
-                    "gstatic.com", "gemini.google.com", "aistudio.google.com", "makersuite.google.com",
-                    "googleusercontent.com", "claude.ai", "anthropic.com", "openai.com", "chatgpt.com",
+                    "gstatic.com", "gemini.google.com", "aistudio.google.com", "ai.studio", "makersuite.google.com",
+                    "googleusercontent.com", "usercontent.goog", "withgoogle.com", "google.dev",
+                    "claude.ai", "anthropic.com", "openai.com", "chatgpt.com",
                     "oaistatic.com", "oaiusercontent.com", "cursor.com", "cursor.sh", "cursorapi.com",
                     "codeium.com", "windsurf.com", "github.com", "githubusercontent.com", "npmjs.org",
                     "pypi.org", "huggingface.co", "discord.com", "discordapp.com", "discord.gg",
@@ -7833,6 +7834,7 @@ namespace PixelTunnel
 
                     string agCode = portOpen ? RunHttpProbe("https://daily-cloudcode-pa.googleapis.com", proxyUrl, 5) : "000";
                     string gemCode = portOpen ? RunHttpProbe("https://gemini.google.com", proxyUrl, 5) : "000";
+                    string aiStudioCode = portOpen ? RunHttpProbe("https://aistudio.google.com", proxyUrl, 5) : "000";
                     string oauthCode = portOpen ? RunHttpProbe("https://oauth2.googleapis.com/token", proxyUrl, 5) : "000";
                     string spCode = portOpen ? RunHttpProbe("https://open.spotify.com", proxyUrl, 5) : "000";
                     string yaCode = RunHttpProbe("https://ya.ru", "", 4);
@@ -7862,6 +7864,7 @@ namespace PixelTunnel
                         {
                             agCode = RunHttpProbe("https://daily-cloudcode-pa.googleapis.com", proxyUrl, 8);
                             gemCode = RunHttpProbe("https://gemini.google.com", proxyUrl, 8);
+                            aiStudioCode = RunHttpProbe("https://aistudio.google.com", proxyUrl, 8);
                             oauthCode = RunHttpProbe("https://oauth2.googleapis.com/token", proxyUrl, 8);
                             spCode = RunHttpProbe("https://open.spotify.com", proxyUrl, 8);
                             yaCode = RunHttpProbe("https://ya.ru", "", 5);
@@ -7889,6 +7892,7 @@ namespace PixelTunnel
                             {
                                 agCode = RunHttpProbe("https://daily-cloudcode-pa.googleapis.com", proxyUrl, 8);
                                 gemCode = RunHttpProbe("https://gemini.google.com", proxyUrl, 8);
+                                aiStudioCode = RunHttpProbe("https://aistudio.google.com", proxyUrl, 8);
                                 oauthCode = RunHttpProbe("https://oauth2.googleapis.com/token", proxyUrl, 8);
                                 spCode = RunHttpProbe("https://open.spotify.com", proxyUrl, 8);
                                 yaCode = RunHttpProbe("https://ya.ru", "", 5);
@@ -7907,7 +7911,7 @@ namespace PixelTunnel
                             FlushWindowsDnsCache();
                             HealAiEditorsAndServices(true, false, _optAntigravity, _optCursorAi, _optDiscordYt, _optSocialWeb);
                             issuesFixed++;
-                            report.AppendLine(string.Format("  ⚡ [АВТО-ФИКС УСПЕШЕН] Туннель поднят! CloudCode: HTTP {0} [OK], Gemini: HTTP {1} [OK], OAuth2: HTTP {2} [OK], РФ (ya.ru): HTTP {3} [OK]", agCode, gemCode, oauthCode, yaCode));
+                            report.AppendLine(string.Format("  ⚡ [АВТО-ФИКС УСПЕШЕН] Туннель поднят! CloudCode: HTTP {0} [OK], Gemini: HTTP {1} [OK], AI Studio: HTTP {4} [OK], OAuth2: HTTP {2} [OK], РФ (ya.ru): HTTP {3} [OK]", agCode, gemCode, oauthCode, yaCode, aiStudioCode));
                             RunOnUiThreadSync(delegate
                             {
                                 _isConnected = true;
@@ -7970,7 +7974,7 @@ namespace PixelTunnel
                             ResetButtonState(true);
                             UpdateLicenseHintFromServer();
                         });
-                        report.AppendLine(string.Format("  ✓ [OK] Все каналы работают идеально! CloudCode: HTTP {0} [OK], Gemini: HTTP {1} [OK], OAuth2: HTTP {2} [OK], РФ (ya.ru): HTTP {3} [OK]", agCode, gemCode, oauthCode, yaCode));
+                        report.AppendLine(string.Format("  ✓ [OK] Все каналы работают идеально! CloudCode: HTTP {0} [OK], Gemini: HTTP {1} [OK], AI Studio: HTTP {4} [OK], OAuth2: HTTP {2} [OK], РФ (ya.ru): HTTP {3} [OK]", agCode, gemCode, oauthCode, yaCode, aiStudioCode));
                     }
                 }
 
@@ -8809,22 +8813,36 @@ namespace PixelTunnel
                 if (!string.IsNullOrEmpty(d) && !domains.Contains(d)) domains.Add(d);
             };
 
+            string[] googleAiStudioList = new[]
+            {
+                "aistudio.google.com", "ai.studio", "aistudio.google", "makersuite.google.com",
+                "alkalimakersuite-pa.clients6.google.com", "alkalimakersuiteapplets.pa.clients6.google.com",
+                "webchannel-alkalimakersuite-pa.clients6.google.com", "generativelanguage.googleapis.com",
+                "gemini.google.com", "gemini.google", "geminiweb-pa.clients6.google.com",
+                "notebooklm.google.com", "notebooklm.google", "colab.research.google.com", "colab.google",
+                "labs.google", "deepmind.google", "ai.google", "ai.google.dev", "jules.google", "firebase.studio",
+                "cloud.google", "usercontent.goog", "withgoogle.com", "google.dev", "g.co", "goo.gl", "ggpht.com",
+                "recaptcha.net", "googletagmanager.com", "google-analytics.com",
+                "run.app", "web.app", "firebaseapp.com", "appspot.com",
+                "apis.google.com", "accounts.google.com",
+                "clients1.google.com", "clients2.google.com", "clients3.google.com",
+                "clients4.google.com", "clients5.google.com", "clients6.google.com",
+                "cloudconsole-pa.clients6.google.com", "people-pa.clients6.google.com",
+                "oauth2.googleapis.com", "www.googleapis.com", "googleapis.com",
+                "gstatic.com", "googleusercontent.com", "google.com",
+                "gvt1.com", "gvt2.com", "gvt3.com", "1e100.net", "pki.goog"
+            };
+
             if (routeAg)
             {
                 string[] agList = new[]
                 {
-                    "antigravity.google", "antigravity-unleash.goog", "daily-cloudcode-pa.googleapis.com",
-                    "cloudcode-pa.googleapis.com", "generativelanguage.googleapis.com", "aistudio.google.com",
-                    "gemini.google.com", "makersuite.google.com", "alkalimakersuite-pa.clients6.google.com",
-                    "notebooklm.google.com", "labs.google", "deepmind.google", "ai.google.dev",
-                    "googleapis.com", "oauth2.googleapis.com", "www.googleapis.com",
-                    "clients6.google.com", "clients1.google.com", "clients2.google.com", "clients3.google.com",
-                    "clients4.google.com", "clients5.google.com", "cloudaicompanion.googleapis.com",
-                    "daily-cloud-pa.clients6.google.com", "geminiweb-pa.clients6.google.com", "aicode.googleapis.com",
-                    "gstatic.com", "googleusercontent.com", "accounts.google.com", "google.com",
-                    "gvt1.com", "gvt2.com", "gvt3.com", "1e100.net", "pki.goog"
+                    "antigravity.google", "antigravity-unleash.goog", "antigravity-unlocker.pages.dev", "antigravity.dev",
+                    "daily-cloudcode-pa.googleapis.com", "cloudcode-pa.googleapis.com",
+                    "cloudaicompanion.googleapis.com", "daily-cloud-pa.clients6.google.com", "aicode.googleapis.com"
                 };
                 foreach (var d in agList) addDom(d);
+                foreach (var d in googleAiStudioList) addDom(d);
 
                 if (_optMcpTerminal)
                 {
@@ -8844,16 +8862,17 @@ namespace PixelTunnel
             {
                 string[] aiList = new[]
                 {
-                    "cursor.com", "cursor.sh", "cursorapi.com", "windsurf.com", "codeium.com",
+                    "cursor.com", "cursor.sh", "cursorapi.com", "cursor-cdn.com", "windsurf.com", "codeium.com",
                     "openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com",
-                    "claude.ai", "anthropic.com", "perplexity.ai", "grok.com", "x.ai",
+                    "claude.ai", "claude.com", "anthropic.com", "auth0.com", "perplexity.ai", "grok.com", "x.ai",
                     "elevenlabs.io", "suno.com", "suno.ai", "midjourney.com", "klingai.com",
                     "runwayml.com", "sora.com", "luma.ai", "lumalabs.ai", "heygen.com",
-                    "v0.dev", "bolt.new", "lovable.dev", "replit.com", "huggingface.co",
+                    "v0.dev", "bolt.new", "lovable.dev", "replit.com", "huggingface.co", "hf.co",
                     "openrouter.ai", "together.ai", "groq.com", "deepseek.com", "mistral.ai",
                     "cohere.com", "replicate.com", "civitai.com", "githubcopilot.com", "copilot.microsoft.com"
                 };
                 foreach (var d in aiList) addDom(d);
+                foreach (var d in googleAiStudioList) addDom(d);
             }
 
             if (routeMedia)

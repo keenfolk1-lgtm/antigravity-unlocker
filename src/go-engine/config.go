@@ -19,7 +19,7 @@ import (
 
 const (
 	EngineName    = "PixelCore_v4_Go"
-	EngineVersion = "2.1.3"
+	EngineVersion = "2.1.4"
 
 	DefaultHost              = "185.103.103.162"
 	DefaultSNI               = "ai.pixelstore.space"
@@ -159,101 +159,148 @@ var CategoryDomains = func() map[string][]string {
 	}
 	social = append(social, telegram...)
 
+	googleAIStudio := []string{
+		"aistudio.google.com",
+		"ai.studio",
+		"aistudio.google",
+		"makersuite.google.com",
+		"alkalimakersuite-pa.clients6.google.com",
+		"alkalimakersuiteapplets.pa.clients6.google.com",
+		"webchannel-alkalimakersuite-pa.clients6.google.com",
+		"generativelanguage.googleapis.com",
+		"gemini.google.com",
+		"gemini.google",
+		"geminiweb-pa.clients6.google.com",
+		"notebooklm.google.com",
+		"notebooklm.google",
+		"colab.research.google.com",
+		"colab.google",
+		"labs.google",
+		"deepmind.google",
+		"ai.google",
+		"ai.google.dev",
+		"jules.google",
+		"firebase.studio",
+		"cloud.google",
+		"usercontent.goog",
+		"withgoogle.com",
+		"google.dev",
+		"g.co",
+		"goo.gl",
+		"ggpht.com",
+		"recaptcha.net",
+		"googletagmanager.com",
+		"google-analytics.com",
+		"run.app",
+		"web.app",
+		"firebaseapp.com",
+		"appspot.com",
+		"apis.google.com",
+		"accounts.google.com",
+		"clients1.google.com",
+		"clients2.google.com",
+		"clients3.google.com",
+		"clients4.google.com",
+		"clients5.google.com",
+		"clients6.google.com",
+		"cloudconsole-pa.clients6.google.com",
+		"people-pa.clients6.google.com",
+		"oauth2.googleapis.com",
+		"www.googleapis.com",
+		"googleapis.com",
+		"gstatic.com",
+		"googleusercontent.com",
+		"google.com",
+		"gvt1.com",
+		"gvt2.com",
+		"gvt3.com",
+		"1e100.net",
+		"pki.goog",
+	}
+
+	dedupeDomains := func(lists ...[]string) []string {
+		seen := make(map[string]struct{})
+		var out []string
+		for _, list := range lists {
+			for _, d := range list {
+				if _, ok := seen[d]; ok {
+					continue
+				}
+				seen[d] = struct{}{}
+				out = append(out, d)
+			}
+		}
+		return out
+	}
+
+	antigravityList := dedupeDomains([]string{
+		"antigravity.google",
+		"antigravity-unleash.goog",
+		"antigravity-unlocker.pages.dev",
+		"antigravity.dev",
+		"daily-cloudcode-pa.googleapis.com",
+		"cloudcode-pa.googleapis.com",
+		"cloudaicompanion.googleapis.com",
+		"daily-cloud-pa.clients6.google.com",
+		"aicode.googleapis.com",
+	}, googleAIStudio)
+
+	aiList := dedupeDomains([]string{
+		"anthropic.com",
+		"claude.ai",
+		"claude.com",
+		"openai.com",
+		"chatgpt.com",
+		"oaistatic.com",
+		"oaiusercontent.com",
+		"auth0.com",
+		"cursor.sh",
+		"cursor.com",
+		"cursorapi.com",
+		"cursor-cdn.com",
+		"codeium.com",
+		"windsurf.com",
+		"perplexity.ai",
+		"x.ai",
+		"grok.com",
+		"huggingface.co",
+		"hf.co",
+		"elevenlabs.io",
+		"suno.com",
+		"suno.ai",
+		"midjourney.com",
+		"klingai.com",
+		"runwayml.com",
+		"sora.com",
+		"luma.ai",
+		"lumalabs.ai",
+		"heygen.com",
+		"v0.dev",
+		"bolt.new",
+		"lovable.dev",
+		"replit.com",
+		"openrouter.ai",
+		"together.ai",
+		"groq.com",
+		"deepseek.com",
+		"mistral.ai",
+		"cohere.com",
+		"replicate.com",
+		"civitai.com",
+		"githubcopilot.com",
+		"copilot.microsoft.com",
+	}, googleAIStudio)
+
 	return map[string][]string{
-		"antigravity": {
-			"antigravity.google",
-			"antigravity-unleash.goog",
-			"antigravity-unlocker.pages.dev",
-			"antigravity.dev",
-			"daily-cloudcode-pa.googleapis.com",
-			"cloudcode-pa.googleapis.com",
-			"generativelanguage.googleapis.com",
-			"aistudio.google.com",
-			"gemini.google.com",
-			"makersuite.google.com",
-			"alkalimakersuite-pa.clients6.google.com",
-			"notebooklm.google.com",
-			"notebooklm.google",
-			"colab.research.google.com",
-			"labs.google",
-			"deepmind.google",
-			"ai.google.dev",
-			"googleapis.com",
-			"oauth2.googleapis.com",
-			"www.googleapis.com",
-			"clients1.google.com",
-			"clients2.google.com",
-			"clients3.google.com",
-			"clients4.google.com",
-			"clients5.google.com",
-			"clients6.google.com",
-			"cloudaicompanion.googleapis.com",
-			"daily-cloud-pa.clients6.google.com",
-			"geminiweb-pa.clients6.google.com",
-			"aicode.googleapis.com",
-			"gstatic.com",
-			"googleusercontent.com",
-			"accounts.google.com",
-			"google.com",
-			"gvt1.com",
-			"gvt2.com",
-			"gvt3.com",
-			"ggpht.com",
-			"1e100.net",
-			"pki.goog",
-		},
-		"ai": {
-			"anthropic.com",
-			"claude.ai",
-			"claude.com",
-			"openai.com",
-			"chatgpt.com",
-			"oaistatic.com",
-			"oaiusercontent.com",
-			"auth0.com",
-			"cursor.sh",
-			"cursor.com",
-			"cursorapi.com",
-			"cursor-cdn.com",
-			"codeium.com",
-			"windsurf.com",
-			"perplexity.ai",
-			"x.ai",
-			"grok.com",
-			"huggingface.co",
-			"hf.co",
-			"elevenlabs.io",
-			"suno.com",
-			"suno.ai",
-			"midjourney.com",
-			"klingai.com",
-			"runwayml.com",
-			"sora.com",
-			"luma.ai",
-			"lumalabs.ai",
-			"heygen.com",
-			"v0.dev",
-			"bolt.new",
-			"lovable.dev",
-			"replit.com",
-			"openrouter.ai",
-			"together.ai",
-			"groq.com",
-			"deepseek.com",
-			"mistral.ai",
-			"cohere.com",
-			"replicate.com",
-			"civitai.com",
-			"githubcopilot.com",
-			"copilot.microsoft.com",
-		},
-		"mcp":      mcpDev,
-		"dev":      mcpDev,
-		"media":    media,
-		"discord":  discord,
-		"youtube":  youtube,
-		"telegram": telegram,
-		"social":   social,
+		"antigravity": antigravityList,
+		"ai":          aiList,
+		"mcp":         mcpDev,
+		"dev":         mcpDev,
+		"media":       media,
+		"discord":     discord,
+		"youtube":     youtube,
+		"telegram":    telegram,
+		"social":      social,
 	}
 }()
 
@@ -1741,6 +1788,9 @@ func (m *DomainRuleMatcher) Classify(host string) RuleAction {
 }
 
 func (m *DomainRuleMatcher) inferRole(h string) string {
+	if h == "accounts.youtube.com" || h == "payments.youtube.com" {
+		return "ai"
+	}
 	for _, d := range m.mediaSuffix {
 		if h == d || strings.HasSuffix(h, "."+d) {
 			return "media"

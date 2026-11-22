@@ -1,28 +1,33 @@
-# PixelTunnel v2.1.3 — Open-Source AI & IDE Unlocker (Antigravity, Cursor, Claude Code, Windsurf)
+# PixelTunnel v2.1.4 — Open-Source AI & IDE Unlocker (Antigravity, Cursor, Claude Code, Windsurf)
 
 [![Release](https://img.shields.io/github/v/release/keenfolk1-lgtm/antigravity-unlocker?label=release&color=2ea44f)](https://github.com/keenfolk1-lgtm/antigravity-unlocker/releases/latest)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)](https://github.com/keenfolk1-lgtm/antigravity-unlocker/releases/latest)
-[![Microsoft WDSI](https://img.shields.io/badge/Microsoft%20Defender-WDSI%20Verified%20Clean-2ea44f)](https://github.com/keenfolk1-lgtm/antigravity-unlocker/releases/tag/v2.1.3)
+[![Microsoft WDSI](https://img.shields.io/badge/Microsoft%20Defender-WDSI%20Verified%20Clean-2ea44f)](https://github.com/keenfolk1-lgtm/antigravity-unlocker/releases/tag/v2.1.4)
 [![Website](https://img.shields.io/badge/site-pixelstore.space-111827)](https://pixelstore.space/)
 [![Telegram Channel](https://img.shields.io/badge/Channel-@pixel__antigravity__fix-26A5E4)](https://t.me/pixel_antigravity_fix)
 [![Telegram Bot](https://img.shields.io/badge/VPN%20Bot-@p1xivpn__bot-26A5E4)](https://t.me/p1xivpn_bot)
 
-**Open-source cross-platform split-tunneling proxy & region unlocker** for **Windows**, **macOS**, and **Linux**. Fixes `location is not supported`, OAuth2 login, MCP servers, and API timeouts in **Google Antigravity 2.0 / IDE**, **Cursor**, **Claude Code**, **Gemini CLI**, **Codex CLI**, **Windsurf**, **ChatGPT**, and **Claude** using a native **Chrome uTLS** Go engine, **PWP-4 AEAD** transport, and **Zero-DNS Smart PAC** — without breaking local Russian/CIS sites or conflicting with **Zapret (`winws`)** / **GoodbyeDPI**.
+**Open-source cross-platform split-tunneling proxy & region unlocker** for **Windows**, **macOS**, and **Linux**. Fixes `location is not supported`, OAuth2 login, MCP servers, and API timeouts in **Google Antigravity 2.0 / IDE**, **Google AI Studio**, **Cursor**, **Claude Code**, **Gemini CLI**, **Codex CLI**, **Windsurf**, **ChatGPT**, and **Claude** using a native **Chrome uTLS** Go engine, **PWP-4 AEAD** transport, and **Zero-DNS Smart PAC** — without breaking local Russian/CIS sites or conflicting with **Zapret (`winws`)** / **GoodbyeDPI**.
 
 Лёгкий и полностью открытый клиент для **Windows**, **macOS** и **Linux** с точечной маршрутизацией трафика (Smart PAC / Split-Tunneling), нативным движком **Chrome uTLS** и шифрованным мультиплексированным транспортом **PWP-4 AEAD**.
 
 - 📢 **Telegram-канал по обходу (обновления, гайды и помощь)**: [t.me/pixel_antigravity_fix](https://t.me/pixel_antigravity_fix)
 - 🌐 **Официальный сайт / Подписки**: [pixelstore.space](https://pixelstore.space/)
 - 🤖 **Telegram-бот (PRO-ключи, YouTube, Discord, iOS/Android)**: [@p1xivpn_bot](https://t.me/p1xivpn_bot)
-- 📦 **Скачать готовый билд**: [GitHub Releases (v2.1.3)](https://github.com/keenfolk1-lgtm/antigravity-unlocker/releases/latest)
+- 📦 **Скачать готовый билд**: [GitHub Releases (v2.1.4)](https://github.com/keenfolk1-lgtm/antigravity-unlocker/releases/latest)
 
 <p align="center">
-  <img src="docs/ui.png" alt="PixelTunnel v2.1.3 UI" width="380" />
+  <img src="docs/ui.png" alt="PixelTunnel v2.1.4 UI" width="380" />
   <br />
-  <sub>Интерфейс PixelTunnel v2.1.3 (Windows WPF + встроенное Go uTLS ядро)</sub>
+  <sub>Интерфейс PixelTunnel v2.1.4 (Windows WPF + встроенное Go uTLS ядро)</sub>
 </p>
 
 ![Схема маршрутизации PixelTunnel](docs/architecture.png)
+
+## Что нового в v2.1.4
+- **Полная поддержка Google AI Studio и Gemini в браузере**: добавлены домены `ai.studio`, `usercontent.goog`, `cloud.google`, `run.app`, `web.app`, `firebaseapp.com`, `appspot.com`, `withgoogle.com`, `google.dev`, `alkalimakersuiteapplets.pa.clients6.google.com`, `webchannel-alkalimakersuite-pa.clients6.google.com`, а также все поддомены Google AI Studio / Build & Preview.
+- **Google AI Studio в категории «ChatGPT, Claude, AI Studio и нейросети»**: теперь `aistudio.google.com`, `ai.studio` и `gemini.google.com` проксируются как при включённой галочке `Antigravity IDE`, так и при включённой категории нейросетей отдельно.
+- **Исправлен резервный C# Smart PAC и добавлена проверка AI Studio**: из резервного генератора PAC удалены локальные DNS-вызовы `isInNet` и небезопасный fallback `; DIRECT`, а в сквозную диагностику добавлена проверка `aistudio.google.com`.
 
 ## Что нового в v2.1.3
 - **Совместимость с `zapret` (`winws.exe`), `GoodbyeDPI` и `ByeDPI`**: автоматическое обнаружение активных WinDivert/DPI-утилит и переключение TLS-рукопожатия в режим `No-Split` без двойной фрагментации пакетов (шаг адаптации увеличен до `3500 мс`).

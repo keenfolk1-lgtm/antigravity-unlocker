@@ -980,7 +980,7 @@ namespace PixelTunnel
 
     public static class PixelCoreService
     {
-        public const string ENGINE_VERSION = "2.1.3";
+        public const string ENGINE_VERSION = "2.1.4";
         private const string DEFAULT_HOST = "185.103.103.162";
         private const string DEFAULT_SNI = "ai.pixelstore.space";
         private const int WARM_POOL_TARGET = 2;
@@ -3071,7 +3071,10 @@ namespace PixelTunnel
 
             if (HostMatchesDomain(h, "googleapis.com") || HostMatchesDomain(h, "antigravity.google") ||
                 HostMatchesDomain(h, "antigravity-unleash.goog") || HostMatchesDomain(h, "1e100.net") ||
-                HostMatchesDomain(h, "gstatic.com") || HostMatchesDomain(h, "google.com") || HostMatchesDomain(h, "gvt1.com"))
+                HostMatchesDomain(h, "gstatic.com") || HostMatchesDomain(h, "google.com") || HostMatchesDomain(h, "gvt1.com") ||
+                HostMatchesDomain(h, "ai.studio") || HostMatchesDomain(h, "usercontent.goog") ||
+                HostMatchesDomain(h, "cloud.google") || HostMatchesDomain(h, "withgoogle.com") ||
+                HostMatchesDomain(h, "google.dev") || HostMatchesDomain(h, "ggpht.com"))
             { bypassDirect = false; ruleLabel = "antigravity-core"; return; }
 
             if (h.EndsWith(".ru", StringComparison.Ordinal) || h.EndsWith(".su", StringComparison.Ordinal) ||
@@ -5447,8 +5450,8 @@ namespace PixelTunnel
             sb.AppendLine("// PixelTunnel v" + ENGINE_VERSION + " Smart PAC (rev " + _pacRevision + ")");
             sb.AppendLine("function FindProxyForURL(url, host) {");
             sb.AppendLine("  var h = (host || '').toLowerCase();");
-            sb.AppendLine("  if (isPlainHostName(h) || shExpMatch(h, '127.*') || shExpMatch(h, 'localhost') || shExpMatch(h, '10.*') || shExpMatch(h, '192.168.*') || isInNet(h, '172.16.0.0', '255.240.0.0')) return 'DIRECT';");
-            sb.AppendLine("  var px = 'PROXY 127.0.0.1:" + _localPort.ToString(CultureInfo.InvariantCulture) + "; DIRECT';");
+            sb.AppendLine("  if (isPlainHostName(h) || shExpMatch(h, '127.*') || shExpMatch(h, 'localhost') || shExpMatch(h, '10.*') || shExpMatch(h, '192.168.*') || /^172\\.(1[6-9]|2\\d|3[0-1])\\./.test(h)) return 'DIRECT';");
+            sb.AppendLine("  var px = 'PROXY 127.0.0.1:" + _localPort.ToString(CultureInfo.InvariantCulture) + "; SOCKS5 127.0.0.1:" + _socksPort.ToString(CultureInfo.InvariantCulture) + "';");
 
             foreach (string dom in _proxyDomains)
             {
@@ -5660,24 +5663,52 @@ namespace PixelTunnel
             });
         }
 
+        private static readonly string[] GoogleAiStudioCategoryDomains = new[]
+        {
+            "aistudio.google.com", "ai.studio", "aistudio.google", "makersuite.google.com",
+            "alkalimakersuite-pa.clients6.google.com", "alkalimakersuiteapplets.pa.clients6.google.com",
+            "webchannel-alkalimakersuite-pa.clients6.google.com", "generativelanguage.googleapis.com",
+            "gemini.google.com", "gemini.google", "geminiweb-pa.clients6.google.com",
+            "notebooklm.google.com", "notebooklm.google", "colab.research.google.com", "colab.google",
+            "labs.google", "deepmind.google", "ai.google", "ai.google.dev", "jules.google", "firebase.studio",
+            "cloud.google", "usercontent.goog", "withgoogle.com", "google.dev", "g.co", "goo.gl", "ggpht.com",
+            "recaptcha.net", "googletagmanager.com", "google-analytics.com",
+            "run.app", "web.app", "firebaseapp.com", "appspot.com",
+            "apis.google.com", "accounts.google.com",
+            "clients1.google.com", "clients2.google.com", "clients3.google.com",
+            "clients4.google.com", "clients5.google.com", "clients6.google.com",
+            "cloudconsole-pa.clients6.google.com", "people-pa.clients6.google.com",
+            "oauth2.googleapis.com", "www.googleapis.com", "googleapis.com",
+            "gstatic.com", "googleusercontent.com", "google.com",
+            "gvt1.com", "gvt2.com", "gvt3.com", "1e100.net", "pki.goog"
+        };
+
+        private static string[] MergeCategoryDomains(string[] primary, string[] extra)
+        {
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var list = new List<string>(primary.Length + extra.Length);
+            foreach (var d in primary)
+            {
+                if (!string.IsNullOrEmpty(d) && seen.Add(d)) list.Add(d);
+            }
+            foreach (var d in extra)
+            {
+                if (!string.IsNullOrEmpty(d) && seen.Add(d)) list.Add(d);
+            }
+            return list.ToArray();
+        }
+
         private static string[] GetCSharpCategoryDomains(string cat)
         {
             switch ((cat ?? "").Trim().ToLowerInvariant())
             {
                 case "antigravity":
-                    return new[]
+                    return MergeCategoryDomains(new[]
                     {
-                        "antigravity.google", "antigravity-unleash.goog", "daily-cloudcode-pa.googleapis.com",
-                        "cloudcode-pa.googleapis.com", "generativelanguage.googleapis.com", "aistudio.google.com",
-                        "gemini.google.com", "makersuite.google.com", "alkalimakersuite-pa.clients6.google.com",
-                        "notebooklm.google.com", "labs.google", "deepmind.google", "ai.google.dev",
-                        "googleapis.com", "oauth2.googleapis.com", "www.googleapis.com",
-                        "clients6.google.com", "clients1.google.com", "clients2.google.com", "clients3.google.com",
-                        "clients4.google.com", "clients5.google.com", "cloudaicompanion.googleapis.com",
-                        "daily-cloud-pa.clients6.google.com", "geminiweb-pa.clients6.google.com", "aicode.googleapis.com",
-                        "gstatic.com", "googleusercontent.com", "accounts.google.com", "google.com",
-                        "gvt1.com", "gvt2.com", "gvt3.com", "1e100.net", "pki.goog"
-                    };
+                        "antigravity.google", "antigravity-unleash.goog", "antigravity-unlocker.pages.dev", "antigravity.dev",
+                        "daily-cloudcode-pa.googleapis.com", "cloudcode-pa.googleapis.com",
+                        "cloudaicompanion.googleapis.com", "daily-cloud-pa.clients6.google.com", "aicode.googleapis.com"
+                    }, GoogleAiStudioCategoryDomains);
                 case "mcp":
                 case "dev":
                     return new[]
@@ -5689,17 +5720,17 @@ namespace PixelTunnel
                         "deno.land", "jsr.io", "bun.sh", "pkg.dev", "docker.io", "cloudflare.com"
                     };
                 case "ai":
-                    return new[]
+                    return MergeCategoryDomains(new[]
                     {
-                        "cursor.com", "cursor.sh", "cursorapi.com", "windsurf.com", "codeium.com",
+                        "cursor.com", "cursor.sh", "cursorapi.com", "cursor-cdn.com", "windsurf.com", "codeium.com",
                         "openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com",
-                        "claude.ai", "anthropic.com", "perplexity.ai", "grok.com", "x.ai",
+                        "claude.ai", "claude.com", "anthropic.com", "auth0.com", "perplexity.ai", "grok.com", "x.ai",
                         "elevenlabs.io", "suno.com", "suno.ai", "midjourney.com", "klingai.com",
                         "runwayml.com", "sora.com", "luma.ai", "lumalabs.ai", "heygen.com",
-                        "v0.dev", "bolt.new", "lovable.dev", "replit.com", "huggingface.co",
+                        "v0.dev", "bolt.new", "lovable.dev", "replit.com", "huggingface.co", "hf.co",
                         "openrouter.ai", "together.ai", "groq.com", "deepseek.com", "mistral.ai",
                         "cohere.com", "replicate.com", "civitai.com", "githubcopilot.com", "copilot.microsoft.com"
-                    };
+                    }, GoogleAiStudioCategoryDomains);
                 case "media":
                     return new[]
                     {

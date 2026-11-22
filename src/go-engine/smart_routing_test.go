@@ -705,3 +705,78 @@ func TestV212LegacyHostNormalizationAndDiscordVoiceCIDR(t *testing.T) {
 		t.Fatalf("expected Discord voice CIDR -> DIRECT when media=false, got %+v", actOff)
 	}
 }
+
+func TestGoogleAIStudioBrowserRoutingAndPAC(t *testing.T) {
+	t.Parallel()
+
+	// Case 1: Only "ai" enabled (antigravity=false, media=false, social=false)
+	cfgAIOnly := DefaultEngineConfig()
+	cfgAIOnly.ProxyAll = false
+	cfgAIOnly.Categories = map[string]bool{
+		"antigravity": false,
+		"ai":          true,
+		"mcp":         false,
+		"media":       false,
+		"social":      false,
+	}
+	cfgAIOnly.RebuildEffectiveRules()
+	mAI := NewDomainRuleMatcher(cfgAIOnly)
+
+	aiStudioTargets := []string{
+		"aistudio.google.com",
+		"ai.studio",
+		"demo.scf.usercontent.goog",
+		"alkalimakersuite-pa.clients6.google.com",
+		"webchannel-alkalimakersuite-pa.clients6.google.com",
+		"generativelanguage.googleapis.com",
+		"payments.cloud.google",
+		"gemini.google.com",
+		"demo-app.run.app",
+		"accounts.google.com",
+	}
+	for _, host := range aiStudioTargets {
+		act := mAI.Classify(host)
+		if act.Action != "PROXY" || act.Role != "ai" {
+			t.Fatalf("ai=true: Classify(%q) = %+v, want Action=PROXY Role=ai", host, act)
+		}
+	}
+	for _, directHost := range []string{"ya.ru", "youtube.com"} {
+		act := mAI.Classify(directHost)
+		if act.Action != "DIRECT" {
+			t.Fatalf("ai=true: Classify(%q) = %+v, want Action=DIRECT", directHost, act)
+		}
+	}
+
+	pac := GenerateSmartPACJS(cfgAIOnly, "127.0.0.1")
+	for _, dom := range []string{"aistudio.google.com", "ai.studio", "usercontent.goog", "cloud.google", "run.app"} {
+		if !strings.Contains(pac, `"`+dom+`"`) {
+			t.Fatalf("expected Smart PAC PROXY_RULES to include %q when ai=true", dom)
+		}
+	}
+
+	// Case 2: Only "antigravity" enabled (ai=false, media=false, social=false)
+	cfgAGOnly := DefaultEngineConfig()
+	cfgAGOnly.ProxyAll = false
+	cfgAGOnly.Categories = map[string]bool{
+		"antigravity": true,
+		"ai":          false,
+		"mcp":         false,
+		"media":       false,
+		"social":      false,
+	}
+	cfgAGOnly.RebuildEffectiveRules()
+	mAG := NewDomainRuleMatcher(cfgAGOnly)
+
+	for _, host := range []string{"aistudio.google.com", "ai.studio", "demo.scf.usercontent.goog", "payments.cloud.google"} {
+		act := mAG.Classify(host)
+		if act.Action != "PROXY" || act.Role != "ai" {
+			t.Fatalf("antigravity=true: Classify(%q) = %+v, want Action=PROXY Role=ai", host, act)
+		}
+	}
+	for _, directHost := range []string{"api.anthropic.com", "youtube.com", "ya.ru"} {
+		act := mAG.Classify(directHost)
+		if act.Action != "DIRECT" {
+			t.Fatalf("antigravity=true: Classify(%q) = %+v, want Action=DIRECT", directHost, act)
+		}
+	}
+}

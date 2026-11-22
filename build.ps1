@@ -127,7 +127,7 @@ namespace PixelTunnel
     internal static class EmbeddedEngineMeta
     {
         public const string ExpectedSha256 = "$expectedSha";
-        public const string EngineVersion = "2.1.0";
+        public const string EngineVersion = "2.1.4";
         public const string ResourceName = "PixelTunnel.pixelcore_utls.gz";
     }
 }
@@ -161,6 +161,10 @@ namespace PixelTunnel
     if ($tempGzPath -and (Test-Path $tempGzPath)) {
         $cscArgs += "/resource:$tempGzPath,PixelTunnel.pixelcore_utls.gz"
     }
+    $manifestEnc = Join-Path (Join-Path $root "manifest") "nodes_v3.enc"
+    if (Test-Path $manifestEnc) {
+        $cscArgs += "/resource:$manifestEnc,PixelTunnel.nodes_v3.enc"
+    }
     $cscArgs += @(
         "/out:$outExe",
         "/reference:$refs",
@@ -169,7 +173,7 @@ namespace PixelTunnel
         $metaPath
     )
 
-    Write-Host "Building PixelTunnel.exe v2.1.0 from open source..."
+    Write-Host "Building PixelTunnel.exe v2.1.4 from open source..."
     & $csc @cscArgs
     if ($LASTEXITCODE -ne 0) {
         throw "Build failed with exit code $LASTEXITCODE"
