@@ -127,7 +127,7 @@ namespace PixelTunnel
     internal static class EmbeddedEngineMeta
     {
         public const string ExpectedSha256 = "$expectedSha";
-        public const string EngineVersion = "2.2.1";
+        public const string EngineVersion = "2.2.2";
         public const string ResourceName = "PixelTunnel.pixelcore_utls.gz";
     }
 }
@@ -174,7 +174,7 @@ namespace PixelTunnel
         $metaPath
     )
 
-    Write-Host "Building PixelTunnel.exe v2.2.1 from open source..."
+    Write-Host "Building PixelTunnel.exe v2.2.2 from open source..."
     & $csc @cscArgs
     if ($LASTEXITCODE -ne 0) {
         throw "Build failed with exit code $LASTEXITCODE"

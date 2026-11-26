@@ -7610,7 +7610,7 @@ namespace PixelTunnel
                     {
                         psi.EnvironmentVariables["PIXEL_LOCAL_TOKEN"] = localToken;
                     }
-                    psi.EnvironmentVariables["GOMEMLIMIT"] = "96MiB";
+                    psi.EnvironmentVariables["GOMEMLIMIT"] = "192MiB";
 
                     Process proc = Process.Start(psi);
                     if (proc == null)

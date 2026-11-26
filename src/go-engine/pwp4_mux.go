@@ -15,6 +15,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1862,10 +1863,10 @@ func (m *MuxManager) instantWakeWatchLoop() {
 				continue
 			}
 
-			// Check clock jump (>3s between 1s ticks indicates OS sleep/hibernation resume)
+			// Check clock jump (>8s between 1s ticks indicates OS sleep/hibernation resume)
 			delta := now.Sub(lastWall)
 			lastWall = now
-			if delta > 3*time.Second || delta < -3*time.Second {
+			if delta > 8*time.Second || delta < -8*time.Second {
 				fp := computeLocalInterfaceFingerprint()
 				m.netFP.Store(fp)
 				_, _ = m.TriggerInstantWake("clock_jump")
@@ -1889,6 +1890,43 @@ func (m *MuxManager) instantWakeWatchLoop() {
 	}
 }
 
+func (m *MuxManager) pingSessionWithRetry(sess *ClientMuxSession, attempts int, timeout time.Duration) (time.Duration, error) {
+	if attempts < 1 {
+		attempts = 1
+	}
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		if sess == nil || sess.IsClosed() || m.isStopped() {
+			return 0, io.ErrClosedPipe
+		}
+		rtt, err := sess.Ping(timeout)
+		if err == nil {
+			return rtt, nil
+		}
+		lastErr = err
+		if i+1 < attempts && !sess.IsClosed() && !m.isStopped() {
+			timer := time.NewTimer(250 * time.Millisecond)
+			select {
+			case <-m.stopCh:
+				timer.Stop()
+				return 0, io.ErrClosedPipe
+			case <-sess.Done():
+				timer.Stop()
+				return 0, io.ErrClosedPipe
+			case <-timer.C:
+			}
+		}
+	}
+	return 0, lastErr
+}
+
+func shouldClosePrimaryAfterPingFailure(sess *ClientMuxSession, activeRxGrace time.Duration) bool {
+	if sess == nil || sess.IsClosed() {
+		return true
+	}
+	return sess.TimeSinceLastRx() >= activeRxGrace
+}
+
 func (m *MuxManager) standbyMaintenanceLoop() {
 	// Keep standby session warm and probe health periodically via FramePing
 	ticker := time.NewTicker(15 * time.Second)
@@ -1905,12 +1943,14 @@ func (m *MuxManager) standbyMaintenanceLoop() {
 
 			if primary != nil && !primary.IsClosed() {
 				tPing := time.Now()
-				if rtt, err := primary.Ping(2 * time.Second); err != nil {
-					m.recordNodeProbe(primary.Node(), false, time.Since(tPing).Milliseconds(), primary)
-					_ = primary.Close()
-					m.clearRoleSession("ai", primary)
-					if newActive := m.promoteStandby("ai"); newActive != nil {
-						m.failoverCount.Add(1)
+				if rtt, err := m.pingSessionWithRetry(primary, 2, 3*time.Second); err != nil {
+					if shouldClosePrimaryAfterPingFailure(primary, 3*time.Second) {
+						m.recordNodeProbe(primary.Node(), false, time.Since(tPing).Milliseconds(), primary)
+						_ = primary.Close()
+						m.clearRoleSession("ai", primary)
+						if newActive := m.promoteStandby("ai"); newActive != nil {
+							m.failoverCount.Add(1)
+						}
 					}
 				} else {
 					rttMs := rtt.Milliseconds()
@@ -2057,14 +2097,43 @@ func (m *MuxManager) checkAndMigrateAI(ctx context.Context) {
 	}
 }
 
+func isVirtualOrVolatileInterfaceName(name string) bool {
+	low := strings.ToLower(strings.TrimSpace(name))
+	if low == "" {
+		return true
+	}
+	for _, pat := range []string{
+		"vethernet", "wsl", "docker", "br-", "veth", "hyper-v",
+		"virbr", "vmnet", "vboxnet", "pixeltun", "wintun", "utun",
+		"tailscale", "wg", "teredo", "isatap",
+	} {
+		if strings.Contains(low, pat) {
+			return true
+		}
+	}
+	return false
+}
+
+func formatInterfaceFingerprint(entries []string) string {
+	if len(entries) == 0 {
+		return ""
+	}
+	cp := append([]string(nil), entries...)
+	sort.Strings(cp)
+	return strings.Join(cp, ";") + ";"
+}
+
 func computeLocalInterfaceFingerprint() string {
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return ""
 	}
-	var b strings.Builder
+	var entries []string
 	for _, iface := range ifaces {
 		if (iface.Flags&net.FlagUp) == 0 || (iface.Flags&net.FlagLoopback) != 0 {
+			continue
+		}
+		if isVirtualOrVolatileInterfaceName(iface.Name) {
 			continue
 		}
 		addrs, err := iface.Addrs()
@@ -2072,13 +2141,13 @@ func computeLocalInterfaceFingerprint() string {
 			continue
 		}
 		for _, a := range addrs {
-			if ipNet, ok := a.(*net.IPNet); ok && ipNet.IP != nil && !ipNet.IP.IsLoopback() {
-				b.WriteString(iface.Name)
-				b.WriteByte('=')
-				b.WriteString(ipNet.IP.String())
-				b.WriteByte(';')
+			if ipNet, ok := a.(*net.IPNet); ok && ipNet.IP != nil {
+				ip4 := ipNet.IP.To4()
+				if ip4 != nil && !ip4.IsLoopback() && !ip4.IsLinkLocalUnicast() {
+					entries = append(entries, iface.Name+"="+ip4.String())
+				}
 			}
 		}
 	}
-	return b.String()
+	return formatInterfaceFingerprint(entries)
 }

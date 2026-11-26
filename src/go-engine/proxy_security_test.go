@@ -535,6 +535,9 @@ func TestLocalProxyConfigCloneRaceSafety(t *testing.T) {
 
 	mux := NewMuxManager(cfg, nil)
 	defer mux.Close()
+	mux.dialNodeOverride = func(ctx context.Context, node NodeConfig, isWS bool) (*ClientMuxSession, string, error) {
+		return nil, "", errors.New("offline race test stub")
+	}
 
 	srv := NewLocalProxyServer(LocalProxyOptions{
 		Config:     cfg,
@@ -783,6 +786,9 @@ func TestV22StatusPingMsAndReloadRulesWSLBridgeHotToggle(t *testing.T) {
 
 	mux := NewMuxManager(cfg, nil)
 	defer mux.Close()
+	mux.dialNodeOverride = func(ctx context.Context, node NodeConfig, isWS bool) (*ClientMuxSession, string, error) {
+		return nil, "", errors.New("offline race test stub")
+	}
 
 	node := NodeConfig{Name: "PingNode-NL", Host: "10.10.0.1", Port: 443, Mux: true}
 	sess := NewClientMuxSession(pCli, bufio.NewReader(pCli), &pwp4ClientCodec{rx: cRx, tx: cTx}, node, LicenseMetadata{Proto: "PWP-4", Tier: "paid"})

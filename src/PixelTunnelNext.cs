@@ -36,8 +36,8 @@ using ShapePath = System.Windows.Shapes.Path;
 [assembly: AssemblyTrademark("")]
 [assembly: AssemblyCulture("")]
 [assembly: ComVisible(false)]
-[assembly: AssemblyVersion("2.2.1.0")]
-[assembly: AssemblyFileVersion("2.2.1.0")]
+[assembly: AssemblyVersion("2.2.2.0")]
+[assembly: AssemblyFileVersion("2.2.2.0")]
 [assembly: System.Runtime.Versioning.TargetFramework(".NETFramework,Version=v4.8", FrameworkDisplayName = ".NET Framework 4.8")]
 
 namespace PixelTunnel
@@ -641,7 +641,7 @@ namespace PixelTunnel
         public static string GetFreeModeSentinelUri() { return "pwp3://free@ai.pixelstore.space:443#PixelTunnel-Free"; }
         private static string GetDefaultClusterHost() { return "ai.pixelstore.space"; }
 
-        public const string APP_VERSION = "2.2.1";
+        public const string APP_VERSION = "2.2.2";
         public const string IPC_PIPE_NAME = "Local\\PixelTunnel_IPC_v2";
         private const int LOCAL_MIXED_PORT = 17890;
         internal static volatile bool _isConfigGenMode = false;
@@ -671,6 +671,7 @@ namespace PixelTunnel
         private bool _isExplicitExit = false;
         private bool _hasShownTrayBalloon = false;
         private int _consecutivePingFailures = 0;
+        private int _consecutivePortCheckFailures = 0;
         private string _githubReleaseUrl = "";
         private string _githubLatestVer = "";
         private static volatile bool _githubUpdateChecked = false;
@@ -10007,6 +10008,7 @@ namespace PixelTunnel
                     });
 
                     _isConnected = true;
+                    _consecutivePortCheckFailures = 0;
                     _tunnelConnectedUtc = DateTime.UtcNow;
                     _lastTunnelConnectedUtc = _tunnelConnectedUtc;
                     var unusedPulseOnConn = RefreshAiPulseUiAsync(true);
@@ -10115,6 +10117,7 @@ namespace PixelTunnel
             _currentPing = 0;
             _ideOpenedPreTunnel = false;
             _isConnected = false;
+            _consecutivePortCheckFailures = 0;
 
             if (updateUi && Dispatcher != null && Dispatcher.CheckAccess())
             {
@@ -11309,6 +11312,7 @@ namespace PixelTunnel
                             RunOnUiThreadSync(delegate
                             {
                                 _isConnected = true;
+                                _consecutivePortCheckFailures = 0;
                                 _connState = TunnelState.Online;
                                 _statusHasCustomMessage = false;
                                 if (_tunnelConnectedUtc == DateTime.MinValue) _tunnelConnectedUtc = DateTime.UtcNow;
@@ -11354,6 +11358,7 @@ namespace PixelTunnel
                             RunOnUiThreadSync(delegate
                             {
                                 _isConnected = true;
+                                _consecutivePortCheckFailures = 0;
                                 _connState = TunnelState.Online;
                                 _statusHasCustomMessage = false;
                                 if (_tunnelConnectedUtc == DateTime.MinValue) _tunnelConnectedUtc = DateTime.UtcNow;
@@ -11896,6 +11901,7 @@ namespace PixelTunnel
                         });
                         if (PixelCoreService.IsRunning && IsLocalPortOpen(_activeHttpPort, 200))
                         {
+                            _consecutivePortCheckFailures = 0;
                             RunOnUiThread(delegate
                             {
                                 if (!PixelCoreService.UsingGoEngine)
@@ -11919,15 +11925,85 @@ namespace PixelTunnel
                 }
 
                 bool alive = PixelCoreService.IsRunning;
-
-                if (!alive || !IsLocalPortOpen(_activeHttpPort, 200))
+                if (!alive)
                 {
-                    // Immediately disable system proxy if core died so browsers NEVER lose internet!
+                    _consecutivePortCheckFailures = 0;
                     _isConnected = false;
                     string stopReason = !string.IsNullOrEmpty(PixelCoreService.GoEngineFallbackReason)
                         ? PixelCoreService.GoEngineFallbackReason
                         : "Системный прокси автоматически отключён. Нажмите «Запустить туннель».";
-                    await Task.Run(() => DisableOrRestoreSystemProxy());
+                    await Task.Run(() =>
+                    {
+                        try { PixelCoreService.StopService(); } catch { }
+                        DisableOrRestoreSystemProxy();
+                    });
+                    RunOnUiThread(delegate
+                    {
+                        SetStatus(ColRed, "Туннель остановился (Прямой интернет сохранён)", stopReason);
+                        ResetButtonState(false);
+                    });
+                    return;
+                }
+
+                bool localPortAlive = await Task.Run(() => IsLocalPortOpen(_activeHttpPort, 600));
+                if (!_isConnected || _isBusy || _isDiagRunning) return;
+
+                if (localPortAlive)
+                {
+                    _consecutivePortCheckFailures = 0;
+                }
+                else
+                {
+                    _consecutivePortCheckFailures++;
+                    if (_consecutivePortCheckFailures < 3)
+                    {
+                        return;
+                    }
+                    _consecutivePortCheckFailures = 0;
+
+                    if (_activeNode != null && (DateTime.UtcNow - _lastAutoReconnectUtc).TotalSeconds >= 15.0)
+                    {
+                        _lastAutoReconnectUtc = DateTime.UtcNow;
+                        VlessNode recoverNode = _activeNode;
+                        await Task.Run(() =>
+                        {
+                            try
+                            {
+                                PixelCoreService.StopService();
+                                Thread.Sleep(150);
+                                string cfg = BuildSingBoxConfig(recoverNode, _optAntigravity, _optCursorAi, _optDiscordYt, _optSocialWeb, false);
+                                ApplyAndStartCoreConfig(cfg);
+                                for (int i = 0; i < 40; i++)
+                                {
+                                    if (IsLocalPortOpen(_activeHttpPort, 150) || !PixelCoreService.IsRunning) break;
+                                    Thread.Sleep(100);
+                                }
+                                if (PixelCoreService.IsRunning && IsLocalPortOpen(_activeHttpPort, 200))
+                                {
+                                    ApplyConnectedProxyPolicy();
+                                }
+                            }
+                            catch { }
+                        });
+                        if (!_isConnected || _isBusy || _isDiagRunning) return;
+                        bool recoveredPort = await Task.Run(() => IsLocalPortOpen(_activeHttpPort, 300));
+                        if (PixelCoreService.IsRunning && recoveredPort)
+                        {
+                            RunOnUiThread(delegate { UpdateConnectionVisuals(false); });
+                            return;
+                        }
+                    }
+
+                    // Core port remained unresponsive across 3 consecutive ticks (~6s): stop core cleanly to avoid zombie Go process!
+                    _isConnected = false;
+                    string stopReason = !string.IsNullOrEmpty(PixelCoreService.GoEngineFallbackReason)
+                        ? PixelCoreService.GoEngineFallbackReason
+                        : "Локальный шлюз перестал отвечать. Системный прокси отключён — нажмите «Запустить туннель».";
+                    await Task.Run(() =>
+                    {
+                        try { PixelCoreService.StopService(); } catch { }
+                        DisableOrRestoreSystemProxy();
+                    });
                     RunOnUiThread(delegate
                     {
                         SetStatus(ColRed, "Туннель остановился (Прямой интернет сохранён)", stopReason);
@@ -12384,6 +12460,10 @@ namespace PixelTunnel
             if (!string.IsNullOrEmpty(PixelCoreService.ActiveWslBridgeIp))
                 sb.AppendLine("WSL2 Bridge IP: " + PixelCoreService.ActiveWslBridgeIp + ":" + _activeHttpPort);
             sb.AppendLine(string.Format("Active Proxy Streams: {0}", CountActiveProxyConnections()));
+            sb.AppendLine(string.Format("MuxTelemetry: Failovers={0} | InstantWakes={1} | LastWake={2}",
+                PixelCoreService.FailoverCount,
+                PixelCoreService.InstantWakeCount,
+                string.IsNullOrEmpty(PixelCoreService.LastWakeReason) ? "none" : PixelCoreService.LastWakeReason));
             if (!string.IsNullOrEmpty(_lastSupportPassport))
             {
                 sb.AppendLine();

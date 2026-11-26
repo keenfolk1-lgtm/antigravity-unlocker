@@ -2,7 +2,7 @@
   <img src="docs/avatar.png" alt="PixelTunnel" width="68" />
 </p>
 
-# PixelTunnel v2.2.1 — Open-Source AI & IDE Unlocker (Antigravity, Cursor, Claude Code, Windsurf)
+# PixelTunnel v2.2.2 — Open-Source AI & IDE Unlocker (Antigravity, Cursor, Claude Code, Windsurf)
 
 [![Release](https://img.shields.io/github/v/release/keenfolk1-lgtm/antigravity-unlocker?label=release&color=2ea44f)](https://github.com/keenfolk1-lgtm/antigravity-unlocker/releases/latest)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)](https://github.com/keenfolk1-lgtm/antigravity-unlocker/releases/latest)
@@ -18,7 +18,7 @@
 - 📢 **Telegram-канал по обходу (обновления, гайды и помощь)**: [t.me/pixel_antigravity_fix](https://t.me/pixel_antigravity_fix)
 - 🌐 **Официальный сайт / Подписки**: [pixelstore.space](https://pixelstore.space/)
 - 🤖 **Telegram-бот (PRO-ключи, YouTube, Discord, iOS/Android)**: [@p1xivpn_bot](https://t.me/p1xivpn_bot)
-- 📦 **Скачать готовый билд**: [GitHub Releases (v2.2.1)](https://github.com/keenfolk1-lgtm/antigravity-unlocker/releases/latest)
+- 📦 **Скачать готовый билд**: [GitHub Releases (v2.2.2)](https://github.com/keenfolk1-lgtm/antigravity-unlocker/releases/latest)
 
 <p align="center">
   <img src="docs/ui.png" alt="PixelTunnel v2.2.0 UI — Obsidian Precision + PRISM ASCII" width="760" />
@@ -35,6 +35,12 @@
 </table>
 
 ![Схема маршрутизации PixelTunnel](docs/architecture.png)
+
+## Что нового в v2.2.2
+- **Устранён ложный сброс UI «Туннель остановлен» (белая кнопка при живом Go-ядре)**: `MonitorLoop` больше не отключает системный прокси после единственного промаха 200-мс проверки локального порта — добавлен порог из 3 последовательных промахов по 600 мс в фоне, авто-восстановление и корректное завершение ядра без «зомби»-процесса.
+- **Увеличен лимит памяти Go uTLS ядра (`GOMEMLIMIT=192MiB`)**: исключены частые GC-паузы под нагрузкой при большом количестве параллельных SSE/HTTP2-потоков IDE.
+- **Устойчивый PWP-4 Ping и фильтрация виртуальных адаптеров в Instant Wake**: проверка канала в `standbyMaintenanceLoop` выполняет повторную попытку (`2×3 с`) и не разрывает сессию при недавнем активном RX-трафике (`<3 с`), а `Instant Wake` игнорирует виртуальные интерфейсы (`vEthernet (WSL)`, `Hyper-V`, `docker`, `tailscale` и т.д.) и временные IPv6-адреса.
+- **Телеметрия `MuxTelemetry` в диагностическом отчёте**: в отчёт диагностики добавлен вывод счётчиков `Failovers`, `InstantWakes` и `LastWake`.
 
 ## Что нового в v2.2.1
 - **Авто-патчер Antigravity `language_server` для Linux и macOS**: при запуске `pixeltunnel start` и через новую команду `pixeltunnel patch [--check] [--tiers-only] [--path <binary>]` движок автоматически патчит `language_server` (`ineligible_tiers` / `ineligibleTiers` → обход ограничения региона аккаунта + `HTTPS_PROXY` → `AG_LS_PROXY`), выполняет атомарную замену без `ETXTBSY`, применяет ad-hoc `codesign` на macOS Apple Silicon и мягко перезапускает затронутый `language_server`.

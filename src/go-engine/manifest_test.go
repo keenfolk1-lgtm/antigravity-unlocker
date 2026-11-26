@@ -486,8 +486,8 @@ func TestFilterRetiredManifestNodesAndSingleNodeGuard(t *testing.T) {
 }
 
 func TestV210DefaultsAndClusterHostNormalization(t *testing.T) {
-	if EngineVersion != "2.2.1" {
-		t.Fatalf("expected EngineVersion=2.2.1, got %q", EngineVersion)
+	if EngineVersion != "2.2.2" {
+		t.Fatalf("expected EngineVersion=2.2.2, got %q", EngineVersion)
 	}
 	if DefaultHost != "185.103.103.162" {
 		t.Fatalf("expected DefaultHost=185.103.103.162, got %q", DefaultHost)

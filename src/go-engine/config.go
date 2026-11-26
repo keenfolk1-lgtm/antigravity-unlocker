@@ -21,7 +21,7 @@ import (
 
 const (
 	EngineName    = "PixelCore_v4_Go"
-	EngineVersion = "2.2.1"
+	EngineVersion = "2.2.2"
 
 	DefaultHost              = "185.103.103.162"
 	DefaultSNI               = "ai.pixelstore.space"
