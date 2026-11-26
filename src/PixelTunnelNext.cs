@@ -957,9 +957,10 @@ namespace PixelTunnel
             }
 
             string icoPath = EnsureIconFileAvailable();
-            if (!string.IsNullOrEmpty(icoPath) && File.Exists(icoPath))
+            var winIcon = LoadWindowIconSafe(icoPath);
+            if (winIcon != null)
             {
-                try { Icon = new System.Windows.Media.Imaging.BitmapImage(new Uri(icoPath)); } catch { }
+                try { Icon = winIcon; } catch { }
             }
 
             BuildInterface();
@@ -1070,6 +1071,10 @@ namespace PixelTunnel
 
             Loaded += delegate
             {
+                if (_trayIcon != null && !_trayIcon.Visible)
+                {
+                    try { _trayIcon.Visible = true; } catch { }
+                }
                 if (!_startMinimized)
                 {
                     var fade = new DoubleAnimation(0.0, 1.0, TimeSpan.FromMilliseconds(220))
@@ -2179,18 +2184,160 @@ namespace PixelTunnel
             });
         }
 
+        private static byte[] ReadIconBytesSafe(string icoPath)
+        {
+            try
+            {
+                using (var s = Assembly.GetExecutingAssembly().GetManifestResourceStream("PixelTunnel.pixel.ico"))
+                {
+                    if (s != null)
+                    {
+                        using (var ms = new MemoryStream())
+                        {
+                            s.CopyTo(ms);
+                            var res = ms.ToArray();
+                            if (res != null && res.Length > 0) return res;
+                        }
+                    }
+                }
+            }
+            catch { }
+            try
+            {
+                if (!string.IsNullOrEmpty(icoPath) && File.Exists(icoPath))
+                {
+                    using (var fs = new FileStream(icoPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                    using (var ms = new MemoryStream())
+                    {
+                        fs.CopyTo(ms);
+                        return ms.ToArray();
+                    }
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        private ImageSource LoadWindowIconSafe(string icoPath)
+        {
+            try
+            {
+                byte[] bytes = ReadIconBytesSafe(icoPath);
+                if (bytes != null && bytes.Length > 0)
+                {
+                    using (var ms = new MemoryStream(bytes))
+                    {
+                        var dec = new System.Windows.Media.Imaging.IconBitmapDecoder(
+                            ms,
+                            System.Windows.Media.Imaging.BitmapCreateOptions.None,
+                            System.Windows.Media.Imaging.BitmapCacheOption.OnLoad
+                        );
+                        System.Windows.Media.Imaging.BitmapSource best = null;
+                        foreach (var f in dec.Frames)
+                        {
+                            if (best == null) { best = f; continue; }
+                            bool fIdeal = f.PixelWidth >= 32 && f.PixelWidth <= 64;
+                            bool bIdeal = best.PixelWidth >= 32 && best.PixelWidth <= 64;
+                            if (fIdeal && (!bIdeal || f.PixelWidth > best.PixelWidth)) best = f;
+                        }
+                        if (best != null)
+                        {
+                            var copy = new System.Windows.Media.Imaging.WriteableBitmap(best);
+                            copy.Freeze();
+                            return copy;
+                        }
+                    }
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        private System.Drawing.Icon LoadTrayIconSafe(string icoPath)
+        {
+            var smallSz = System.Windows.Forms.SystemInformation.SmallIconSize;
+            // 1. Embedded manifest resource (DIB frames, zero file-lock risk)
+            try
+            {
+                using (var s = Assembly.GetExecutingAssembly().GetManifestResourceStream("PixelTunnel.pixel.ico"))
+                {
+                    if (s != null)
+                    {
+                        using (var ms = new MemoryStream())
+                        {
+                            s.CopyTo(ms);
+                            ms.Position = 0;
+                            using (var tmp = new System.Drawing.Icon(ms, smallSz))
+                            {
+                                return (System.Drawing.Icon)tmp.Clone();
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+
+            // 2. Win32 EXE associated icon
+            try
+            {
+                string exePath = Process.GetCurrentProcess().MainModule.FileName;
+                var assoc = System.Drawing.Icon.ExtractAssociatedIcon(exePath);
+                if (assoc != null) return assoc;
+            }
+            catch { }
+
+            // 3. Disk icoPath via read-share stream
+            try
+            {
+                if (!string.IsNullOrEmpty(icoPath) && File.Exists(icoPath))
+                {
+                    using (var fs = new FileStream(icoPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                    using (var ms = new MemoryStream())
+                    {
+                        fs.CopyTo(ms);
+                        ms.Position = 0;
+                        using (var tmp = new System.Drawing.Icon(ms, smallSz))
+                        {
+                            return (System.Drawing.Icon)tmp.Clone();
+                        }
+                    }
+                }
+            }
+            catch { }
+
+            // 4. Programmatic GDI+ Portal Arch fallback (always guaranteed non-null)
+            using (var bmp = new System.Drawing.Bitmap(32, 32, System.Drawing.Imaging.PixelFormat.Format32bppArgb))
+            {
+                using (var g = System.Drawing.Graphics.FromImage(bmp))
+                {
+                    g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                    g.Clear(System.Drawing.Color.FromArgb(255, 16, 17, 21));
+                    using (var pen = new System.Drawing.Pen(System.Drawing.Color.White, 4.0f))
+                    {
+                        pen.StartCap = System.Drawing.Drawing2D.LineCap.Round;
+                        pen.EndCap = System.Drawing.Drawing2D.LineCap.Round;
+                        g.DrawArc(pen, 9.0f, 7.0f, 14.0f, 14.0f, 180.0f, 180.0f);
+                        g.DrawLine(pen, 9.0f, 14.0f, 9.0f, 23.0f);
+                        g.DrawLine(pen, 23.0f, 14.0f, 23.0f, 23.0f);
+                    }
+                    using (var core = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb(255, 96, 165, 250)))
+                    {
+                        g.FillRectangle(core, 13.0f, 15.0f, 6.0f, 6.0f);
+                    }
+                }
+                return System.Drawing.Icon.FromHandle(bmp.GetHicon());
+            }
+        }
+
         private void InitTray(string icoPath)
         {
             try
             {
                 _trayIcon = new System.Windows.Forms.NotifyIcon();
-                if (!string.IsNullOrEmpty(icoPath) && File.Exists(icoPath))
-                    _trayIcon.Icon = new System.Drawing.Icon(icoPath);
-                else
-                    _trayIcon.Icon = System.Drawing.Icon.ExtractAssociatedIcon(Process.GetCurrentProcess().MainModule.FileName);
+                _trayIcon.Icon = LoadTrayIconSafe(icoPath);
 
-                _trayIcon.Text = "PixelTunnel v" + APP_VERSION + " — PWP-4 Dual-Mux";
-                _trayIcon.Visible = true;
+                string tip = "PixelTunnel v" + APP_VERSION + " — PWP-4 Dual-Mux";
+                _trayIcon.Text = tip.Length > 63 ? tip.Substring(0, 63) : tip;
                 _trayIcon.MouseClick += (s, e) =>
                 {
                     if (e.Button == System.Windows.Forms.MouseButtons.Left)
@@ -2242,6 +2389,7 @@ namespace PixelTunnel
                     ExplicitShutdown();
                 });
                 _trayIcon.ContextMenuStrip = menu;
+                _trayIcon.Visible = true;
             }
             catch { }
         }
