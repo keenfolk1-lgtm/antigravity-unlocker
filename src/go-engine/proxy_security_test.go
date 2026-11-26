@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -738,5 +739,191 @@ func TestProxyBugfixesConnectEmptyHostReloadEmptyJSONAndStandbyStop(t *testing.T
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatalf("ensureStandby did not abort promptly on MuxManager.Close()")
+	}
+}
+
+func TestV22StatusPingMsAndReloadRulesWSLBridgeHotToggle(t *testing.T) {
+	// 1. Live Ping/RTT in MuxManagerSnapshot, /__pixelcore/v4/status, and /__pixelcore/telemetry
+	pCli, pSrv := net.Pipe()
+	defer pCli.Close()
+	defer pSrv.Close()
+
+	mat, err := DerivePWP4KeyMaterial("ping-test-secret", "cli-ping", "srv-ping")
+	if err != nil {
+		t.Fatalf("DerivePWP4KeyMaterial: %v", err)
+	}
+	cTx, _ := newPWP4Cipher(mat[0:32], mat[64:80])
+	cRx, _ := newPWP4Cipher(mat[32:64], mat[80:96])
+	sTx, _ := newPWP4Cipher(mat[32:64], mat[80:96])
+	sRx, _ := newPWP4Cipher(mat[0:32], mat[64:80])
+
+	// Server loop responding to FramePing with FramePong after a small delay
+	go func() {
+		br := bufio.NewReader(pSrv)
+		for {
+			ft, sid, payload, _, rerr := sRx.OpenFrame(br, nil)
+			if rerr != nil {
+				return
+			}
+			if ft == FramePing {
+				time.Sleep(15 * time.Millisecond)
+				wire, werr := sTx.SealFrame(FramePong, sid, payload)
+				if werr == nil {
+					_, _ = pSrv.Write(wire)
+				}
+			}
+		}
+	}()
+
+	cfg := DefaultEngineConfig()
+	cfg.HTTPPort = 0
+	cfg.SOCKSPort = 0
+	cfg.EnableWSLBridge = false
+	cfg.RebuildEffectiveRules()
+
+	mux := NewMuxManager(cfg, nil)
+	defer mux.Close()
+
+	node := NodeConfig{Name: "PingNode-NL", Host: "10.10.0.1", Port: 443, Mux: true}
+	sess := NewClientMuxSession(pCli, bufio.NewReader(pCli), &pwp4ClientCodec{rx: cRx, tx: cTx}, node, LicenseMetadata{Proto: "PWP-4", Tier: "paid"})
+	mux.mu.Lock()
+	mux.sessions["ai"] = sess
+	mux.mu.Unlock()
+	mux.recordNodeProbe(node, true, 47, sess)
+
+	// Before any Ping(), Snapshot() should fall back to selector.NodeEWMA(sess.Node()) = 47ms
+	if snap0 := mux.Snapshot(); snap0.PingMs != 47 {
+		t.Fatalf("expected PingMs fallback from NodeEWMA=47, got %d", snap0.PingMs)
+	}
+
+	// Simulate live primary.Ping() RTT measurement
+	rtt, perr := sess.Ping(2 * time.Second)
+	if perr != nil {
+		t.Fatalf("sess.Ping: %v", perr)
+	}
+	rttMs := rtt.Milliseconds()
+	if rttMs <= 0 {
+		rttMs = 1
+	}
+	mux.recordPrimaryPing(sess, rttMs)
+	if snap1 := mux.Snapshot(); snap1.PingMs != rttMs {
+		t.Fatalf("expected Snapshot.PingMs=%d after Ping, got %d", rttMs, snap1.PingMs)
+	}
+
+	srv := NewLocalProxyServer(LocalProxyOptions{
+		Config:     cfg,
+		Mux:        mux,
+		LocalToken: "v22-tok",
+	})
+	srv.findWSLBridgeIPFn = func() (string, error) {
+		return "172.24.160.1", nil
+	}
+	srv.listenWSLFunc = func(network, address string) (net.Listener, error) {
+		return net.Listen(network, "127.0.0.1:0")
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatalf("srv.Start: %v", err)
+	}
+	defer srv.Close()
+
+	baseURL := "http://" + srv.HTTPAddr()
+	client := &http.Client{Timeout: 3 * time.Second}
+
+	// Verify /__pixelcore/v4/status emits "ping_ms"
+	reqStatus, _ := http.NewRequest(http.MethodGet, baseURL+"/__pixelcore/v4/status", nil)
+	reqStatus.Header.Set("X-Pixel-Local-Token", "v22-tok")
+	respStatus, err := client.Do(reqStatus)
+	if err != nil {
+		t.Fatalf("GET status: %v", err)
+	}
+	var statusBody struct {
+		OK          bool   `json:"ok"`
+		PingMs      int64  `json:"ping_ms"`
+		WSLBridgeIP string `json:"wsl_bridge_ip"`
+	}
+	_ = json.NewDecoder(respStatus.Body).Decode(&statusBody)
+	_ = respStatus.Body.Close()
+	if respStatus.StatusCode != http.StatusOK || !statusBody.OK || statusBody.PingMs != rttMs {
+		t.Fatalf("unexpected v4 status: code=%d body=%+v want ping_ms=%d", respStatus.StatusCode, statusBody, rttMs)
+	}
+
+	// Verify /__pixelcore/telemetry enforces localToken auth and emits "ping_ms"
+	respTelUnauth, err := client.Get(baseURL + "/__pixelcore/telemetry")
+	if err != nil {
+		t.Fatalf("GET telemetry unauth: %v", err)
+	}
+	_ = respTelUnauth.Body.Close()
+	if respTelUnauth.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized on unauthenticated /__pixelcore/telemetry, got %d", respTelUnauth.StatusCode)
+	}
+	reqTel, _ := http.NewRequest(http.MethodGet, baseURL+"/__pixelcore/telemetry", nil)
+	reqTel.Header.Set("X-Pixel-Local-Token", "v22-tok")
+	respTel, err := client.Do(reqTel)
+	if err != nil {
+		t.Fatalf("GET telemetry: %v", err)
+	}
+	var telBody struct {
+		PingMs int64 `json:"ping_ms"`
+	}
+	_ = json.NewDecoder(respTel.Body).Decode(&telBody)
+	_ = respTel.Body.Close()
+	if respTel.StatusCode != http.StatusOK || telBody.PingMs != rttMs {
+		t.Fatalf("unexpected telemetry ping_ms: code=%d body=%+v want %d", respTel.StatusCode, telBody, rttMs)
+	}
+
+	// 2. Hot-toggle wsl_bridge ON via /__pixelcore/v4/reload-rules without dropping active mux session
+	reqOn, _ := http.NewRequest(http.MethodPost, baseURL+"/__pixelcore/v4/reload-rules", strings.NewReader(`{"wsl_bridge":true}`))
+	reqOn.Header.Set("X-Pixel-Local-Token", "v22-tok")
+	respOn, err := client.Do(reqOn)
+	if err != nil {
+		t.Fatalf("POST reload-rules wsl_bridge=true: %v", err)
+	}
+	var outOn struct {
+		OK          bool   `json:"ok"`
+		WSLBridge   bool   `json:"wsl_bridge"`
+		WSLBridgeIP string `json:"wsl_bridge_ip"`
+	}
+	_ = json.NewDecoder(respOn.Body).Decode(&outOn)
+	_ = respOn.Body.Close()
+	if respOn.StatusCode != http.StatusOK || !outOn.OK || !outOn.WSLBridge || outOn.WSLBridgeIP != "172.24.160.1" {
+		t.Fatalf("expected wsl_bridge hot-enable to bind 172.24.160.1, got status=%d out=%+v", respOn.StatusCode, outOn)
+	}
+	if sess.IsClosed() {
+		t.Fatal("active mux session must NOT be dropped on wsl_bridge hot-enable")
+	}
+	curCfg := srv.getConfig()
+	if !curCfg.EnableWSLBridge || !curCfg.V2.WSLBridge || srv.WSLBridgeIP() != "172.24.160.1" {
+		t.Fatalf("config/server WSL state mismatch after enable: Enable=%v V2=%v IP=%q", curCfg.EnableWSLBridge, curCfg.V2.WSLBridge, srv.WSLBridgeIP())
+	}
+
+	// 3. Hot-toggle wsl_bridge OFF via /__pixelcore/v4/reload-rules
+	reqOff, _ := http.NewRequest(http.MethodPost, baseURL+"/__pixelcore/v4/reload-rules", strings.NewReader(`{"wsl_bridge":false}`))
+	reqOff.Header.Set("X-Pixel-Local-Token", "v22-tok")
+	respOff, err := client.Do(reqOff)
+	if err != nil {
+		t.Fatalf("POST reload-rules wsl_bridge=false: %v", err)
+	}
+	var outOff struct {
+		OK          bool   `json:"ok"`
+		WSLBridge   bool   `json:"wsl_bridge"`
+		WSLBridgeIP string `json:"wsl_bridge_ip"`
+	}
+	_ = json.NewDecoder(respOff.Body).Decode(&outOff)
+	_ = respOff.Body.Close()
+	if respOff.StatusCode != http.StatusOK || !outOff.OK || outOff.WSLBridge || outOff.WSLBridgeIP != "" {
+		t.Fatalf("expected wsl_bridge hot-disable to unbind, got status=%d out=%+v", respOff.StatusCode, outOff)
+	}
+	if sess.IsClosed() {
+		t.Fatal("active mux session must NOT be dropped on wsl_bridge hot-disable")
+	}
+	curCfg2 := srv.getConfig()
+	if curCfg2.EnableWSLBridge || curCfg2.V2.WSLBridge || srv.WSLBridgeIP() != "" {
+		t.Fatalf("config/server WSL state mismatch after disable: Enable=%v V2=%v IP=%q", curCfg2.EnableWSLBridge, curCfg2.V2.WSLBridge, srv.WSLBridgeIP())
+	}
+
+	// Clearing primary session resets PingMs to 0
+	mux.clearRoleSession("ai", sess)
+	if snapAfterClear := mux.Snapshot(); snapAfterClear.Connected || snapAfterClear.PingMs != 0 {
+		t.Fatalf("expected PingMs=0 after clearing primary session, got %+v", snapAfterClear)
 	}
 }

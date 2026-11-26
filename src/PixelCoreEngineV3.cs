@@ -14,6 +14,7 @@ using System.Runtime.InteropServices;
 using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
+using System.Security.Principal;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -980,7 +981,7 @@ namespace PixelTunnel
 
     public static class PixelCoreService
     {
-        public const string ENGINE_VERSION = "2.1.4";
+        public const string ENGINE_VERSION = EmbeddedEngineMeta.EngineVersion;
         private const string DEFAULT_HOST = "185.103.103.162";
         private const string DEFAULT_SNI = "ai.pixelstore.space";
         private const int WARM_POOL_TARGET = 2;
@@ -1098,11 +1099,34 @@ namespace PixelTunnel
         private static HashSet<string> _directDomains = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private static HashSet<string> _proxyDomains = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private static HashSet<string> _baseDirectDomains = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private static bool _baseDirectInitialized = false;
+        private static HashSet<string> _configStaticProxyDomains = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private static HashSet<string> _customProxySet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private static HashSet<string> _customDirectSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private static HashSet<string> _categoryProxySet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private static readonly Dictionary<string, DateTime> _temporaryProxyDomains = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+        private static readonly object _rulesLock = new object();
         private static Dictionary<string, bool> _activeCategories = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
         private static List<string> _customProxyList = new List<string>();
         private static List<string> _customDirectList = new List<string>();
         private static HashSet<string> _serverHostBypass = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private static bool _defaultOutboundIsProxy = false;
+
+        private static readonly string[] BuiltinDirectDomains = new[]
+        {
+            ".ru", ".su", ".by", ".xn--p1ai",
+            "pixelstore.space",
+            "ya.ru", "yandex.ru", "yandex.com", "yandex.net", "yandex.cloud", "yandexcloud.net", "yastatic.net", "yandex.kz",
+            "vk.com", "vk.ru", "vk.me", "vk.cc", "userapi.com", "vkuser.net", "vkuseraudio.net", "vkuservideo.net", "vk-cdn.net", "vkvideo.ru", "mycdn.me", "ok.me", "mail.ru", "mail.ua",
+            "gosuslugi.ru", "sberbank.ru", "sberdevices.ru", "tbank.ru", "tinkoff.com", "alfa.me",
+            "ozon.ru", "ozon.com", "ozon.kz", "ozon.tech", "ozon.travel", "ozon.team", "ozonru.me", "ozonrucn.me", "ozoncom.me", "ozonusercontent.com",
+            "wildberries.ru", "wbstatic.net", "avito.ru", "avito.st",
+            "dzen.ru", "kinopoisk.ru", "rutube.ru", "rutube.me", "kinescope.io", "2gis.com", "ivi.tv", "okko.tv", "premier.one", "habr.com", "habrastorage.org",
+            "timeweb.cloud", "timeweb.com", "selectel.org", "beget.com", "cloud.mts.ru", "rt.ru", "kaspersky.com",
+            "chatzone.ru", "radiofine.net", "rusweb.net",
+            "steampowered.com", "steamcontent.com", "steamstatic.com", "windowsupdate.com", "epicgames.com", "battle.net", "wargaming.net", "lesta.ru", "vkplay.ru"
+        };
+        private static readonly HashSet<string> _builtinDirectSet = new HashSet<string>(BuiltinDirectDomains, StringComparer.OrdinalIgnoreCase);
 
         private static long _activeConns = 0;
         private static long _totalBytesUp = 0;
@@ -1136,6 +1160,8 @@ namespace PixelTunnel
         private static TcpListener _secListener;
         private static TcpListener _wslHttpListener;
         private static TcpListener _wslSocksListener;
+        private static CancellationTokenSource _wslCts;
+        private static readonly object _wslLock = new object();
         private static CancellationTokenSource _cts;
         private static readonly object _syncLock = new object();
 
@@ -1146,6 +1172,7 @@ namespace PixelTunnel
         private static int _pacRevision = 1;
         private static string _localControlToken = "";
         private static int _powerHookRegistered = 0;
+        private static volatile bool _instantWakeEnabled = true;
         private static long _liveRouteSeq = 0;
         private static readonly object _liveRoutesLock = new object();
         private static readonly LinkedList<LiveRouteEntry> _liveRoutes = new LinkedList<LiveRouteEntry>();
@@ -1177,6 +1204,9 @@ namespace PixelTunnel
         private static string _lastGoEngineFailureReason = "";
         public static bool UsingGoEngine { get; private set; }
         public static string GoEngineFallbackReason { get; private set; }
+        public static string GoEngineUnexpectedExitReason { get; private set; }
+        public static event Action<string> OnUnexpectedGoEngineExit;
+        public static bool IsGoEngineAlive() { return NativeUtlsEngineHost.IsAlive(); }
         public static string LastUsedEngineLabel { get { return _lastUsedEngineLabel; } private set { _lastUsedEngineLabel = value ?? ""; } }
         public static string LastGoEngineFailureReason { get { return _lastGoEngineFailureReason; } private set { _lastGoEngineFailureReason = value ?? ""; } }
         public static string ActiveEngineLabel { get { return UsingGoEngine ? ("Go uTLS (Chrome v" + ENGINE_VERSION + ")") : ("C# Fallback (v" + ENGINE_VERSION + ")"); } }
@@ -1186,6 +1216,11 @@ namespace PixelTunnel
         public static int ActiveHttpPort { get { return _localPort; } }
         public static int ActiveSocksPort { get { return _socksPort; } }
         public static bool IsWslBridgeEnabled { get { return _wslBridgeEnabled; } }
+        public static bool InstantWakeEnabled
+        {
+            get { return _instantWakeEnabled; }
+            set { _instantWakeEnabled = value; }
+        }
         public static string StandbyNodeName { get; private set; }
         public static bool StandbyReady { get; private set; }
         public static int FailoverCount { get; private set; }
@@ -1198,6 +1233,7 @@ namespace PixelTunnel
         public static string LastConnectError { get; private set; }
         public static string ActiveNodeName { get; private set; }
         public static int ActiveNodeLatencyMs { get; private set; }
+        public static int LivePingMs { get; private set; }
         public static string ActiveProtocol { get; private set; }
         public static int ManifestVersion { get; private set; }
         public static string ManifestSource { get; private set; }
@@ -1300,6 +1336,7 @@ namespace PixelTunnel
         {
             ActiveNodeName = nodeName;
             ActiveNodeLatencyMs = rttMs;
+            if (rttMs > 0 && rttMs < 9000) LivePingMs = rttMs;
         }
 
         public static void SampleLiveSpeed()
@@ -1656,6 +1693,89 @@ namespace PixelTunnel
             catch { }
         }
 
+        internal static bool EnsureManifestLoadedForConfig(int maxWaitMs = 3500)
+        {
+            try
+            {
+                EnsureManifestPathsInitialized();
+                if (_persistedManifestVersion <= 0)
+                    _persistedManifestVersion = LoadPersistedManifestVersion();
+                if (!HasAnyNodeWithSecret())
+                    TryLoadCachedManifest();
+                if (!HasAnyNodeWithSecret())
+                    EnsureEmbeddedManifestLoaded();
+                if (!HasAnyNodeWithSecret())
+                {
+                    string[] localCandidates = new[]
+                    {
+                        Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "nodes_v3.enc"),
+                        Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "manifest", "nodes_v3.enc")
+                    };
+                    foreach (string cand in localCandidates)
+                    {
+                        if (!File.Exists(cand)) continue;
+                        try
+                        {
+                            string raw = File.ReadAllText(cand, Encoding.UTF8);
+                            if (TryApplySignedManifestEnvelope(raw, "local-file", false))
+                                break;
+                        }
+                        catch { }
+                    }
+                }
+                if (!HasAnyNodeWithSecret())
+                {
+                    EnsureManifestSecretsLoaded(maxWaitMs);
+                }
+            }
+            catch { }
+            return HasAnyNodeWithSecret();
+        }
+
+        internal static void ExportManifestFieldsForConfig(int maxWaitMs, out string pwpSecret, out List<Dictionary<string, object>> nodes)
+        {
+            pwpSecret = "";
+            nodes = new List<Dictionary<string, object>>();
+            try
+            {
+                EnsureManifestLoadedForConfig(maxWaitMs);
+                lock (_nodesLock)
+                {
+                    pwpSecret = (_secret ?? "").Trim();
+                    for (int i = 0; i < _nodes.Count; i++)
+                    {
+                        PixelServerNode n = _nodes[i];
+                        if (n == null || string.IsNullOrWhiteSpace(n.Host)) continue;
+                        string nodeSecret = !string.IsNullOrEmpty(n.Secret) ? n.Secret.Trim() : pwpSecret;
+                        if (string.IsNullOrEmpty(pwpSecret) && !string.IsNullOrEmpty(nodeSecret))
+                            pwpSecret = nodeSecret;
+
+                        string region = string.IsNullOrWhiteSpace(n.Region) ? "nl" : n.Region.Trim().ToLowerInvariant();
+                        string sni = string.IsNullOrWhiteSpace(n.Sni) ? DEFAULT_SNI : n.Sni.Trim();
+                        string path = string.IsNullOrWhiteSpace(n.UpgradePath) ? "/api/v3/telemetry/mux" : n.UpgradePath.Trim();
+                        string pwp4Path = n.SupportsMuxV3 ? "/api/v4/telemetry/events" : "";
+                        string name = string.IsNullOrWhiteSpace(n.Name) ? n.Host.Trim() : n.Name.Trim();
+
+                        nodes.Add(new Dictionary<string, object>
+                        {
+                            { "name", name },
+                            { "region", region },
+                            { "host", n.Host.Trim() },
+                            { "port", n.Port > 0 ? n.Port : 443 },
+                            { "sni", sni },
+                            { "path", path },
+                            { "pwp4_path", pwp4Path },
+                            { "secret", nodeSecret },
+                            { "tls", n.UseTls },
+                            { "mux", n.SupportsMuxV3 },
+                            { "frag", n.EnableDpiSplit }
+                        });
+                    }
+                }
+            }
+            catch { }
+        }
+
         public static void StartService(string configPath)
         {
             string rawJson = "";
@@ -1728,6 +1848,7 @@ namespace PixelTunnel
                 FailoverCount = 0;
                 UsingGoEngine = false;
                 GoEngineFallbackReason = "";
+                GoEngineUnexpectedExitReason = "";
                 lock (_speedLock)
                 {
                     _prevSpeedTicks = 0;
@@ -1738,7 +1859,8 @@ namespace PixelTunnel
                 Interlocked.Exchange(ref _lane0BytesDown, 0);
                 Interlocked.Exchange(ref _lane1BytesDown, 0);
                 ActiveNodeName = "NL-Edge-443";
-                ActiveNodeLatencyMs = 28;
+                ActiveNodeLatencyMs = 0;
+                LivePingMs = 0;
                 ActiveProtocol = "PWP-3 Mux";
                 if (string.IsNullOrEmpty(ManifestSource)) ManifestSource = "Embedded";
                 _cts = new CancellationTokenSource();
@@ -1789,18 +1911,21 @@ namespace PixelTunnel
 
                 _mainListener = new TcpListener(IPAddress.Loopback, _localPort);
                 _mainListener.Start(512);
-                Task.Run(() => AcceptLoopAsync(_mainListener, token));
+                Task.Run(() => AcceptLoopAsync(_mainListener, token, false));
 
                 if (_socksPort > 0 && _socksPort != _localPort)
                 {
                     _secListener = new TcpListener(IPAddress.Loopback, _socksPort);
                     _secListener.Start(256);
-                    Task.Run(() => AcceptLoopAsync(_secListener, token));
+                    Task.Run(() => AcceptLoopAsync(_secListener, token, false));
                 }
 
                 if (_wslBridgeEnabled)
                 {
-                    TryStartWslBridgeListeners(token);
+                    lock (_wslLock)
+                    {
+                        TryStartWslBridgeListeners(token);
+                    }
                 }
 
                 IsRunning = true;
@@ -1816,6 +1941,8 @@ namespace PixelTunnel
             {
                 IsRunning = false;
                 UsingGoEngine = false;
+                ActiveNodeLatencyMs = 0;
+                LivePingMs = 0;
                 ActiveWslBridgeIp = "";
                 if (_cts != null)
                 {
@@ -1833,15 +1960,9 @@ namespace PixelTunnel
                     try { _secListener.Stop(); } catch { }
                     _secListener = null;
                 }
-                if (_wslHttpListener != null)
+                lock (_wslLock)
                 {
-                    try { _wslHttpListener.Stop(); } catch { }
-                    _wslHttpListener = null;
-                }
-                if (_wslSocksListener != null)
-                {
-                    try { _wslSocksListener.Stop(); } catch { }
-                    _wslSocksListener = null;
+                    StopWslBridgeListenersLocked();
                 }
                 ResetMuxLanes();
                 DrainWarmPool();
@@ -2062,8 +2183,8 @@ namespace PixelTunnel
                 }
                 RebuildServerBypassSet();
 
-                var newDirect = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                var newProxy = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var staticDirect = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var staticProxy = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
                 MatchCollection ruleMatches = Regex.Matches(
                     json,
@@ -2077,16 +2198,18 @@ namespace PixelTunnel
                     MatchCollection doms = Regex.Matches(domBlock, "\"domain:([^\"]+)\"", RegexOptions.IgnoreCase);
                     foreach (Match dm in doms)
                     {
-                        string d = dm.Groups[1].Value.Trim().ToLowerInvariant();
+                        string d = SanitizeDomainRule(dm.Groups[1].Value);
                         if (string.IsNullOrEmpty(d)) continue;
-                        if (tag == "direct") newDirect.Add(d);
-                        else if (tag == "proxy") newProxy.Add(d);
+                        if (tag == "direct") staticDirect.Add(d);
+                        else if (tag == "proxy") staticProxy.Add(d);
                     }
                 }
 
                 var parsedCustomProxy = new List<string>();
                 var parsedCustomDirect = new List<string>();
                 var parsedCats = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+                var parsedTempProxy = new List<string>();
+                int parsedTempTtlSec = 0;
 
                 var rootObj = MiniJson.Deserialize(json) as Dictionary<string, object>;
                 if (rootObj != null)
@@ -2103,6 +2226,8 @@ namespace PixelTunnel
                         int parsedRev = MiniJson.GetInt(v2Obj, "pac_rev", 0);
                         if (parsedRev > 0) _pacRevision = parsedRev;
                         _wslBridgeEnabled = MiniJson.GetBool(v2Obj, "wsl_bridge", false);
+                        if (v2Obj.ContainsKey("instant_wake"))
+                            InstantWakeEnabled = MiniJson.GetBool(v2Obj, "instant_wake", InstantWakeEnabled);
                         string cfgToken = MiniJson.GetStr(v2Obj, "local_token");
                         if (!string.IsNullOrEmpty(cfgToken)) _localControlToken = cfgToken.Trim();
 
@@ -2111,13 +2236,7 @@ namespace PixelTunnel
                         {
                             foreach (var kv in catDict)
                             {
-                                bool enabled = MiniJson.GetBool(catDict, kv.Key, false);
-                                parsedCats[kv.Key] = enabled;
-                                if (enabled)
-                                {
-                                    foreach (string cd in GetCSharpCategoryDomains(kv.Key))
-                                        newProxy.Add(cd);
-                                }
+                                parsedCats[kv.Key] = MiniJson.GetBool(catDict, kv.Key, false);
                             }
                         }
 
@@ -2126,8 +2245,8 @@ namespace PixelTunnel
                             : MiniJson.GetStrList(v2Obj, "custom_proxy");
                         foreach (string cp in cpList)
                         {
-                            string clean = (cp ?? "").Trim().ToLowerInvariant();
-                            if (!string.IsNullOrEmpty(clean)) { parsedCustomProxy.Add(clean); newProxy.Add(clean); newDirect.Remove(clean); }
+                            string clean = SanitizeDomainRule(cp);
+                            if (!string.IsNullOrEmpty(clean)) parsedCustomProxy.Add(clean);
                         }
 
                         var cdList = v2Obj.ContainsKey("custom_direct_domains")
@@ -2135,20 +2254,42 @@ namespace PixelTunnel
                             : MiniJson.GetStrList(v2Obj, "custom_direct");
                         foreach (string cd in cdList)
                         {
-                            string clean = (cd ?? "").Trim().ToLowerInvariant();
-                            if (!string.IsNullOrEmpty(clean)) { parsedCustomDirect.Add(clean); newDirect.Add(clean); newProxy.Remove(clean); }
+                            string clean = SanitizeDomainRule(cd);
+                            if (!string.IsNullOrEmpty(clean)) parsedCustomDirect.Add(clean);
+                        }
+
+                        if (v2Obj.ContainsKey("temporary_proxy_domains"))
+                        {
+                            parsedTempTtlSec = MiniJson.GetInt(v2Obj, "temporary_proxy_ttl_sec", 180);
+                            foreach (string tp in MiniJson.GetStrList(v2Obj, "temporary_proxy_domains"))
+                            {
+                                string clean = SanitizeDomainRule(tp);
+                                if (!string.IsNullOrEmpty(clean)) parsedTempProxy.Add(clean);
+                            }
                         }
                     }
                 }
 
-                var baseDirect = new HashSet<string>(newDirect, StringComparer.OrdinalIgnoreCase);
-                foreach (string cd in parsedCustomDirect) baseDirect.Remove(cd);
-                _baseDirectDomains = baseDirect;
-                _activeCategories = parsedCats;
-                _customProxyList = parsedCustomProxy;
-                _customDirectList = parsedCustomDirect;
-                _directDomains = newDirect;
-                _proxyDomains = newProxy;
+                foreach (string cp in parsedCustomProxy) staticProxy.Remove(cp);
+                foreach (string cd in parsedCustomDirect) staticDirect.Remove(cd);
+
+                lock (_rulesLock)
+                {
+                    _baseDirectDomains = staticDirect;
+                    _baseDirectInitialized = true;
+                    _configStaticProxyDomains = staticProxy;
+                    _activeCategories = parsedCats;
+                    _customProxyList = parsedCustomProxy;
+                    _customDirectList = parsedCustomDirect;
+                    _temporaryProxyDomains.Clear();
+                    if (parsedTempProxy.Count > 0 && parsedTempTtlSec > 0)
+                    {
+                        DateTime exp = DateTime.UtcNow.AddSeconds(parsedTempTtlSec);
+                        foreach (string tp in parsedTempProxy)
+                            _temporaryProxyDomains[tp] = exp;
+                    }
+                    RebuildEffectiveRulesLocked();
+                }
 
                 Match mDefault = Regex.Match(
                     json,
@@ -2689,6 +2830,7 @@ namespace PixelTunnel
 
                             ActiveNodeName = node.Name;
                             ActiveNodeLatencyMs = node.LatencyMs;
+                            if (node.LatencyMs > 0 && node.LatencyMs < 9000) LivePingMs = node.LatencyMs;
                             ActiveProtocol = "PWP-3 Mux";
                             return created;
                         }
@@ -2976,19 +3118,257 @@ namespace PixelTunnel
             return false;
         }
 
+        public static bool IsValidHostname(string host)
+        {
+            if (string.IsNullOrEmpty(host)) return false;
+            string h = host.Trim();
+            if (h.Length == 0 || h.Length > 253) return false;
+            if (h.EndsWith(".", StringComparison.Ordinal)) h = h.Substring(0, h.Length - 1);
+            if (h.Length == 0 || h.Length > 253) return false;
+            for (int i = 0; i < h.Length; i++)
+            {
+                char c = h[i];
+                if (c <= 0x20 || c >= 0x7f) return false;
+                if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '.'))
+                    return false;
+            }
+            if (Uri.CheckHostName(h) != UriHostNameType.Dns) return false;
+            string[] labels = h.Split('.');
+            for (int i = 0; i < labels.Length; i++)
+            {
+                string lbl = labels[i];
+                if (lbl.Length == 0 || lbl.Length > 63) return false;
+                if (lbl[0] == '-' || lbl[lbl.Length - 1] == '-') return false;
+            }
+            return true;
+        }
+
+        private static bool IsValidDnsLabel(string lbl)
+        {
+            if (string.IsNullOrEmpty(lbl) || lbl.Length > 63) return false;
+            if (lbl[0] == '-' || lbl[lbl.Length - 1] == '-') return false;
+            for (int i = 0; i < lbl.Length; i++)
+            {
+                char c = lbl[i];
+                if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-'))
+                    return false;
+            }
+            return true;
+        }
+
+        private static string SanitizeDomainRule(string raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw)) return "";
+            string s = raw.Trim().ToLowerInvariant();
+            for (int i = 0; i < s.Length; i++)
+            {
+                char c = s[i];
+                if (c <= 0x20 || c >= 0x7f) return "";
+            }
+            if (s.StartsWith("*.", StringComparison.Ordinal)) s = s.Substring(2);
+            bool leadingDot = s.StartsWith(".", StringComparison.Ordinal);
+            while (s.StartsWith(".", StringComparison.Ordinal)) s = s.Substring(1);
+            while (s.EndsWith(".", StringComparison.Ordinal)) s = s.Substring(0, s.Length - 1);
+            if (string.IsNullOrEmpty(s)) return "";
+            if (leadingDot && s.IndexOf('.') < 0)
+            {
+                return IsValidDnsLabel(s) ? ("." + s) : "";
+            }
+            return IsValidHostname(s) ? s : "";
+        }
+
         private static bool MatchesDomainSet(string host, HashSet<string> set)
         {
             if (set == null || set.Count == 0) return false;
             string nh = host.Trim().Trim('[', ']').TrimEnd('.').ToLowerInvariant();
-            if (set.Contains(nh)) return true;
+            if (set.Contains(nh) || set.Contains("." + nh)) return true;
             int dot = nh.IndexOf('.');
             while (dot > 0 && dot + 1 < nh.Length)
             {
                 string parent = nh.Substring(dot + 1);
-                if (set.Contains(parent)) return true;
+                if (set.Contains(parent) || set.Contains("." + parent)) return true;
                 dot = nh.IndexOf('.', dot + 1);
             }
             return false;
+        }
+
+        private static void RebuildEffectiveRulesLocked()
+        {
+            var customProxySet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string cp in _customProxyList)
+            {
+                string clean = SanitizeDomainRule(cp);
+                if (!string.IsNullOrEmpty(clean)) customProxySet.Add(clean);
+            }
+
+            var customDirectSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string cd in _customDirectList)
+            {
+                string clean = SanitizeDomainRule(cd);
+                if (!string.IsNullOrEmpty(clean)) customDirectSet.Add(clean);
+            }
+
+            var categoryProxySet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string sp in _configStaticProxyDomains)
+            {
+                string clean = SanitizeDomainRule(sp);
+                if (!string.IsNullOrEmpty(clean)) categoryProxySet.Add(clean);
+            }
+            foreach (var kv in _activeCategories)
+            {
+                if (!kv.Value) continue;
+                foreach (string dom in GetCSharpCategoryDomains(kv.Key))
+                {
+                    string clean = SanitizeDomainRule(dom);
+                    if (!string.IsNullOrEmpty(clean)) categoryProxySet.Add(clean);
+                }
+            }
+
+            DateTime now = DateTime.UtcNow;
+            var expired = new List<string>();
+            var activeTemp = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var kv in _temporaryProxyDomains)
+            {
+                if (kv.Value <= now) expired.Add(kv.Key);
+                else activeTemp.Add(kv.Key);
+            }
+            foreach (string k in expired) _temporaryProxyDomains.Remove(k);
+
+            var newProxy = new HashSet<string>(categoryProxySet, StringComparer.OrdinalIgnoreCase);
+            foreach (string cp in customProxySet) newProxy.Add(cp);
+            foreach (string tp in activeTemp) newProxy.Add(tp);
+
+            var newDirect = new HashSet<string>(_baseDirectDomains, StringComparer.OrdinalIgnoreCase);
+            foreach (string bd in _builtinDirectSet) newDirect.Add(bd);
+            foreach (string cd in customDirectSet)
+            {
+                newDirect.Add(cd);
+                newProxy.Remove(cd);
+            }
+            foreach (string cp in customProxySet)
+            {
+                newDirect.Remove(cp);
+            }
+            foreach (string tp in activeTemp)
+            {
+                newDirect.Remove(tp);
+            }
+
+            _customProxySet = customProxySet;
+            _customDirectSet = customDirectSet;
+            _categoryProxySet = categoryProxySet;
+            _proxyDomains = newProxy;
+            _directDomains = newDirect;
+        }
+
+        private static bool IsWslBridgeSubnetIp(IPAddress ip)
+        {
+            if (ip == null) return false;
+            if (ip.IsIPv4MappedToIPv6) ip = ip.MapToIPv4();
+            if (ip.AddressFamily != AddressFamily.InterNetwork) return false;
+            byte[] b = ip.GetAddressBytes();
+            return b.Length == 4 && b[0] == 172 && b[1] >= 16 && b[1] <= 31;
+        }
+
+        private static bool IsSelfTarget(string host, int port)
+        {
+            if (port <= 0) return false;
+            if (port != _localPort && port != _socksPort) return false;
+            if (string.IsNullOrEmpty(host)) return true;
+            string h = host.Trim().Trim('[', ']').TrimEnd('.').ToLowerInvariant();
+            if (h == "127.0.0.1" || h == "localhost" || h == "localhost.localdomain" || h == "::1" || h == "0.0.0.0" || h == "::")
+                return true;
+            string wslIp = ActiveWslBridgeIp;
+            if (!string.IsNullOrEmpty(wslIp) && string.Equals(h, wslIp, StringComparison.OrdinalIgnoreCase))
+                return true;
+            IPAddress ip;
+            if (IPAddress.TryParse(h, out ip))
+            {
+                if (ip.IsIPv4MappedToIPv6) ip = ip.MapToIPv4();
+                if (IPAddress.IsLoopback(ip) || ip.Equals(IPAddress.Any) || ip.Equals(IPAddress.IPv6Any) || ip.Equals(IPAddress.IPv6Loopback))
+                    return true;
+            }
+            return false;
+        }
+
+        private static bool IsWslRestrictedIp(IPAddress ip)
+        {
+            if (ip == null) return true;
+            if (ip.IsIPv4MappedToIPv6) ip = ip.MapToIPv4();
+            if (IPAddress.IsLoopback(ip)) return true;
+            string wslIp = ActiveWslBridgeIp;
+            if (!string.IsNullOrEmpty(wslIp) && string.Equals(ip.ToString(), wslIp, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            byte[] b = ip.GetAddressBytes();
+            if (ip.AddressFamily == AddressFamily.InterNetwork && b.Length == 4)
+            {
+                if (b[0] == 10 || b[0] == 127 || b[0] == 0) return true;
+                if (b[0] == 192 && b[1] == 168) return true;
+                if (b[0] == 172 && b[1] >= 16 && b[1] <= 31) return true;
+                if (b[0] == 169 && b[1] == 254) return true; // link-local & cloud metadata 169.254.169.254
+                if (b[0] == 100 && b[1] >= 64 && b[1] <= 127) return true; // CGNAT 100.64.0.0/10
+                return false;
+            }
+            if (ip.AddressFamily == AddressFamily.InterNetworkV6 && b.Length == 16)
+            {
+                if (ip.Equals(IPAddress.IPv6Any) || ip.Equals(IPAddress.IPv6Loopback)) return true;
+                if (ip.IsIPv6LinkLocal || ip.IsIPv6SiteLocal || ip.IsIPv6Multicast) return true;
+                if ((b[0] & 0xFE) == 0xFC) return true; // fc00::/7 ULA
+                return false;
+            }
+            return false;
+        }
+
+        private static bool IsWslRestrictedHost(string host)
+        {
+            if (string.IsNullOrEmpty(host)) return true;
+            string h = host.Trim().Trim('[', ']').TrimEnd('.').ToLowerInvariant();
+            if (h.Length == 0 || h == "localhost" || h == "localhost.localdomain" || h == "::1" ||
+                h == "0.0.0.0" || h == "::" || h == "metadata" || h == "metadata.google.internal")
+                return true;
+            string wslIp = ActiveWslBridgeIp;
+            if (!string.IsNullOrEmpty(wslIp) && string.Equals(h, wslIp, StringComparison.OrdinalIgnoreCase))
+                return true;
+            IPAddress ip;
+            if (IPAddress.TryParse(h, out ip))
+                return IsWslRestrictedIp(ip);
+            return false;
+        }
+
+        private static bool FixedTimeEquals(string a, string b)
+        {
+            if (string.IsNullOrEmpty(a) || string.IsNullOrEmpty(b)) return false;
+            byte[] ba = Encoding.UTF8.GetBytes(a);
+            byte[] bb = Encoding.UTF8.GetBytes(b);
+            int maxLen = Math.Max(ba.Length, bb.Length);
+            int diff = ba.Length ^ bb.Length;
+            for (int i = 0; i < maxLen; i++)
+            {
+                byte lhs = (i < ba.Length) ? ba[i] : (byte)0;
+                byte rhs = (i < bb.Length) ? bb[i] : (byte)0;
+                diff |= lhs ^ rhs;
+            }
+            return diff == 0;
+        }
+
+        private static void SendLocalProxyForbidden(NetworkStream localStream, bool isHttpConnect, bool isSocks5)
+        {
+            try
+            {
+                if (isSocks5)
+                {
+                    byte[] resp = new byte[] { 0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0 };
+                    localStream.Write(resp, 0, resp.Length);
+                }
+                else
+                {
+                    byte[] resp = Encoding.ASCII.GetBytes("HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 9\r\nConnection: close\r\n\r\nForbidden");
+                    localStream.Write(resp, 0, resp.Length);
+                }
+                localStream.Flush();
+            }
+            catch { }
         }
 
         private static bool IsPrivateOrServerLoopbackHost(string h)
@@ -3057,42 +3437,87 @@ namespace PixelTunnel
 
         private static void ClassifyRoute(string host, out bool bypassDirect, out string ruleLabel)
         {
-            bypassDirect = false;
-            ruleLabel = "proxy-default";
-            if (string.IsNullOrEmpty(host)) return;
+            bypassDirect = true;
+            ruleLabel = "default-direct";
+            if (string.IsNullOrEmpty(host))
+            {
+                ruleLabel = "empty";
+                return;
+            }
             string h = host.Trim().Trim('[', ']').TrimEnd('.').ToLowerInvariant();
 
+            // Tier 0: Self-bypass (pixelstore.space, active node hosts/SNIs, loopback/private IPs)
             if (IsPrivateOrServerLoopbackHost(h)) { bypassDirect = true; ruleLabel = "loopback-private"; return; }
-            if (MatchesDomainSet(h, _proxyDomains)) { bypassDirect = false; ruleLabel = "proxy-rule"; return; }
 
-            IPAddress parsedIp;
-            if (IPAddress.TryParse(h, out parsedIp) && IsTelegramDcIp(parsedIp) && MatchesDomainSet("telegram.org", _proxyDomains))
-            { bypassDirect = false; ruleLabel = "telegram-dc"; return; }
+            HashSet<string> customProxy;
+            HashSet<string> tempProxy = null;
+            HashSet<string> customDirect;
+            HashSet<string> categoryProxy;
+            HashSet<string> baseDirect;
+            bool proxyAll;
 
-            if (HostMatchesDomain(h, "googleapis.com") || HostMatchesDomain(h, "antigravity.google") ||
-                HostMatchesDomain(h, "antigravity-unleash.goog") || HostMatchesDomain(h, "1e100.net") ||
-                HostMatchesDomain(h, "gstatic.com") || HostMatchesDomain(h, "google.com") || HostMatchesDomain(h, "gvt1.com") ||
-                HostMatchesDomain(h, "ai.studio") || HostMatchesDomain(h, "usercontent.goog") ||
-                HostMatchesDomain(h, "cloud.google") || HostMatchesDomain(h, "withgoogle.com") ||
-                HostMatchesDomain(h, "google.dev") || HostMatchesDomain(h, "ggpht.com"))
-            { bypassDirect = false; ruleLabel = "antigravity-core"; return; }
+            lock (_rulesLock)
+            {
+                customProxy = _customProxySet;
+                customDirect = _customDirectSet;
+                categoryProxy = _categoryProxySet;
+                baseDirect = _baseDirectDomains;
+                proxyAll = _defaultOutboundIsProxy;
+                if (_temporaryProxyDomains.Count > 0)
+                {
+                    DateTime now = DateTime.UtcNow;
+                    List<string> expired = null;
+                    foreach (var kv in _temporaryProxyDomains)
+                    {
+                        if (kv.Value <= now)
+                        {
+                            if (expired == null) expired = new List<string>();
+                            expired.Add(kv.Key);
+                        }
+                        else
+                        {
+                            if (tempProxy == null) tempProxy = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                            tempProxy.Add(kv.Key);
+                        }
+                    }
+                    if (expired != null)
+                    {
+                        foreach (string k in expired) _temporaryProxyDomains.Remove(k);
+                    }
+                }
+            }
 
+            // Tier 1: custom_proxy_domains + active non-expired temporary_proxy_domains
+            if (MatchesDomainSet(h, customProxy)) { bypassDirect = false; ruleLabel = "custom-proxy"; return; }
+            if (tempProxy != null && MatchesDomainSet(h, tempProxy)) { bypassDirect = false; ruleLabel = "temporary-proxy"; return; }
+
+            // Tier 2: custom_direct_domains
+            if (MatchesDomainSet(h, customDirect)) { bypassDirect = true; ruleLabel = "custom-direct"; return; }
+
+            // Tier 3: BUILTIN_DIRECT (.ru/.su/.by/.xn--p1ai + unified direct list)
             if (h.EndsWith(".ru", StringComparison.Ordinal) || h.EndsWith(".su", StringComparison.Ordinal) ||
                 h.EndsWith(".xn--p1ai", StringComparison.Ordinal) || h.EndsWith(".by", StringComparison.Ordinal) ||
-                HostMatchesDomain(h, "yastatic.net") || HostMatchesDomain(h, "yandex.net") ||
-                HostMatchesDomain(h, "userapi.com") || HostMatchesDomain(h, "vkuseraudio.net") ||
-                HostMatchesDomain(h, "wbstatic.net") || HostMatchesDomain(h, "ozonusercontent.com") ||
-                HostMatchesDomain(h, "ozon.kz") || HostMatchesDomain(h, "ozon.tech") ||
-                HostMatchesDomain(h, "ozon.com") || HostMatchesDomain(h, "ozon.travel") ||
-                HostMatchesDomain(h, "ozon.team") || HostMatchesDomain(h, "ozonru.me") ||
-                HostMatchesDomain(h, "ozonrucn.me") || HostMatchesDomain(h, "ozoncom.me") ||
-                HostMatchesDomain(h, "steamcontent.com") || HostMatchesDomain(h, "steampowered.com"))
-            { bypassDirect = true; ruleLabel = "ru-direct"; return; }
+                MatchesDomainSet(h, _builtinDirectSet) || MatchesDomainSet(h, baseDirect))
+            {
+                bypassDirect = true;
+                ruleLabel = "builtin-direct";
+                return;
+            }
 
-            if (MatchesDomainSet(h, _directDomains)) { bypassDirect = true; ruleLabel = "direct-rule"; return; }
+            // Tier 4: Enabled categories -> proxy_all -> DIRECT
+            IPAddress parsedIp;
+            if (IPAddress.TryParse(h, out parsedIp) && IsTelegramDcIp(parsedIp) &&
+                (MatchesDomainSet("telegram.org", categoryProxy) || MatchesDomainSet("telegram.org", customProxy) || proxyAll))
+            {
+                bypassDirect = false;
+                ruleLabel = "telegram-dc";
+                return;
+            }
 
-            bypassDirect = !_defaultOutboundIsProxy;
-            ruleLabel = bypassDirect ? "default-direct" : "default-proxy";
+            if (MatchesDomainSet(h, categoryProxy)) { bypassDirect = false; ruleLabel = "category-proxy"; return; }
+
+            bypassDirect = !proxyAll;
+            ruleLabel = bypassDirect ? "default-direct" : "proxy-all";
         }
 
         private static bool ShouldBypassDirect(string host)
@@ -3103,7 +3528,7 @@ namespace PixelTunnel
             return bypass;
         }
 
-        private static async Task AcceptLoopAsync(TcpListener listener, CancellationToken token)
+        private static async Task AcceptLoopAsync(TcpListener listener, CancellationToken token, bool isWsl)
         {
             while (!token.IsCancellationRequested)
             {
@@ -3111,11 +3536,18 @@ namespace PixelTunnel
                 try
                 {
                     TcpClient client = await listener.AcceptTcpClientAsync().ConfigureAwait(false);
-                    var unused = Task.Run(() => HandleLocalClientAsync(client));
+                    var unused = Task.Run(() => HandleLocalClientAsync(client, isWsl));
                 }
                 catch
                 {
                     if (token.IsCancellationRequested) break;
+                    if (!ReferenceEquals(listener, _mainListener) &&
+                        !ReferenceEquals(listener, _secListener) &&
+                        !ReferenceEquals(listener, _wslHttpListener) &&
+                        !ReferenceEquals(listener, _wslSocksListener))
+                    {
+                        break;
+                    }
                     hadError = true;
                 }
                 if (hadError)
@@ -3198,7 +3630,7 @@ namespace PixelTunnel
             }
         }
 
-        private static async Task HandleLocalClientAsync(TcpClient localClient)
+        private static async Task HandleLocalClientAsync(TcpClient localClient, bool isWsl)
         {
             Interlocked.Increment(ref _activeConns);
             localClient.NoDelay = true;
@@ -3214,157 +3646,13 @@ namespace PixelTunnel
                 if (r0 <= 0) return;
                 int firstByte = fb[0];
 
-                string targetHost = null;
-                int targetPort = 0;
-                byte[] initialPayload = null;
-                bool isHttpConnect = false;
-                bool suppressRadar = false;
-                bool isSocks5 = (firstByte == 0x05);
-
-                if (isSocks5)
+                if (firstByte == 0x05)
                 {
-                    byte[] nmBuf = new byte[1];
-                    if (!await ReadExactAsync(localStream, nmBuf, 0, 1).ConfigureAwait(false)) return;
-                    int nMethods = nmBuf[0];
-                    if (nMethods <= 0)
-                    {
-                        await localStream.WriteAsync(new byte[] { 0x05, 0xFF }, 0, 2).ConfigureAwait(false);
-                        return;
-                    }
-                    byte[] methods = new byte[nMethods];
-                    if (!await ReadExactAsync(localStream, methods, 0, nMethods).ConfigureAwait(false)) return;
-                    bool hasNoAuth = false;
-                    for (int i = 0; i < nMethods; i++)
-                    {
-                        if (methods[i] == 0x00) { hasNoAuth = true; break; }
-                    }
-                    if (!hasNoAuth)
-                    {
-                        await localStream.WriteAsync(new byte[] { 0x05, 0xFF }, 0, 2).ConfigureAwait(false);
-                        return;
-                    }
-                    await localStream.WriteAsync(new byte[] { 0x05, 0x00 }, 0, 2).ConfigureAwait(false);
-
-                    byte[] reqHdr = new byte[4];
-                    if (!await ReadExactAsync(localStream, reqHdr, 0, 4).ConfigureAwait(false)) return;
-                    byte cmd = reqHdr[1];
-                    byte atyp = reqHdr[3];
-
-                    string parsedAddr;
-                    int parsedPort;
-                    if (!ReadSocksAddress(localStream, atyp, out parsedAddr, out parsedPort))
-                    {
-                        return;
-                    }
-
-                    // RFC 1928 SOCKS5 UDP ASSOCIATE (CMD = 0x03) — для голоса Discord / WebRTC / QUIC без драйверов!
-                    if (cmd == 0x03)
-                    {
-                        await HandleSocks5UdpAssociateAsync(localClient, localStream).ConfigureAwait(false);
-                        return;
-                    }
-
-                    if (cmd != 0x01)
-                    {
-                        await localStream.WriteAsync(new byte[] { 0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0 }, 0, 10).ConfigureAwait(false);
-                        return;
-                    }
-
-                    targetHost = parsedAddr;
-                    targetPort = parsedPort;
+                    await HandleSocks5Async(localClient, localStream, isWsl).ConfigureAwait(false);
                 }
                 else
                 {
-                    Tuple<string, byte[]> hdrRead = await ReadHttpRequestHeadersBufferedAsync(localStream, (byte)firstByte, 8192).ConfigureAwait(false);
-                    if (hdrRead == null) return;
-                    string headerStr = hdrRead.Item1;
-                    byte[] extraBody = hdrRead.Item2;
-                    suppressRadar = string.Equals((ExtractHeader(headerStr, "X-Pixel-Internal-Probe") ?? "").Trim(), "1", StringComparison.Ordinal);
-
-                    string firstLine = headerStr.Split(new[] { "\r\n" }, StringSplitOptions.None)[0];
-                    string[] parts = firstLine.Split(' ');
-                    if (parts.Length < 2) return;
-
-                    string method = parts[0].ToUpperInvariant();
-                    string rawTarget = parts[1];
-
-                    if (rawTarget.StartsWith("/proxy.pac", StringComparison.OrdinalIgnoreCase) ||
-                        rawTarget.StartsWith("/__pixelcore/", StringComparison.OrdinalIgnoreCase))
-                    {
-                        await HandleLocalControlHttpAsync(localClient, localStream, method, rawTarget, headerStr, extraBody).ConfigureAwait(false);
-                        return;
-                    }
-
-                    if (method == "CONNECT")
-                    {
-                        isHttpConnect = true;
-                        ParseConnectHostPort(rawTarget, out targetHost, out targetPort);
-                        if (extraBody != null && extraBody.Length > 0)
-                        {
-                            initialPayload = extraBody;
-                        }
-                    }
-                    else
-                    {
-                        Uri uri;
-                        if (!Uri.TryCreate(rawTarget, UriKind.Absolute, out uri)) return;
-                        targetHost = uri.Host.Trim('[', ']');
-                        targetPort = uri.Port > 0 ? uri.Port : 80;
-                        byte[] reqHead = RewritePlainHttpProxyRequest(headerStr, uri);
-                        if (extraBody != null && extraBody.Length > 0)
-                        {
-                            initialPayload = new byte[reqHead.Length + extraBody.Length];
-                            Buffer.BlockCopy(reqHead, 0, initialPayload, 0, reqHead.Length);
-                            Buffer.BlockCopy(extraBody, 0, initialPayload, reqHead.Length, extraBody.Length);
-                        }
-                        else
-                        {
-                            initialPayload = reqHead;
-                        }
-                    }
-                }
-
-                if (string.IsNullOrEmpty(targetHost) || targetPort <= 0) return;
-
-                bool bypassDirect;
-                string routeRule;
-                ClassifyRoute(targetHost, out bypassDirect, out routeRule);
-
-                if (!suppressRadar && !string.Equals(targetHost, "127.0.0.1", StringComparison.OrdinalIgnoreCase))
-                {
-                    int clientPid = 0;
-                    string clientProc = "";
-                    try
-                    {
-                        IPEndPoint rep = localClient.Client.RemoteEndPoint as IPEndPoint;
-                        if (rep != null && IPAddress.IsLoopback(rep.Address))
-                        {
-                            Win32TcpProcessResolver.ResolveLocalPortOwner(rep.Port, out clientPid, out clientProc);
-                        }
-                    }
-                    catch { }
-                    string protoName = isSocks5 ? "SOCKS5" : (isHttpConnect ? "HTTPS" : "HTTP");
-                    RecordLiveRoute(
-                        clientPid,
-                        string.IsNullOrEmpty(clientProc) ? "local" : clientProc,
-                        targetHost,
-                        targetPort,
-                        protoName,
-                        bypassDirect ? "direct" : "tunnel",
-                        routeRule,
-                        bypassDirect ? "DIRECT" : (ActiveNodeName ?? "NL-Edge"),
-                        bypassDirect ? "direct" : "ai",
-                        bypassDirect ? 0 : ActiveNodeLatencyMs,
-                        "");
-                }
-
-                if (bypassDirect)
-                {
-                    await BridgeDirectAsync(localClient, localStream, targetHost, targetPort, isHttpConnect, isSocks5, initialPayload).ConfigureAwait(false);
-                }
-                else
-                {
-                    await ForwardProxyTrafficV3Async(localClient, localStream, targetHost, targetPort, isHttpConnect, isSocks5, initialPayload).ConfigureAwait(false);
+                    await HandleHttpConnectOrProxyAsync(localClient, localStream, (byte)firstByte, isWsl).ConfigureAwait(false);
                 }
             }
             catch
@@ -3374,6 +3662,181 @@ namespace PixelTunnel
             {
                 try { localClient.Close(); } catch { }
                 Interlocked.Decrement(ref _activeConns);
+            }
+        }
+
+        private static async Task HandleSocks5Async(TcpClient localClient, NetworkStream localStream, bool isWsl)
+        {
+            byte[] nmBuf = new byte[1];
+            if (!await ReadExactAsync(localStream, nmBuf, 0, 1).ConfigureAwait(false)) return;
+            int nMethods = nmBuf[0];
+            if (nMethods <= 0)
+            {
+                await localStream.WriteAsync(new byte[] { 0x05, 0xFF }, 0, 2).ConfigureAwait(false);
+                return;
+            }
+            byte[] methods = new byte[nMethods];
+            if (!await ReadExactAsync(localStream, methods, 0, nMethods).ConfigureAwait(false)) return;
+            bool hasNoAuth = false;
+            for (int i = 0; i < nMethods; i++)
+            {
+                if (methods[i] == 0x00) { hasNoAuth = true; break; }
+            }
+            if (!hasNoAuth)
+            {
+                await localStream.WriteAsync(new byte[] { 0x05, 0xFF }, 0, 2).ConfigureAwait(false);
+                return;
+            }
+            await localStream.WriteAsync(new byte[] { 0x05, 0x00 }, 0, 2).ConfigureAwait(false);
+
+            byte[] reqHdr = new byte[4];
+            if (!await ReadExactAsync(localStream, reqHdr, 0, 4).ConfigureAwait(false)) return;
+            byte cmd = reqHdr[1];
+            byte atyp = reqHdr[3];
+
+            string parsedAddr;
+            int parsedPort;
+            if (!ReadSocksAddress(localStream, atyp, out parsedAddr, out parsedPort))
+            {
+                return;
+            }
+
+            if (cmd == 0x03)
+            {
+                await HandleSocks5UdpAssociateAsync(localClient, localStream, isWsl).ConfigureAwait(false);
+                return;
+            }
+
+            if (cmd != 0x01)
+            {
+                await localStream.WriteAsync(new byte[] { 0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0 }, 0, 10).ConfigureAwait(false);
+                return;
+            }
+
+            await RouteAndForwardLocalTargetAsync(localClient, localStream, parsedAddr, parsedPort, false, true, null, false, isWsl).ConfigureAwait(false);
+        }
+
+        private static async Task HandleHttpConnectOrProxyAsync(TcpClient localClient, NetworkStream localStream, byte firstByte, bool isWsl)
+        {
+            Tuple<string, byte[]> hdrRead = await ReadHttpRequestHeadersBufferedAsync(localStream, firstByte, 8192).ConfigureAwait(false);
+            if (hdrRead == null) return;
+            string headerStr = hdrRead.Item1;
+            byte[] extraBody = hdrRead.Item2;
+            bool suppressRadar = string.Equals((ExtractHeader(headerStr, "X-Pixel-Internal-Probe") ?? "").Trim(), "1", StringComparison.Ordinal);
+
+            string firstLine = headerStr.Split(new[] { "\r\n" }, StringSplitOptions.None)[0];
+            string[] parts = firstLine.Split(' ');
+            if (parts.Length < 2) return;
+
+            string method = parts[0].ToUpperInvariant();
+            string rawTarget = parts[1];
+
+            if (rawTarget.StartsWith("/proxy.pac", StringComparison.OrdinalIgnoreCase) ||
+                rawTarget.StartsWith("/__pixelcore/", StringComparison.OrdinalIgnoreCase))
+            {
+                await HandleLocalControlHttpAsync(localClient, localStream, method, rawTarget, headerStr, extraBody, isWsl).ConfigureAwait(false);
+                return;
+            }
+
+            string targetHost = null;
+            int targetPort = 0;
+            byte[] initialPayload = null;
+            bool isHttpConnect = false;
+
+            if (method == "CONNECT")
+            {
+                isHttpConnect = true;
+                ParseConnectHostPort(rawTarget, out targetHost, out targetPort);
+                if (extraBody != null && extraBody.Length > 0)
+                {
+                    initialPayload = extraBody;
+                }
+            }
+            else
+            {
+                Uri uri;
+                if (!Uri.TryCreate(rawTarget, UriKind.Absolute, out uri)) return;
+                if (isWsl && uri.AbsolutePath.StartsWith("/__pixelcore", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteHttpResponseAsync(localStream, 403, "Forbidden", "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"forbidden_on_wsl\"}").ConfigureAwait(false);
+                    return;
+                }
+                targetHost = uri.Host.Trim('[', ']');
+                targetPort = uri.Port > 0 ? uri.Port : 80;
+                byte[] reqHead = RewritePlainHttpProxyRequest(headerStr, uri);
+                if (extraBody != null && extraBody.Length > 0)
+                {
+                    initialPayload = new byte[reqHead.Length + extraBody.Length];
+                    Buffer.BlockCopy(reqHead, 0, initialPayload, 0, reqHead.Length);
+                    Buffer.BlockCopy(extraBody, 0, initialPayload, reqHead.Length, extraBody.Length);
+                }
+                else
+                {
+                    initialPayload = reqHead;
+                }
+            }
+
+            await RouteAndForwardLocalTargetAsync(localClient, localStream, targetHost, targetPort, isHttpConnect, false, initialPayload, suppressRadar, isWsl).ConfigureAwait(false);
+        }
+
+        private static async Task RouteAndForwardLocalTargetAsync(
+            TcpClient localClient,
+            NetworkStream localStream,
+            string targetHost,
+            int targetPort,
+            bool isHttpConnect,
+            bool isSocks5,
+            byte[] initialPayload,
+            bool suppressRadar,
+            bool isWsl)
+        {
+            if (string.IsNullOrEmpty(targetHost) || targetPort <= 0) return;
+
+            if (IsSelfTarget(targetHost, targetPort) || (isWsl && IsWslRestrictedHost(targetHost)))
+            {
+                SendLocalProxyForbidden(localStream, isHttpConnect, isSocks5);
+                return;
+            }
+
+            bool bypassDirect;
+            string routeRule;
+            ClassifyRoute(targetHost, out bypassDirect, out routeRule);
+
+            if (!suppressRadar && !string.Equals(targetHost, "127.0.0.1", StringComparison.OrdinalIgnoreCase))
+            {
+                int clientPid = 0;
+                string clientProc = "";
+                try
+                {
+                    IPEndPoint rep = localClient.Client.RemoteEndPoint as IPEndPoint;
+                    if (rep != null && IPAddress.IsLoopback(rep.Address))
+                    {
+                        Win32TcpProcessResolver.ResolveLocalPortOwner(rep.Port, out clientPid, out clientProc);
+                    }
+                }
+                catch { }
+                string protoName = isSocks5 ? "SOCKS5" : (isHttpConnect ? "HTTPS" : "HTTP");
+                RecordLiveRoute(
+                    clientPid,
+                    string.IsNullOrEmpty(clientProc) ? (isWsl ? "wsl2" : "local") : clientProc,
+                    targetHost,
+                    targetPort,
+                    protoName,
+                    bypassDirect ? "direct" : "tunnel",
+                    routeRule,
+                    bypassDirect ? "DIRECT" : (ActiveNodeName ?? "NL-Edge"),
+                    bypassDirect ? "direct" : "ai",
+                    bypassDirect ? 0 : ActiveNodeLatencyMs,
+                    "");
+            }
+
+            if (bypassDirect)
+            {
+                await BridgeDirectAsync(localClient, localStream, targetHost, targetPort, isHttpConnect, isSocks5, initialPayload, isWsl).ConfigureAwait(false);
+            }
+            else
+            {
+                await ForwardProxyTrafficV3Async(localClient, localStream, targetHost, targetPort, isHttpConnect, isSocks5, initialPayload).ConfigureAwait(false);
             }
         }
 
@@ -3598,7 +4061,7 @@ namespace PixelTunnel
         // =========================================================================
         // RFC 1928 SOCKS5 UDP ASSOCIATE (DISCORD VOICE / WEBRTC / QUIC OVER PWP-3)
         // =========================================================================
-        private static async Task HandleSocks5UdpAssociateAsync(TcpClient controlTcp, NetworkStream controlStream)
+        private static async Task HandleSocks5UdpAssociateAsync(TcpClient controlTcp, NetworkStream controlStream, bool isWsl)
         {
             CancellationToken serviceToken = (_cts != null) ? _cts.Token : CancellationToken.None;
             Pwp3MuxClient mux = await GetOrConnectMuxLaneAsync(false, serviceToken).ConfigureAwait(false);
@@ -3620,7 +4083,10 @@ namespace PixelTunnel
 
             try
             {
-                localUdp.Bind(new IPEndPoint(isV6 ? IPAddress.IPv6Loopback : IPAddress.Loopback, 0));
+                IPAddress bindAddr = (isWsl && ctrlEp != null)
+                    ? ctrlEp.Address
+                    : (isV6 ? IPAddress.IPv6Loopback : IPAddress.Loopback);
+                localUdp.Bind(new IPEndPoint(bindAddr, 0));
                 int boundPort = ((IPEndPoint)localUdp.LocalEndPoint).Port;
 
                 EndPoint learnedClientEp = null;
@@ -3662,10 +4128,11 @@ namespace PixelTunnel
                 }
                 else
                 {
+                    byte[] addrBytes = bindAddr.GetAddressBytes();
                     reply = new byte[]
                     {
                         0x05, 0x00, 0x00, 0x01,
-                        127, 0, 0, 1,
+                        addrBytes[0], addrBytes[1], addrBytes[2], addrBytes[3],
                         (byte)((boundPort >> 8) & 0xFF),
                         (byte)(boundPort & 0xFF)
                     };
@@ -3697,6 +4164,8 @@ namespace PixelTunnel
                         int dataLen = n - dataOff;
                         if (dataLen <= 0) continue;
 
+                        if (IsSelfTarget(dstHost, dstPort) || (isWsl && IsWslRestrictedHost(dstHost))) continue;
+
                         if (ShouldBypassDirect(dstHost))
                         {
                             byte[] rawOut = new byte[dataLen];
@@ -3722,9 +4191,22 @@ namespace PixelTunnel
                                     IPAddress chosen = null;
                                     foreach (var a in addrs)
                                     {
+                                        if (IsSelfTarget(a.ToString(), capPort) || (isWsl && IsWslRestrictedIp(a)))
+                                        {
+                                            if (isWsl) return;
+                                            continue;
+                                        }
                                         if (a.AddressFamily == AddressFamily.InterNetwork) { chosen = a; break; }
                                     }
-                                    if (chosen == null && addrs.Length > 0) chosen = addrs[0];
+                                    if (chosen == null)
+                                    {
+                                        foreach (var a in addrs)
+                                        {
+                                            if (IsSelfTarget(a.ToString(), capPort) || (isWsl && IsWslRestrictedIp(a))) continue;
+                                            chosen = a;
+                                            break;
+                                        }
+                                    }
                                     if (chosen == null) return;
 
                                     bool targetV6 = (chosen.AddressFamily == AddressFamily.InterNetworkV6);
@@ -4526,12 +5008,62 @@ namespace PixelTunnel
             int targetPort,
             bool isHttpConnect,
             bool isSocks5,
-            byte[] initialPayload)
+            byte[] initialPayload,
+            bool isWsl)
         {
-            using (TcpClient remote = new TcpClient())
+            if (IsSelfTarget(targetHost, targetPort) || (isWsl && IsWslRestrictedHost(targetHost)))
+            {
+                SendLocalProxyForbidden(localStream, isHttpConnect, isSocks5);
+                return;
+            }
+
+            IPAddress connectIp = null;
+            try
+            {
+                IPAddress parsedIp;
+                IPAddress[] resolvedIps;
+                if (IPAddress.TryParse(targetHost, out parsedIp))
+                {
+                    resolvedIps = new[] { parsedIp };
+                }
+                else
+                {
+                    resolvedIps = await Dns.GetHostAddressesAsync(targetHost).ConfigureAwait(false);
+                }
+
+                if (resolvedIps != null)
+                {
+                    foreach (var cand in resolvedIps)
+                    {
+                        if (IsSelfTarget(cand.ToString(), targetPort) || (isWsl && IsWslRestrictedIp(cand)))
+                        {
+                            if (isWsl)
+                            {
+                                SendLocalProxyForbidden(localStream, isHttpConnect, isSocks5);
+                                return;
+                            }
+                            continue;
+                        }
+                        if (connectIp == null) connectIp = cand;
+                    }
+                }
+            }
+            catch
+            {
+                SendLocalProxyError(localStream, isHttpConnect, isSocks5);
+                return;
+            }
+
+            if (connectIp == null)
+            {
+                SendLocalProxyForbidden(localStream, isHttpConnect, isSocks5);
+                return;
+            }
+
+            using (TcpClient remote = new TcpClient(connectIp.AddressFamily))
             {
                 remote.NoDelay = true;
-                await remote.ConnectAsync(targetHost, targetPort).ConfigureAwait(false);
+                await remote.ConnectAsync(connectIp, targetPort).ConfigureAwait(false);
                 EnableTcpKeepAlive(remote.Client);
                 NetworkStream remoteStream = remote.GetStream();
 
@@ -4613,9 +5145,11 @@ namespace PixelTunnel
             SampleLiveSpeed();
             long uptimeSec = (long)(DateTime.UtcNow - _startTime).TotalSeconds;
             string standby = FindStandbyNodeNameLocked();
+            int pingMs = UsingGoEngine ? LivePingMs : ComputeCSharpLivePingMs();
+            if (!UsingGoEngine && pingMs > 0) LivePingMs = pingMs;
             string body = string.Format(
                 CultureInfo.InvariantCulture,
-                "{{\"engine\":\"PixelCore v3.0 (v{23})\",\"engine_version\":\"{23}\",\"protocol\":\"{0}\",\"region\":\"{1}\",\"manifest_ver\":{2},\"manifest_src\":\"{3}\",\"mux_streams\":{4},\"udp_assocs\":{5},\"dpi_clienthello_split\":{6},\"dpi_profile\":\"{7}\",\"anti_freeze_ok\":{8},\"dpi_escalations\":{9},\"clock_offset_sec\":{22},\"license_tier\":\"{10}\",\"days_left\":{11},\"devices_used\":{12},\"devices_max\":{13},\"speed_mbps\":{14:0.00},\"latest_version\":\"{15}\",\"license_error\":\"{16}\",\"uptime_sec\":{17},\"active_connections\":{18},\"bytes_up\":{19},\"bytes_down\":{20},\"utls_profile\":\"{24}\",\"standby_node\":\"{25}\",\"standby_ready\":{26},\"failover_count\":{27},\"instant_wake_count\":{28},\"pac_rev\":{29},\"wsl_bridge_ip\":\"{30}\",\"nodes\":{21}}}",
+                "{{\"engine\":\"PixelCore v3.0 (v{23})\",\"engine_version\":\"{23}\",\"protocol\":\"{0}\",\"region\":\"{1}\",\"manifest_ver\":{2},\"manifest_src\":\"{3}\",\"mux_streams\":{4},\"udp_assocs\":{5},\"dpi_clienthello_split\":{6},\"dpi_profile\":\"{7}\",\"anti_freeze_ok\":{8},\"dpi_escalations\":{9},\"clock_offset_sec\":{22},\"license_tier\":\"{10}\",\"days_left\":{11},\"devices_used\":{12},\"devices_max\":{13},\"speed_mbps\":{14:0.00},\"latest_version\":\"{15}\",\"license_error\":\"{16}\",\"uptime_sec\":{17},\"active_connections\":{18},\"bytes_up\":{19},\"bytes_down\":{20},\"utls_profile\":\"{24}\",\"standby_node\":\"{25}\",\"standby_ready\":{26},\"failover_count\":{27},\"instant_wake_count\":{28},\"pac_rev\":{29},\"wsl_bridge_ip\":\"{30}\",\"ping_ms\":{31},\"nodes\":{21}}}",
                 EscapeJson(ActiveProtocol ?? "PWP-3 Mux"),
                 EscapeJson(_preferredRegion),
                 ManifestVersion,
@@ -4646,7 +5180,8 @@ namespace PixelTunnel
                 FailoverCount,
                 InstantWakeCount,
                 _pacRevision,
-                EscapeJson(ActiveWslBridgeIp ?? ""));
+                EscapeJson(ActiveWslBridgeIp ?? ""),
+                pingMs);
 
             byte[] bodyBytes = Encoding.UTF8.GetBytes(body);
             string respHdr =
@@ -5277,21 +5812,71 @@ namespace PixelTunnel
             return StandbyNodeName ?? "";
         }
 
+        public static void RegisterPowerModeHookOnUiThread()
+        {
+            EnsurePowerModeHook();
+        }
+
         private static void EnsurePowerModeHook()
         {
+            if (Thread.CurrentThread.GetApartmentState() != ApartmentState.STA) return;
             if (Interlocked.CompareExchange(ref _powerHookRegistered, 1, 0) == 0)
             {
                 try
                 {
                     SystemEvents.PowerModeChanged += (s, e) =>
                     {
-                        if (e.Mode == PowerModes.Resume && IsRunning)
+                        if (e.Mode == PowerModes.Resume && IsRunning && InstantWakeEnabled)
                         {
                             Task.Run(() => TriggerInstantWakeAsync("power_resume"));
                         }
                     };
                 }
-                catch { }
+                catch
+                {
+                    Interlocked.Exchange(ref _powerHookRegistered, 0);
+                }
+            }
+        }
+
+        private static void StopWslBridgeListenersLocked()
+        {
+            if (_wslCts != null)
+            {
+                try { _wslCts.Cancel(); } catch { }
+                try { _wslCts.Dispose(); } catch { }
+                _wslCts = null;
+            }
+            if (_wslHttpListener != null)
+            {
+                try { _wslHttpListener.Stop(); } catch { }
+                _wslHttpListener = null;
+            }
+            if (_wslSocksListener != null)
+            {
+                try { _wslSocksListener.Stop(); } catch { }
+                _wslSocksListener = null;
+            }
+            ActiveWslBridgeIp = "";
+        }
+
+        private static void SyncCSharpWslBridgeState()
+        {
+            if (!IsRunning || UsingGoEngine) return;
+            lock (_wslLock)
+            {
+                if (_wslBridgeEnabled)
+                {
+                    if (_wslHttpListener == null)
+                    {
+                        CancellationToken serviceToken = (_cts != null) ? _cts.Token : CancellationToken.None;
+                        TryStartWslBridgeListeners(serviceToken);
+                    }
+                }
+                else
+                {
+                    StopWslBridgeListenersLocked();
+                }
             }
         }
 
@@ -5299,22 +5884,29 @@ namespace PixelTunnel
         {
             try
             {
+                StopWslBridgeListenersLocked();
                 IPAddress wslIp = FindWslBridgeIpv4();
                 if (wslIp == null) return;
+                _wslCts = token.CanBeCanceled
+                    ? CancellationTokenSource.CreateLinkedTokenSource(token)
+                    : new CancellationTokenSource();
+                CancellationToken wslToken = _wslCts.Token;
                 _wslHttpListener = new TcpListener(wslIp, _localPort);
                 _wslHttpListener.Start(128);
-                Task.Run(() => AcceptLoopAsync(_wslHttpListener, token));
+                TcpListener httpRef = _wslHttpListener;
+                Task.Run(() => AcceptLoopAsync(httpRef, wslToken, true));
                 if (_socksPort > 0 && _socksPort != _localPort)
                 {
                     _wslSocksListener = new TcpListener(wslIp, _socksPort);
                     _wslSocksListener.Start(128);
-                    Task.Run(() => AcceptLoopAsync(_wslSocksListener, token));
+                    TcpListener socksRef = _wslSocksListener;
+                    Task.Run(() => AcceptLoopAsync(socksRef, wslToken, true));
                 }
                 ActiveWslBridgeIp = wslIp.ToString();
             }
             catch
             {
-                ActiveWslBridgeIp = "";
+                StopWslBridgeListenersLocked();
             }
         }
 
@@ -5329,7 +5921,8 @@ namespace PixelTunnel
                     if (combined.IndexOf("WSL", StringComparison.OrdinalIgnoreCase) < 0) continue;
                     foreach (UnicastIPAddressInformation ua in ni.GetIPProperties().UnicastAddresses)
                     {
-                        if (ua.Address != null && ua.Address.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(ua.Address))
+                        if (ua.Address != null && ua.Address.AddressFamily == AddressFamily.InterNetwork &&
+                            !IPAddress.IsLoopback(ua.Address) && IsWslBridgeSubnetIp(ua.Address))
                         {
                             return ua.Address;
                         }
@@ -5340,15 +5933,49 @@ namespace PixelTunnel
             return null;
         }
 
+        private static void HandleUnexpectedGoEngineExit(string reason)
+        {
+            Action<string> handler = null;
+            bool raised = false;
+            lock (_syncLock)
+            {
+                if (!IsRunning || !UsingGoEngine || NativeUtlsEngineHost.IsAlive()) return;
+                string msg = string.IsNullOrEmpty(reason) ? "Go uTLS процесс неожиданно завершился" : reason;
+                GoEngineUnexpectedExitReason = msg;
+                GoEngineFallbackReason = msg;
+                LastGoEngineFailureReason = msg;
+                StopService();
+                GoEngineUnexpectedExitReason = msg;
+                GoEngineFallbackReason = msg;
+                LastGoEngineFailureReason = msg;
+                handler = OnUnexpectedGoEngineExit;
+                raised = true;
+            }
+            if (raised && handler != null)
+            {
+                try { handler(GoEngineUnexpectedExitReason); } catch { }
+            }
+        }
+
         private static async Task GoTelemetryPollLoopAsync(CancellationToken token)
         {
             while (!token.IsCancellationRequested && IsRunning && UsingGoEngine)
             {
+                if (!NativeUtlsEngineHost.IsAlive())
+                {
+                    int exitCode = NativeUtlsEngineHost.GetLastExitCode();
+                    string reason = exitCode >= 0
+                        ? ("Go uTLS процесс неожиданно завершился (код " + exitCode.ToString(CultureInfo.InvariantCulture) + ")")
+                        : "Go uTLS процесс неожиданно завершился";
+                    HandleUnexpectedGoEngineExit(reason);
+                    break;
+                }
                 try
                 {
                     await SyncGoTelemetryAsync().ConfigureAwait(false);
                 }
                 catch { }
+                if (!IsRunning || !UsingGoEngine) break;
                 try { await Task.Delay(1500, token).ConfigureAwait(false); } catch { break; }
             }
         }
@@ -5356,11 +5983,31 @@ namespace PixelTunnel
         public static async Task SyncGoTelemetryAsync()
         {
             if (!IsRunning || !UsingGoEngine) return;
+            if (!NativeUtlsEngineHost.IsAlive())
+            {
+                int exitCode = NativeUtlsEngineHost.GetLastExitCode();
+                string reason = exitCode >= 0
+                    ? ("Go uTLS процесс неожиданно завершился (код " + exitCode.ToString(CultureInfo.InvariantCulture) + ")")
+                    : "Go uTLS процесс неожиданно завершился";
+                HandleUnexpectedGoEngineExit(reason);
+                return;
+            }
             try
             {
                 string raw = await QueryLocalEndpointAsync("GET", "/__pixelcore/v4/status", null, 2500).ConfigureAwait(false);
                 if (string.IsNullOrEmpty(raw))
+                {
+                    if (!NativeUtlsEngineHost.IsAlive())
+                    {
+                        int exitCode = NativeUtlsEngineHost.GetLastExitCode();
+                        string reason = exitCode >= 0
+                            ? ("Go uTLS процесс неожиданно завершился (код " + exitCode.ToString(CultureInfo.InvariantCulture) + ")")
+                            : "Go uTLS процесс неожиданно завершился";
+                        HandleUnexpectedGoEngineExit(reason);
+                        return;
+                    }
                     raw = await QueryLocalEndpointAsync("GET", "/__pixelcore/telemetry", null, 2500).ConfigureAwait(false);
+                }
                 var obj = MiniJson.Deserialize(raw) as Dictionary<string, object>;
                 if (obj == null) return;
 
@@ -5409,9 +6056,94 @@ namespace PixelTunnel
                 if (ac >= 0) Interlocked.Exchange(ref _activeConns, ac);
                 double mbps = MiniJson.GetDouble(obj, "speed_mbps", -1.0);
                 if (mbps >= 0.0) LiveTotalMbps = mbps;
+
+                bool isConnected = MiniJson.GetBool(obj, "connected", false);
+                int pingMs = MiniJson.GetInt(obj, "ping_ms", 0);
+                if (pingMs <= 0)
+                {
+                    pingMs = ExtractActiveNodePingFromJson(obj, ActiveNodeName);
+                }
+                if (pingMs <= 0 && isConnected)
+                {
+                    pingMs = GetMeasuredNodeLatencyLocked(ActiveNodeName);
+                }
+                if (isConnected && pingMs > 0 && pingMs < 9000)
+                {
+                    LivePingMs = pingMs;
+                    ActiveNodeLatencyMs = pingMs;
+                }
+                else
+                {
+                    LivePingMs = 0;
+                    ActiveNodeLatencyMs = 0;
+                }
+
                 SampleLiveSpeed();
             }
             catch { }
+        }
+
+        private static int ExtractActiveNodePingFromJson(Dictionary<string, object> obj, string activeNodeName)
+        {
+            if (obj == null) return 0;
+            var nodesList = MiniJson.GetList(obj, "nodes");
+            if (nodesList == null) return 0;
+            int firstOnlinePing = 0;
+            foreach (object item in nodesList)
+            {
+                var nd = item as Dictionary<string, object>;
+                if (nd == null) continue;
+                int lat = MiniJson.GetInt(nd, "latency_ms", 0);
+                if (lat <= 0 || lat >= 9000) continue;
+                string name = MiniJson.GetStr(nd, "name") ?? "";
+                if (!string.IsNullOrEmpty(activeNodeName) &&
+                    string.Equals(name, activeNodeName, StringComparison.OrdinalIgnoreCase))
+                {
+                    return lat;
+                }
+                if (firstOnlinePing == 0 && MiniJson.GetBool(nd, "online", false))
+                {
+                    firstOnlinePing = lat;
+                }
+            }
+            return firstOnlinePing;
+        }
+
+        private static int GetMeasuredNodeLatencyLocked(string activeNodeName)
+        {
+            lock (_nodesLock)
+            {
+                foreach (var n in _nodes)
+                {
+                    if (n == null) continue;
+                    if (!string.IsNullOrEmpty(activeNodeName) &&
+                        string.Equals(n.Name, activeNodeName, StringComparison.OrdinalIgnoreCase) &&
+                        n.LastHealthMeasuredUtc != DateTime.MinValue &&
+                        n.LatencyMs > 0 && n.LatencyMs < 9000)
+                    {
+                        return n.LatencyMs;
+                    }
+                }
+            }
+            return 0;
+        }
+
+        private static int ComputeCSharpLivePingMs()
+        {
+            if (!IsRunning) return 0;
+            Pwp3MuxClient l0 = _laneInteractive;
+            if (l0 != null && !l0.IsClosed && l0.LastRttMs > 0 && l0.LastRttMs < 9000)
+            {
+                return l0.LastRttMs;
+            }
+            int measured = GetMeasuredNodeLatencyLocked(ActiveNodeName);
+            if (measured > 0) return measured;
+            if (LivePingMs > 0 && LivePingMs < 9000) return LivePingMs;
+            if (l0 != null && ActiveNodeLatencyMs > 0 && ActiveNodeLatencyMs < 9000)
+            {
+                return ActiveNodeLatencyMs;
+            }
+            return 0;
         }
 
         private static void RecordLiveRoute(int pid, string procName, string domain, int port, string proto, string action, string rule, string node, string role, int pingMs, string error)
@@ -5446,30 +6178,136 @@ namespace PixelTunnel
 
         public static string GeneratePacScript()
         {
+            return GeneratePacScript("127.0.0.1");
+        }
+
+        private static void AddSanitizedPacEntries(List<string> target, HashSet<string> seen, IEnumerable<string> source, bool allowIpLiterals)
+        {
+            if (source == null) return;
+            foreach (string raw in source)
+            {
+                if (string.IsNullOrWhiteSpace(raw)) continue;
+                string s = raw.Trim().Trim('[', ']').ToLowerInvariant();
+                IPAddress ip;
+                if (allowIpLiterals && IPAddress.TryParse(s, out ip))
+                {
+                    string ipStr = ip.ToString();
+                    if (seen.Add(ipStr)) target.Add(ipStr);
+                    continue;
+                }
+                string clean = SanitizeDomainRule(raw);
+                if (!string.IsNullOrEmpty(clean) && seen.Add(clean))
+                {
+                    target.Add(clean);
+                }
+            }
+        }
+
+        private static string GeneratePacScript(string proxyHost)
+        {
+            string effectiveProxyHost = string.IsNullOrWhiteSpace(proxyHost) ? "127.0.0.1" : proxyHost.Trim();
+            IPAddress tmpIp;
+            if (!IPAddress.TryParse(effectiveProxyHost, out tmpIp) && !IsValidHostname(effectiveProxyHost))
+                effectiveProxyHost = "127.0.0.1";
+
+            var tier0List = new List<string>();
+            var tier1List = new List<string>();
+            var tier2List = new List<string>();
+            var tier3List = new List<string>();
+            var tier4List = new List<string>();
+            bool proxyAll;
+            bool routeTgDc;
+
+            lock (_rulesLock)
+            {
+                var s0 = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                tier0List.Add("pixelstore.space");
+                s0.Add("pixelstore.space");
+                AddSanitizedPacEntries(tier0List, s0, _serverHostBypass, true);
+
+                var s1 = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                AddSanitizedPacEntries(tier1List, s1, _customProxySet, false);
+                DateTime now = DateTime.UtcNow;
+                var expired = new List<string>();
+                foreach (var kv in _temporaryProxyDomains)
+                {
+                    if (kv.Value <= now) { expired.Add(kv.Key); continue; }
+                    string clean = SanitizeDomainRule(kv.Key);
+                    if (!string.IsNullOrEmpty(clean) && s1.Add(clean)) tier1List.Add(clean);
+                }
+                foreach (string k in expired) _temporaryProxyDomains.Remove(k);
+
+                var s2 = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                AddSanitizedPacEntries(tier2List, s2, _customDirectSet, false);
+
+                var s3 = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                AddSanitizedPacEntries(tier3List, s3, _builtinDirectSet, false);
+                AddSanitizedPacEntries(tier3List, s3, _baseDirectDomains, false);
+
+                var s4 = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                AddSanitizedPacEntries(tier4List, s4, _categoryProxySet, false);
+
+                proxyAll = _defaultOutboundIsProxy;
+                routeTgDc = s4.Contains("telegram.org") || s1.Contains("telegram.org") || proxyAll;
+            }
+
+            string proxyChain = "PROXY " + effectiveProxyHost + ":" + _localPort.ToString(CultureInfo.InvariantCulture) +
+                                "; SOCKS5 " + effectiveProxyHost + ":" + _socksPort.ToString(CultureInfo.InvariantCulture);
+
             var sb = new StringBuilder();
-            sb.AppendLine("// PixelTunnel v" + ENGINE_VERSION + " Smart PAC (rev " + _pacRevision + ")");
+            sb.AppendLine("// PixelTunnel v" + ENGINE_VERSION + " Smart PAC (rev " + _pacRevision.ToString(CultureInfo.InvariantCulture) + ")");
+            sb.Append("var TIER0_BYPASS = ").Append(MiniJson.Serialize(tier0List)).AppendLine(";");
+            sb.Append("var TIER1_CUSTOM_PROXY = ").Append(MiniJson.Serialize(tier1List)).AppendLine(";");
+            sb.Append("var TIER2_CUSTOM_DIRECT = ").Append(MiniJson.Serialize(tier2List)).AppendLine(";");
+            sb.Append("var TIER3_BUILTIN_DIRECT = ").Append(MiniJson.Serialize(tier3List)).AppendLine(";");
+            sb.Append("var TIER4_CATEGORY_PROXY = ").Append(MiniJson.Serialize(tier4List)).AppendLine(";");
+            sb.Append("var PROXY_ALL = ").Append(proxyAll ? "true" : "false").AppendLine(";");
+            sb.Append("var ROUTE_TG_DC = ").Append(routeTgDc ? "true" : "false").AppendLine(";");
+            sb.Append("var PROXY_CHAIN = ").Append(MiniJson.Serialize(proxyChain)).AppendLine(";");
+            sb.AppendLine();
+            sb.AppendLine("function _endsWith(str, suf) {");
+            sb.AppendLine("  return str.length >= suf.length && str.slice(str.length - suf.length) === suf;");
+            sb.AppendLine("}");
+            sb.AppendLine("function _matchRule(h, rule) {");
+            sb.AppendLine("  if (!rule) return false;");
+            sb.AppendLine("  if (rule.charAt(0) === '.') return _endsWith(h, rule) || h === rule.slice(1);");
+            sb.AppendLine("  return h === rule || _endsWith(h, '.' + rule);");
+            sb.AppendLine("}");
+            sb.AppendLine("function _matchList(h, list) {");
+            sb.AppendLine("  for (var i = 0; i < list.length; i++) {");
+            sb.AppendLine("    if (_matchRule(h, list[i])) return true;");
+            sb.AppendLine("  }");
+            sb.AppendLine("  return false;");
+            sb.AppendLine("}");
+            sb.AppendLine("function _isPrivateIPLiteral(h) {");
+            sb.AppendLine("  if (h === 'localhost' || h === '::1' || h === '[::1]' || h === '0.0.0.0') return true;");
+            sb.AppendLine("  if (/^127\\./.test(h) || /^10\\./.test(h) || /^192\\.168\\./.test(h) || /^169\\.254\\./.test(h)) return true;");
+            sb.AppendLine("  var m = /^172\\.(\\d+)\\./.exec(h);");
+            sb.AppendLine("  if (m) { var sec = parseInt(m[1], 10); if (sec >= 16 && sec <= 31) return true; }");
+            sb.AppendLine("  if (/^(fc|fd|fe80)/i.test(h.replace(/^\\[|\\]$/g, ''))) return true;");
+            sb.AppendLine("  return false;");
+            sb.AppendLine("}");
+            sb.AppendLine("function _isTelegramDCIP(h) {");
+            sb.AppendLine("  var m = /^(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})$/.exec(h);");
+            sb.AppendLine("  if (!m) return false;");
+            sb.AppendLine("  var a = parseInt(m[1], 10), b = parseInt(m[2], 10), c = parseInt(m[3], 10), d = parseInt(m[4], 10);");
+            sb.AppendLine("  if (a > 255 || b > 255 || c > 255 || d > 255) return false;");
+            sb.AppendLine("  if (a === 149 && b === 154 && (c & 240) === 160) return true;");
+            sb.AppendLine("  if (a === 91 && b === 108 && ((c & 252) === 4 || (c & 252) === 8 || (c & 252) === 12 || (c & 252) === 16 || (c & 252) === 20 || (c & 252) === 56)) return true;");
+            sb.AppendLine("  if (a === 91 && b === 105 && (c & 254) === 192) return true;");
+            sb.AppendLine("  if (a === 185 && b === 76 && c === 151) return true;");
+            sb.AppendLine("  return false;");
+            sb.AppendLine("}");
             sb.AppendLine("function FindProxyForURL(url, host) {");
-            sb.AppendLine("  var h = (host || '').toLowerCase();");
-            sb.AppendLine("  if (isPlainHostName(h) || shExpMatch(h, '127.*') || shExpMatch(h, 'localhost') || shExpMatch(h, '10.*') || shExpMatch(h, '192.168.*') || /^172\\.(1[6-9]|2\\d|3[0-1])\\./.test(h)) return 'DIRECT';");
-            sb.AppendLine("  var px = 'PROXY 127.0.0.1:" + _localPort.ToString(CultureInfo.InvariantCulture) + "; SOCKS5 127.0.0.1:" + _socksPort.ToString(CultureInfo.InvariantCulture) + "';");
-
-            foreach (string dom in _proxyDomains)
-            {
-                string d = (dom ?? "").Trim().TrimStart('.').ToLowerInvariant();
-                if (string.IsNullOrEmpty(d)) continue;
-                sb.AppendLine("  if (dnsDomainIs(h, '." + d + "') || h === '" + d + "') return px;");
-            }
-
-            sb.AppendLine("  if (shExpMatch(h, '*.ru') || shExpMatch(h, '*.su') || shExpMatch(h, '*.by') || shExpMatch(h, '*.xn--p1ai')) return 'DIRECT';");
-
-            foreach (string dom in _directDomains)
-            {
-                string d = (dom ?? "").Trim().TrimStart('.').ToLowerInvariant();
-                if (string.IsNullOrEmpty(d)) continue;
-                sb.AppendLine("  if (dnsDomainIs(h, '." + d + "') || h === '" + d + "') return 'DIRECT';");
-            }
-
-            sb.AppendLine(_defaultOutboundIsProxy ? "  return px;" : "  return 'DIRECT';");
+            sb.AppendLine("  var h = (host || '').toLowerCase().replace(/\\.+$/, '');");
+            sb.AppendLine("  if (!h || isPlainHostName(h) || _isPrivateIPLiteral(h) || _matchList(h, TIER0_BYPASS)) return 'DIRECT';");
+            sb.AppendLine("  if (_matchList(h, TIER1_CUSTOM_PROXY)) return PROXY_CHAIN;");
+            sb.AppendLine("  if (_matchList(h, TIER2_CUSTOM_DIRECT)) return 'DIRECT';");
+            sb.AppendLine("  if (_endsWith(h, '.ru') || _endsWith(h, '.su') || _endsWith(h, '.by') || _endsWith(h, '.xn--p1ai') || _matchList(h, TIER3_BUILTIN_DIRECT)) return 'DIRECT';");
+            sb.AppendLine("  if (ROUTE_TG_DC && _isTelegramDCIP(h)) return PROXY_CHAIN;");
+            sb.AppendLine("  if (_matchList(h, TIER4_CATEGORY_PROXY)) return PROXY_CHAIN;");
+            sb.AppendLine("  if (PROXY_ALL) return PROXY_CHAIN;");
+            sb.AppendLine("  return 'DIRECT';");
             sb.AppendLine("}");
             return sb.ToString();
         }
@@ -5510,27 +6348,41 @@ namespace PixelTunnel
                 await stream.WriteAsync(data, 0, data.Length).ConfigureAwait(false);
         }
 
-        private static async Task HandleLocalControlHttpAsync(TcpClient localClient, NetworkStream localStream, string method, string rawTarget, string headerStr, byte[] extraBody)
+        private static async Task HandleLocalControlHttpAsync(TcpClient localClient, NetworkStream localStream, string method, string rawTarget, string headerStr, byte[] extraBody, bool isWsl)
         {
             string pathOnly = rawTarget.Split('?')[0].ToLowerInvariant();
+            if (isWsl)
+            {
+                if (pathOnly == "/proxy.pac")
+                {
+                    string wslHost = string.IsNullOrEmpty(ActiveWslBridgeIp) ? "127.0.0.1" : ActiveWslBridgeIp;
+                    await WriteHttpResponseAsync(localStream, 200, "OK", "application/x-ns-proxy-autoconfig; charset=utf-8", GeneratePacScript(wslHost)).ConfigureAwait(false);
+                    return;
+                }
+                await WriteHttpResponseAsync(localStream, 403, "Forbidden", "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"forbidden_on_wsl\"}").ConfigureAwait(false);
+                return;
+            }
+
             string hostHdr = (ExtractHeader(headerStr, "Host") ?? "").Trim();
             int listenPort = _localPort;
+            bool isLoopbackPeer = false;
             try
             {
                 IPEndPoint lep = localClient.Client.LocalEndPoint as IPEndPoint;
                 if (lep != null && lep.Port > 0) listenPort = lep.Port;
+                IPEndPoint rep = localClient.Client.RemoteEndPoint as IPEndPoint;
+                isLoopbackPeer = (rep != null && IPAddress.IsLoopback(rep.Address));
             }
             catch { }
 
             string portStr = listenPort.ToString(CultureInfo.InvariantCulture);
-            bool validLoopbackHost =
+            bool validLoopbackHost = isLoopbackPeer && (
                 string.Equals(hostHdr, "127.0.0.1", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(hostHdr, "127.0.0.1:" + portStr, StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(hostHdr, "localhost", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(hostHdr, "localhost:" + portStr, StringComparison.OrdinalIgnoreCase) ||
-                (!string.IsNullOrEmpty(ActiveWslBridgeIp) &&
-                 (string.Equals(hostHdr, ActiveWslBridgeIp, StringComparison.OrdinalIgnoreCase) ||
-                  string.Equals(hostHdr, ActiveWslBridgeIp + ":" + portStr, StringComparison.OrdinalIgnoreCase)));
+                string.Equals(hostHdr, "[::1]", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(hostHdr, "[::1]:" + portStr, StringComparison.OrdinalIgnoreCase));
 
             if (!validLoopbackHost)
             {
@@ -5540,20 +6392,26 @@ namespace PixelTunnel
 
             if (pathOnly == "/proxy.pac")
             {
-                await WriteHttpResponseAsync(localStream, 200, "OK", "application/x-ns-proxy-autoconfig; charset=utf-8", GeneratePacScript()).ConfigureAwait(false);
+                await WriteHttpResponseAsync(localStream, 200, "OK", "application/x-ns-proxy-autoconfig; charset=utf-8", GeneratePacScript("127.0.0.1")).ConfigureAwait(false);
                 return;
             }
 
+            string tokHdr = (ExtractHeader(headerStr, "X-Pixel-Local-Token") ?? "").Trim();
+
             if (pathOnly == "/__pixelcore/status" || pathOnly == "/__pixelcore/telemetry")
             {
+                if (!string.IsNullOrEmpty(_localControlToken) && !FixedTimeEquals(tokHdr, _localControlToken))
+                {
+                    await WriteHttpResponseAsync(localStream, 403, "Forbidden", "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"unauthorized\"}").ConfigureAwait(false);
+                    return;
+                }
                 ServeTelemetryApi(localStream);
                 return;
             }
 
             if (pathOnly.StartsWith("/__pixelcore/v4/", StringComparison.Ordinal))
             {
-                string tokHdr = (ExtractHeader(headerStr, "X-Pixel-Local-Token") ?? "").Trim();
-                if (!string.IsNullOrEmpty(_localControlToken) && !string.Equals(tokHdr, _localControlToken, StringComparison.Ordinal))
+                if (string.IsNullOrEmpty(_localControlToken) || !FixedTimeEquals(tokHdr, _localControlToken))
                 {
                     await WriteHttpResponseAsync(localStream, 403, "Forbidden", "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"unauthorized\"}").ConfigureAwait(false);
                     return;
@@ -5594,6 +6452,8 @@ namespace PixelTunnel
             SampleLiveSpeed();
             long uptimeSec = (long)(DateTime.UtcNow - _startTime).TotalSeconds;
             string standby = FindStandbyNodeNameLocked();
+            int pingMs = ComputeCSharpLivePingMs();
+            if (!UsingGoEngine && pingMs > 0) LivePingMs = pingMs;
             var d = new Dictionary<string, object>
             {
                 { "ok", true },
@@ -5605,6 +6465,7 @@ namespace PixelTunnel
                 { "dpi_profile", AntiDpiProfileName },
                 { "active_node", ActiveNodeName ?? "NL-Edge-443" },
                 { "active_role", "ai" },
+                { "ping_ms", pingMs },
                 { "standby_node", standby },
                 { "standby_ready", StandbyReady },
                 { "failover_count", FailoverCount },
@@ -5617,6 +6478,10 @@ namespace PixelTunnel
                 { "wsl_bridge_ip", ActiveWslBridgeIp ?? "" },
                 { "license_tier", ServerLicenseTier ?? "" },
                 { "days_left", ServerDaysLeft },
+                { "hours_left", ServerHoursLeft },
+                { "license_error", LastLicenseError ?? "" },
+                { "last_error", LastConnectError ?? "" },
+                { "speed_mbps", LiveTotalMbps },
                 { "manifest_ver", ManifestVersion },
                 { "manifest_src", ManifestSource ?? "Embedded" },
                 { "uptime_sec", uptimeSec },
@@ -5762,90 +6627,103 @@ namespace PixelTunnel
 
         private static string ApplyCSharpReloadRules(string bodyJson)
         {
+            int proxyCount = 0;
+            int directCount = 0;
+            int activeTempCount = 0;
             try
             {
                 var req = !string.IsNullOrEmpty(bodyJson) ? MiniJson.Deserialize(bodyJson) as Dictionary<string, object> : null;
-                if (req == null)
+                if (req == null || req.Count == 0)
                 {
                     if (!string.IsNullOrEmpty(_activeConfigPath) && File.Exists(_activeConfigPath))
                     {
                         LoadCompatibleJsonString(File.ReadAllText(_activeConfigPath, Encoding.UTF8));
                     }
+                    lock (_rulesLock)
+                    {
+                        proxyCount = _proxyDomains.Count;
+                        directCount = _directDomains.Count;
+                        activeTempCount = _temporaryProxyDomains.Count;
+                    }
                 }
                 else
                 {
-                    bool rebuildFromCats = false;
-                    var catsDict = MiniJson.GetDict(req, "categories");
-                    if (catsDict != null)
+                    lock (_rulesLock)
                     {
-                        rebuildFromCats = true;
-                        var nextCats = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
-                        foreach (var kv in catsDict)
-                            nextCats[kv.Key] = MiniJson.GetBool(catsDict, kv.Key, false);
-                        _activeCategories = nextCats;
-                    }
-
-                    if (req.ContainsKey("custom_proxy_domains") || req.ContainsKey("custom_proxy"))
-                    {
-                        string pKey = req.ContainsKey("custom_proxy_domains") ? "custom_proxy_domains" : "custom_proxy";
-                        var nextCustomProxy = new List<string>();
-                        foreach (string s in MiniJson.GetStrList(req, pKey))
+                        var prevCustomDirect = new List<string>(_customDirectList);
+                        if (!_baseDirectInitialized)
                         {
-                            string clean = (s ?? "").Trim().ToLowerInvariant();
-                            if (!string.IsNullOrEmpty(clean)) nextCustomProxy.Add(clean);
+                            var inferredBase = new HashSet<string>(_directDomains, StringComparer.OrdinalIgnoreCase);
+                            foreach (string oldCd in prevCustomDirect) inferredBase.Remove(oldCd);
+                            _baseDirectDomains = inferredBase;
+                            _baseDirectInitialized = true;
                         }
-                        _customProxyList = nextCustomProxy;
-                        rebuildFromCats = rebuildFromCats || _activeCategories.Count > 0;
-                    }
 
-                    if (req.ContainsKey("custom_direct_domains") || req.ContainsKey("custom_direct"))
-                    {
-                        string dKey = req.ContainsKey("custom_direct_domains") ? "custom_direct_domains" : "custom_direct";
-                        var nextCustomDirect = new List<string>();
-                        foreach (string s in MiniJson.GetStrList(req, dKey))
+                        var catsDict = MiniJson.GetDict(req, "categories");
+                        if (catsDict != null)
                         {
-                            string clean = (s ?? "").Trim().ToLowerInvariant();
-                            if (!string.IsNullOrEmpty(clean)) nextCustomDirect.Add(clean);
+                            var nextCats = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+                            foreach (var kv in catsDict)
+                                nextCats[kv.Key] = MiniJson.GetBool(catsDict, kv.Key, false);
+                            _activeCategories = nextCats;
                         }
-                        _customDirectList = nextCustomDirect;
-                    }
 
-                    if (req.ContainsKey("proxy_all"))
-                        _defaultOutboundIsProxy = MiniJson.GetBool(req, "proxy_all", _defaultOutboundIsProxy);
-
-                    var newDirect = new HashSet<string>(
-                        _baseDirectDomains.Count > 0 ? _baseDirectDomains : _directDomains,
-                        StringComparer.OrdinalIgnoreCase);
-                    var newProxy = rebuildFromCats
-                        ? new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-                        : new HashSet<string>(_proxyDomains, StringComparer.OrdinalIgnoreCase);
-
-                    if (rebuildFromCats)
-                    {
-                        foreach (var kv in _activeCategories)
+                        if (req.ContainsKey("custom_proxy_domains") || req.ContainsKey("custom_proxy"))
                         {
-                            if (kv.Value)
+                            string pKey = req.ContainsKey("custom_proxy_domains") ? "custom_proxy_domains" : "custom_proxy";
+                            var nextCustomProxy = new List<string>();
+                            foreach (string s in MiniJson.GetStrList(req, pKey))
                             {
-                                foreach (string dom in GetCSharpCategoryDomains(kv.Key))
-                                    newProxy.Add(dom);
+                                string clean = SanitizeDomainRule(s);
+                                if (!string.IsNullOrEmpty(clean)) nextCustomProxy.Add(clean);
+                            }
+                            _customProxyList = nextCustomProxy;
+                        }
+
+                        if (req.ContainsKey("custom_direct_domains") || req.ContainsKey("custom_direct"))
+                        {
+                            string dKey = req.ContainsKey("custom_direct_domains") ? "custom_direct_domains" : "custom_direct";
+                            var nextCustomDirect = new List<string>();
+                            foreach (string s in MiniJson.GetStrList(req, dKey))
+                            {
+                                string clean = SanitizeDomainRule(s);
+                                if (!string.IsNullOrEmpty(clean)) nextCustomDirect.Add(clean);
+                            }
+                            _customDirectList = nextCustomDirect;
+                        }
+
+                        if (req.ContainsKey("temporary_proxy_domains"))
+                        {
+                            _temporaryProxyDomains.Clear();
+                            int ttlSec = MiniJson.GetInt(req, "temporary_proxy_ttl_sec", 180);
+                            if (ttlSec > 0)
+                            {
+                                DateTime expiresAt = DateTime.UtcNow.AddSeconds(ttlSec);
+                                foreach (string s in MiniJson.GetStrList(req, "temporary_proxy_domains"))
+                                {
+                                    string clean = SanitizeDomainRule(s);
+                                    if (!string.IsNullOrEmpty(clean))
+                                        _temporaryProxyDomains[clean] = expiresAt;
+                                }
                             }
                         }
-                    }
 
-                    foreach (string cp in _customProxyList)
-                    {
-                        newProxy.Add(cp);
-                        newDirect.Remove(cp);
-                    }
-                    foreach (string cd in _customDirectList)
-                    {
-                        newDirect.Add(cd);
-                        newProxy.Remove(cd);
-                    }
+                        if (req.ContainsKey("proxy_all"))
+                            _defaultOutboundIsProxy = MiniJson.GetBool(req, "proxy_all", _defaultOutboundIsProxy);
 
-                    _proxyDomains = newProxy;
-                    _directDomains = newDirect;
+                        if (req.ContainsKey("wsl_bridge"))
+                            _wslBridgeEnabled = MiniJson.GetBool(req, "wsl_bridge", _wslBridgeEnabled);
+
+                        if (req.ContainsKey("instant_wake"))
+                            InstantWakeEnabled = MiniJson.GetBool(req, "instant_wake", InstantWakeEnabled);
+
+                        RebuildEffectiveRulesLocked();
+                        proxyCount = _proxyDomains.Count;
+                        directCount = _directDomains.Count;
+                        activeTempCount = _temporaryProxyDomains.Count;
+                    }
                 }
+                SyncCSharpWslBridgeState();
             }
             catch { }
 
@@ -5854,8 +6732,12 @@ namespace PixelTunnel
             {
                 { "ok", true },
                 { "pac_rev", _pacRevision },
-                { "proxy_domains", _proxyDomains.Count },
-                { "direct_domains", _directDomains.Count }
+                { "proxy_domains", proxyCount },
+                { "direct_domains", directCount },
+                { "temporary_proxy_domains", activeTempCount },
+                { "instant_wake", InstantWakeEnabled },
+                { "wsl_bridge", _wslBridgeEnabled },
+                { "wsl_bridge_ip", ActiveWslBridgeIp ?? "" }
             });
         }
 
@@ -6262,6 +7144,14 @@ namespace PixelTunnel
 
         public static async Task<int> ReloadRulesV4Async(string optionalBodyJson)
         {
+            if (!string.IsNullOrEmpty(optionalBodyJson))
+            {
+                var reqObj = MiniJson.Deserialize(optionalBodyJson) as Dictionary<string, object>;
+                if (reqObj != null && reqObj.ContainsKey("wsl_bridge"))
+                {
+                    _wslBridgeEnabled = MiniJson.GetBool(reqObj, "wsl_bridge", _wslBridgeEnabled);
+                }
+            }
             string resJson;
             if (UsingGoEngine)
             {
@@ -6272,8 +7162,19 @@ namespace PixelTunnel
                 resJson = ApplyCSharpReloadRules(optionalBodyJson);
             }
             var obj = MiniJson.Deserialize(resJson) as Dictionary<string, object>;
-            int pr = obj != null ? MiniJson.GetInt(obj, "pac_rev", 0) : 0;
-            if (pr > 0) _pacRevision = pr;
+            if (obj != null)
+            {
+                int pr = MiniJson.GetInt(obj, "pac_rev", 0);
+                if (pr > 0) _pacRevision = pr;
+                if (obj.ContainsKey("wsl_bridge_ip"))
+                {
+                    ActiveWslBridgeIp = MiniJson.GetStr(obj, "wsl_bridge_ip") ?? "";
+                }
+                if (obj.ContainsKey("wsl_bridge"))
+                {
+                    _wslBridgeEnabled = MiniJson.GetBool(obj, "wsl_bridge", _wslBridgeEnabled);
+                }
+            }
             return _pacRevision;
         }
 
@@ -6481,14 +7382,93 @@ namespace PixelTunnel
         private static StreamWriter _goStdin;
         private static Win32JobObject _job;
 
+        private static bool IsRunningAsAdministrator()
+        {
+            try
+            {
+                using (WindowsIdentity identity = WindowsIdentity.GetCurrent())
+                {
+                    if (identity == null) return false;
+                    WindowsPrincipal principal = new WindowsPrincipal(identity);
+                    return principal.IsInRole(WindowsBuiltInRole.Administrator);
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool IsDirectoryWritable(string dir)
+        {
+            if (string.IsNullOrEmpty(dir)) return false;
+            try
+            {
+                Directory.CreateDirectory(dir);
+                string probe = Path.Combine(
+                    dir,
+                    ".write_probe_" + Process.GetCurrentProcess().Id.ToString(CultureInfo.InvariantCulture) + "_" + Guid.NewGuid().ToString("N"));
+                using (var fs = new FileStream(probe, FileMode.CreateNew, FileAccess.Write, FileShare.None, 64, FileOptions.DeleteOnClose))
+                {
+                    fs.WriteByte(0x50);
+                }
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static string ResolveEngineCacheDir()
+        {
+            if (IsRunningAsAdministrator())
+            {
+                string progData = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
+                if (!string.IsNullOrEmpty(progData))
+                {
+                    string adminDir = Path.Combine(progData, "PixelTunnel", "engine");
+                    if (IsDirectoryWritable(adminDir))
+                        return adminDir;
+                }
+            }
+            return Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "PixelTunnel",
+                "engine");
+        }
+
         public static string EngineCacheDir
         {
-            get
+            get { return ResolveEngineCacheDir(); }
+        }
+
+        public static bool IsAlive()
+        {
+            lock (_hostLock)
             {
-                return Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                    "PixelTunnel",
-                    "engine");
+                try
+                {
+                    return _goProc != null && !_goProc.HasExited;
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+        }
+
+        public static int GetLastExitCode()
+        {
+            lock (_hostLock)
+            {
+                try
+                {
+                    if (_goProc != null && _goProc.HasExited)
+                        return _goProc.ExitCode;
+                }
+                catch { }
+                return -1;
             }
         }
 
@@ -6505,7 +7485,8 @@ namespace PixelTunnel
 
         private static bool EnsureVerifiedGoBinary(out string exePath, out string failReason)
         {
-            exePath = Path.Combine(EngineCacheDir, "pixelcore-utls-" + EmbeddedEngineMeta.EngineVersion + ".exe");
+            string targetDir = ResolveEngineCacheDir();
+            exePath = Path.Combine(targetDir, "pixelcore-utls-" + EmbeddedEngineMeta.EngineVersion + ".exe");
             failReason = "";
 
             string expected = (EmbeddedEngineMeta.ExpectedSha256 ?? "").Trim().ToLowerInvariant();
@@ -6518,7 +7499,7 @@ namespace PixelTunnel
 
             try
             {
-                Directory.CreateDirectory(EngineCacheDir);
+                Directory.CreateDirectory(targetDir);
                 if (File.Exists(exePath) && !string.IsNullOrEmpty(expected))
                 {
                     using (var fs = File.OpenRead(exePath))

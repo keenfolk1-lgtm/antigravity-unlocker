@@ -309,6 +309,7 @@ func (c *TUNController) Start() error {
 
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	c.processor = NewTUNPacketProcessor(c.opts, net.ParseIP(TUNAdapterIPStr), relayPort, c.writeWintunPacket)
+	c.processor.SetRelayHandlesTCPRadar(true)
 	// Active must be true when PhysicalDialControl is called for direct sockets.
 	c.active.Store(true)
 	c.processor.SetDirectDialControl(c.PhysicalDialControl())
@@ -534,7 +535,7 @@ func (c *TUNController) handleRelayTCPConn(clientConn net.Conn) {
 		return
 	}
 
-	host, port, isFakeIP, found := c.processor.NAT.LookupOriginalTarget(tcpAddr.Port)
+	host, port, isFakeIP, found := c.processor.NAT.LookupOriginalTargetForAddr(tcpAddr.IP, tcpAddr.Port)
 	if !found || host == "" || port <= 0 || port > 65535 {
 		return
 	}
@@ -567,18 +568,52 @@ func (c *TUNController) handleRelayTCPConn(clientConn net.Conn) {
 	dialCtx, cancel := context.WithTimeout(c.ctx, 15*time.Second)
 	defer cancel()
 
+	pid, proc := LookupProcessForConnection(clientConn.RemoteAddr(), 0, 0)
+	t0 := time.Now()
 	var upstream net.Conn
+	var nodeUsed string
 	var err error
 	if strings.EqualFold(decision.Action, "PROXY") && c.opts.Mux != nil {
-		upstream, _, err = c.opts.Mux.OpenStream(dialCtx, decision.Role, host, port)
+		upstream, nodeUsed, err = c.opts.Mux.OpenStream(dialCtx, decision.Role, host, port)
 	} else {
+		nodeUsed = "DIRECT"
 		dialHost := host
 		if isFakeIP {
 			if c.opts.Resolver == nil {
+				if c.opts.Radar != nil {
+					c.opts.Radar.Record(RouteRadarEntry{
+						PID:     pid,
+						Process: proc,
+						Domain:  host,
+						Port:    port,
+						Proto:   "TUN-TCP",
+						Action:  strings.ToUpper(decision.Action),
+						Rule:    decision.Rule,
+						Node:    nodeUsed,
+						Role:    decision.Role,
+						PingMs:  time.Since(t0).Milliseconds(),
+						Error:   "doh resolver unavailable",
+					})
+				}
 				return
 			}
 			ips, rErr := c.opts.Resolver.LookupHost(dialCtx, host)
 			if rErr != nil {
+				if c.opts.Radar != nil {
+					c.opts.Radar.Record(RouteRadarEntry{
+						PID:     pid,
+						Process: proc,
+						Domain:  host,
+						Port:    port,
+						Proto:   "TUN-TCP",
+						Action:  strings.ToUpper(decision.Action),
+						Rule:    decision.Rule,
+						Node:    nodeUsed,
+						Role:    decision.Role,
+						PingMs:  time.Since(t0).Milliseconds(),
+						Error:   rErr.Error(),
+					})
+				}
 				return
 			}
 			var chosen net.IP
@@ -589,6 +624,21 @@ func (c *TUNController) handleRelayTCPConn(clientConn net.Conn) {
 				}
 			}
 			if chosen == nil {
+				if c.opts.Radar != nil {
+					c.opts.Radar.Record(RouteRadarEntry{
+						PID:     pid,
+						Process: proc,
+						Domain:  host,
+						Port:    port,
+						Proto:   "TUN-TCP",
+						Action:  strings.ToUpper(decision.Action),
+						Rule:    decision.Rule,
+						Node:    nodeUsed,
+						Role:    decision.Role,
+						PingMs:  time.Since(t0).Milliseconds(),
+						Error:   "no IPv4 address resolved for FakeIP DIRECT target",
+					})
+				}
 				return
 			}
 			dialHost = chosen.String()
@@ -600,28 +650,124 @@ func (c *TUNController) handleRelayTCPConn(clientConn net.Conn) {
 		}
 		upstream, err = d.DialContext(dialCtx, "tcp4", net.JoinHostPort(dialHost, strconv.Itoa(port)))
 	}
+	latMs := time.Since(t0).Milliseconds()
+	if latMs <= 0 && strings.EqualFold(decision.Action, "PROXY") && c.opts.Mux != nil {
+		if snap := c.opts.Mux.Snapshot(); snap.PingMs > 0 {
+			latMs = snap.PingMs
+		}
+	}
+	var radarSeq uint64
+	if c.opts.Radar != nil {
+		errStr := ""
+		if err != nil {
+			errStr = err.Error()
+		}
+		action := strings.ToUpper(strings.TrimSpace(decision.Action))
+		if action == "" {
+			action = "DIRECT"
+		}
+		radarSeq = c.opts.Radar.Record(RouteRadarEntry{
+			PID:     pid,
+			Process: proc,
+			Domain:  host,
+			Port:    port,
+			Proto:   "TUN-TCP",
+			Action:  action,
+			Rule:    decision.Rule,
+			Node:    nodeUsed,
+			Role:    decision.Role,
+			PingMs:  latMs,
+			Error:   errStr,
+		})
+	}
 	if err != nil || upstream == nil {
 		return
 	}
 	defer upstream.Close()
 
+	var upBytes, downBytes atomic.Int64
 	var copyWg sync.WaitGroup
 	copyWg.Add(2)
 	go func() {
 		defer copyWg.Done()
-		_, _ = io.Copy(upstream, clientConn)
+		n, _ := io.Copy(upstream, clientConn)
+		upBytes.Store(n)
 		if cw, ok := upstream.(interface{ CloseWrite() error }); ok {
 			_ = cw.CloseWrite()
 		}
 	}()
 	go func() {
 		defer copyWg.Done()
-		_, _ = io.Copy(clientConn, upstream)
+		n, _ := io.Copy(clientConn, upstream)
+		downBytes.Store(n)
 		if cw, ok := clientConn.(interface{ CloseWrite() error }); ok {
 			_ = cw.CloseWrite()
 		}
 	}()
 	copyWg.Wait()
+	if c.opts.Radar != nil && radarSeq != 0 {
+		c.opts.Radar.UpdateTraffic(radarSeq, upBytes.Load(), downBytes.Load(), "")
+	}
+}
+
+func resolveWintunBinDir() (string, error) {
+	if isWindowsElevated() {
+		progData := strings.TrimSpace(os.Getenv("ProgramData"))
+		if progData == "" {
+			progData = strings.TrimSpace(os.Getenv("ALLUSERSPROFILE"))
+		}
+		if progData == "" {
+			progData = `C:\ProgramData`
+		}
+		rootDir := filepath.Join(progData, "PixelTunnel")
+		adminBinDir := filepath.Join(rootDir, "bin")
+		if err := os.MkdirAll(adminBinDir, 0755); err == nil {
+			hardenAdminDirACL(rootDir)
+			hardenAdminDirACL(adminBinDir)
+			// Probe writability before committing
+			probe := filepath.Join(adminBinDir, ".write_probe")
+			if wErr := os.WriteFile(probe, []byte("1"), 0600); wErr == nil {
+				_ = os.Remove(probe)
+				return adminBinDir, nil
+			}
+		}
+	}
+
+	baseDir := strings.TrimSpace(os.Getenv("LOCALAPPDATA"))
+	if baseDir == "" {
+		if uc, uErr := os.UserCacheDir(); uErr == nil && uc != "" {
+			baseDir = uc
+		} else {
+			home, _ := os.UserHomeDir()
+			baseDir = filepath.Join(home, "AppData", "Local")
+		}
+	}
+	binDir := filepath.Join(baseDir, "PixelTunnel", "bin")
+	if err := os.MkdirAll(binDir, 0700); err != nil {
+		return "", fmt.Errorf("create wintun bin dir: %w", err)
+	}
+	return binDir, nil
+}
+
+func hardenAdminDirACL(dirPath string) {
+	// SYSTEM: Full, Administrators: Full, Authenticated Users: Read+Execute (protected DACL, no inherited user write)
+	sd, err := windows.SecurityDescriptorFromString("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;AU)")
+	if err != nil || sd == nil {
+		return
+	}
+	dacl, _, err := sd.DACL()
+	if err != nil || dacl == nil {
+		return
+	}
+	_ = windows.SetNamedSecurityInfo(
+		dirPath,
+		windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+		nil,
+		nil,
+		dacl,
+		nil,
+	)
 }
 
 func extractEmbeddedWintunDLL() (string, error) {
@@ -638,18 +784,9 @@ func extractEmbeddedWintunDLL() (string, error) {
 		return "", fmt.Errorf("invalid decompressed wintun.dll (len=%d): %w", len(dllBytes), err)
 	}
 
-	baseDir := strings.TrimSpace(os.Getenv("LOCALAPPDATA"))
-	if baseDir == "" {
-		if uc, uErr := os.UserCacheDir(); uErr == nil && uc != "" {
-			baseDir = uc
-		} else {
-			home, _ := os.UserHomeDir()
-			baseDir = filepath.Join(home, "AppData", "Local")
-		}
-	}
-	binDir := filepath.Join(baseDir, "PixelTunnel", "bin")
-	if err := os.MkdirAll(binDir, 0700); err != nil {
-		return "", fmt.Errorf("create wintun bin dir: %w", err)
+	binDir, err := resolveWintunBinDir()
+	if err != nil {
+		return "", err
 	}
 	dstPath := filepath.Join(binDir, "wintun.dll")
 

@@ -1,8 +1,12 @@
-# PixelTunnel v2.1.4 — Open-Source AI & IDE Unlocker (Antigravity, Cursor, Claude Code, Windsurf)
+<p align="center">
+  <img src="docs/avatar.png" alt="PixelTunnel" width="68" />
+</p>
+
+# PixelTunnel v2.2.0 — Open-Source AI & IDE Unlocker (Antigravity, Cursor, Claude Code, Windsurf)
 
 [![Release](https://img.shields.io/github/v/release/keenfolk1-lgtm/antigravity-unlocker?label=release&color=2ea44f)](https://github.com/keenfolk1-lgtm/antigravity-unlocker/releases/latest)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)](https://github.com/keenfolk1-lgtm/antigravity-unlocker/releases/latest)
-[![Microsoft WDSI](https://img.shields.io/badge/Microsoft%20Defender-WDSI%20Verified%20Clean-2ea44f)](https://github.com/keenfolk1-lgtm/antigravity-unlocker/releases/tag/v2.1.4)
+[![Microsoft WDSI](https://img.shields.io/badge/Microsoft%20Defender-WDSI%20Verified%20Clean%20(v2.1.3)-2ea44f)](https://github.com/keenfolk1-lgtm/antigravity-unlocker/releases/tag/v2.1.3)
 [![Website](https://img.shields.io/badge/site-pixelstore.space-111827)](https://pixelstore.space/)
 [![Telegram Channel](https://img.shields.io/badge/Channel-@pixel__antigravity__fix-26A5E4)](https://t.me/pixel_antigravity_fix)
 [![Telegram Bot](https://img.shields.io/badge/VPN%20Bot-@p1xivpn__bot-26A5E4)](https://t.me/p1xivpn_bot)
@@ -14,15 +18,28 @@
 - 📢 **Telegram-канал по обходу (обновления, гайды и помощь)**: [t.me/pixel_antigravity_fix](https://t.me/pixel_antigravity_fix)
 - 🌐 **Официальный сайт / Подписки**: [pixelstore.space](https://pixelstore.space/)
 - 🤖 **Telegram-бот (PRO-ключи, YouTube, Discord, iOS/Android)**: [@p1xivpn_bot](https://t.me/p1xivpn_bot)
-- 📦 **Скачать готовый билд**: [GitHub Releases (v2.1.4)](https://github.com/keenfolk1-lgtm/antigravity-unlocker/releases/latest)
+- 📦 **Скачать готовый билд**: [GitHub Releases (v2.2.0)](https://github.com/keenfolk1-lgtm/antigravity-unlocker/releases/latest)
 
 <p align="center">
-  <img src="docs/ui.png" alt="PixelTunnel v2.1.4 UI" width="380" />
+  <img src="docs/ui.png" alt="PixelTunnel v2.2.0 UI — Obsidian Precision + PRISM ASCII" width="760" />
   <br />
-  <sub>Интерфейс PixelTunnel v2.1.4 (Windows WPF + встроенное Go uTLS ядро)</sub>
+  <sub>Интерфейс PixelTunnel v2.2.0 (Obsidian Precision · PRISM ASCII · Windows WPF + встроенное Go uTLS ядро)</sub>
 </p>
 
+<table>
+  <tr>
+    <td align="center" width="33%"><img src="docs/ui-light.png" alt="Светлая тема v2.2.0" /><br /><sub>Адаптивная светлая тема</sub></td>
+    <td align="center" width="33%"><img src="docs/ui-vpn.png" alt="Выбор VPN — ASCII-таблетки" /><br /><sub>Наш VPN · 3D ASCII-капсулы</sub></td>
+    <td align="center" width="33%"><img src="docs/ui-diag.png" alt="Умная диагностика — ASCII-сканер" /><br /><sub>Диагностика · 5-узловой ASCII-сканер</sub></td>
+  </tr>
+</table>
+
 ![Схема маршрутизации PixelTunnel](docs/architecture.png)
+
+## Что нового в v2.2.0
+- **Новый интерфейс Obsidian Precision v2.2 + PRISM ASCII**: двухколоночное окно без пустых зазоров, живая переливающаяся ASCII-эмблема Google Antigravity, адаптивная светлая/тёмная тема (`#FAFBFD` / `#08090D`), 3D ASCII-капсулы выбора VPN в «Наш VPN» и живой 5-узловой ASCII-сканер (`uTLS · PWP4 · PAC · IDE · AI`) в «Умной диагностике».
+- **Улучшения Smart PAC и правил маршрутизации (Go-ядро)**: мгновенная санитизация и корректный откат при удалении пользовательских доменов, поддержка временных прокси-правил с авто-истечением по TTL без записи на диск и единый список системных прямых исключений.
+- **Стабильность TUN/UDP, NAT и Instant Wake**: 2-секундная дедупликация пробуждения `Instant Wake`, неблокирующая очередь приёма UDP в TUN, строгая изоляция NAT по паре `(srcIP, srcPort)` и коалесинг UDP-событий в RouteRadar.
 
 ## Что нового в v2.1.4
 - **Полная поддержка Google AI Studio и Gemini в браузере**: добавлены домены `ai.studio`, `usercontent.goog`, `cloud.google`, `run.app`, `web.app`, `firebaseapp.com`, `appspot.com`, `withgoogle.com`, `google.dev`, `alkalimakersuiteapplets.pa.clients6.google.com`, `webchannel-alkalimakersuite-pa.clients6.google.com`, а также все поддомены Google AI Studio / Build & Preview.
@@ -97,6 +114,6 @@ CGO_ENABLED=0 go build -buildvcs=false -trimpath -ldflags="-s -w" -o pixeltunnel
 ```
 
 ## Безопасность и проверка
-- Весь исходный код открыт: Windows UI/хост в `src/` (`PixelTunnelNext.cs`, `PixelCoreEngineV3.cs`) и кроссплатформенный Go uTLS движок в `src/go-engine/`.
+- Весь исходный код открыт: Windows UI/хост в `src/` (`PixelTunnelNext.cs`, `PixelCoreEngineV3.cs`, `PixelTunnelAsciiRenderer.cs`) и кроссплатформенный Go uTLS движок в `src/go-engine/`.
 - Конфигурация узлов (`nodes_v3.enc`) и обновления проверяются по цифровой подписи **ECDSA P-256** и хэшу **SHA-256** с персистентной защитой от отката версии.
 - Установщик `install.sh` проверяет контрольные суммы по `SHA256SUMS.txt`, а все бинарники и `go test ./...` / `--genconfig` проверяются автоматически через [GitHub Actions](.github/workflows/build.yml).

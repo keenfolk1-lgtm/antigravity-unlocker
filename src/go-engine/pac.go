@@ -4,20 +4,23 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 )
 
-// GenerateSmartPACJS generates a zero-DNS Smart PAC script with ZERO dnsResolve() calls.
-// Matching rules:
-//   - .ru, .рф (.xn--p1ai), .su, .by, RU ecosystem domains, localhost, private CIDRs, direct list -> DIRECT
-//   - enabled proxy categories & custom proxy list (or proxy_all) -> PROXY <host>:<http>; SOCKS5 <host>:<socks>
+// GenerateSmartPACJS generates a zero-DNS Smart PAC script with ZERO dnsResolve() calls
+// implementing the unified 4-tier precedence:
+// Tier 0 self-bypass -> Tier 1 custom/temporary proxy -> Tier 2 custom direct ->
+// Tier 3 BUILTIN_DIRECT -> Tier 4 enabled categories / proxy_all -> DIRECT.
 func GenerateSmartPACJS(cfg *EngineConfig, proxyHost string) string {
 	if proxyHost == "" {
 		proxyHost = "127.0.0.1"
 	}
 	httpPort := DefaultHTTPPort
 	socksPort := DefaultSOCKSPort
-	var directList, proxyList []string
 	var proxyAll bool
+
+	bypassInputs := []string{"localhost", "localhost.localdomain", "pixelstore.space", DefaultHost}
+	var customProxyList, customDirectList, staticDirectList, categoryAndStaticProxy []string
 
 	if cfg != nil {
 		if cfg.HTTPPort > 0 {
@@ -26,36 +29,83 @@ func GenerateSmartPACJS(cfg *EngineConfig, proxyHost string) string {
 		if cfg.SOCKSPort > 0 {
 			socksPort = cfg.SOCKSPort
 		}
-		directList = cfg.DirectDomains
-		proxyList = cfg.ProxyDomains
 		proxyAll = cfg.ProxyAll
+
+		if cfg.ActiveNode.Host != "" {
+			bypassInputs = append(bypassInputs, cfg.ActiveNode.Host)
+		}
+		if cfg.ActiveNode.SNI != "" {
+			bypassInputs = append(bypassInputs, cfg.ActiveNode.SNI)
+		}
+		for _, n := range cfg.Nodes {
+			if n.Host != "" {
+				bypassInputs = append(bypassInputs, n.Host)
+			}
+			if n.SNI != "" {
+				bypassInputs = append(bypassInputs, n.SNI)
+			}
+		}
+
+		customProxyList = mergeUniquePACDomains(cfg.CustomProxy, cfg.ActiveTemporaryProxy(time.Now()))
+		customDirectList = mergeUniquePACDomains(cfg.CustomDirect)
+		staticDirectList = cfg.ConfigStaticDirect
+
+		for cat, enabled := range cfg.Categories {
+			if !enabled {
+				continue
+			}
+			categoryAndStaticProxy = append(categoryAndStaticProxy, CategoryDomains[strings.ToLower(cat)]...)
+		}
+		categoryAndStaticProxy = append(categoryAndStaticProxy, cfg.ConfigStaticProxy...)
 	}
 
-	mergedDirect := mergeUniquePACDomains(directList, RUEcosystemDomains)
-	if proxyList == nil {
-		proxyList = []string{}
+	bypassRules := mergeUniquePACDomains(bypassInputs)
+	if customProxyList == nil {
+		customProxyList = []string{}
 	}
+	if customDirectList == nil {
+		customDirectList = []string{}
+	}
+	mergedDirect := mergeUniquePACDomains(BuiltinDirectDomains, RUEcosystemDomains, staticDirectList)
+	proxyList := mergeUniquePACDomains(categoryAndStaticProxy)
 
 	routeTgDC := false
 	if cfg != nil && (cfg.Categories["social"] || cfg.Categories["telegram"] || cfg.Categories["media"]) {
 		routeTgDC = true
 	}
 	if !routeTgDC {
+		for _, p := range customProxyList {
+			if p == "telegram.org" {
+				routeTgDC = true
+				break
+			}
+		}
+	}
+	if !routeTgDC {
 		for _, p := range proxyList {
-			if normalizeDomainPattern(p) == "telegram.org" {
+			if p == "telegram.org" {
 				routeTgDC = true
 				break
 			}
 		}
 	}
 
+	bypassJSON, _ := json.Marshal(bypassRules)
+	customProxyJSON, _ := json.Marshal(customProxyList)
+	customDirectJSON, _ := json.Marshal(customDirectList)
 	directJSON, _ := json.Marshal(mergedDirect)
 	proxyJSON, _ := json.Marshal(proxyList)
 	proxyReturn := fmt.Sprintf("PROXY %s:%d; SOCKS5 %s:%d", proxyHost, httpPort, proxyHost, socksPort)
 
 	var b strings.Builder
-	b.WriteString("// PixelTunnel Smart PAC v2.1 (Zero local DNS queries)\n")
-	b.WriteString("var DIRECT_RULES = ")
+	b.WriteString("// PixelTunnel Smart PAC v2.2 (Zero local DNS queries)\n")
+	b.WriteString("var BYPASS_RULES = ")
+	b.Write(bypassJSON)
+	b.WriteString(";\nvar CUSTOM_PROXY_RULES = ")
+	b.Write(customProxyJSON)
+	b.WriteString(";\nvar CUSTOM_DIRECT_RULES = ")
+	b.Write(customDirectJSON)
+	b.WriteString(";\nvar DIRECT_RULES = ")
 	b.Write(directJSON)
 	b.WriteString(";\nvar PROXY_RULES = ")
 	b.Write(proxyJSON)
@@ -91,10 +141,15 @@ function _matchRule(h, rule) {
 function _isPrivateIPLiteral(h) {
   if (h === 'localhost' || h === '::1' || h === '[::1]' || h === '0.0.0.0') return true;
   if (/^127\./.test(h) || /^10\./.test(h) || /^192\.168\./.test(h) || /^169\.254\./.test(h)) return true;
-  var m = /^172\.(\d+)\./.exec(h);
-  if (m) {
-    var sec = parseInt(m[1], 10);
+  var m172 = /^172\.(\d+)\./.exec(h);
+  if (m172) {
+    var sec = parseInt(m172[1], 10);
     if (sec >= 16 && sec <= 31) return true;
+  }
+  var m100 = /^100\.(\d+)\./.exec(h);
+  if (m100) {
+    var sec100 = parseInt(m100[1], 10);
+    if (sec100 >= 64 && sec100 <= 127) return true;
   }
   if (/^(fc|fd|fe80)/i.test(h.replace(/^\[|\]$/g, ''))) return true;
   return false;
@@ -117,12 +172,26 @@ function FindProxyForURL(url, host) {
   if (!h || isPlainHostName(h) || _isPrivateIPLiteral(h)) {
     return 'DIRECT';
   }
+  // Tier 0: Non-overridable self-bypass
+  for (var b = 0; b < BYPASS_RULES.length; b++) {
+    if (_matchRule(h, BYPASS_RULES[b])) return 'DIRECT';
+  }
+  // Tier 1: Custom & active temporary proxy overrides (beats .ru and built-in direct)
+  for (var cp = 0; cp < CUSTOM_PROXY_RULES.length; cp++) {
+    if (_matchRule(h, CUSTOM_PROXY_RULES[cp])) return PROXY_CHAIN;
+  }
+  // Tier 2: Custom direct rules (beats enabled categories)
+  for (var cd = 0; cd < CUSTOM_DIRECT_RULES.length; cd++) {
+    if (_matchRule(h, CUSTOM_DIRECT_RULES[cd])) return 'DIRECT';
+  }
+  // Tier 3: Built-in direct (.ru/.su/.by/.xn--p1ai + RU ecosystem + direct defaults)
   if (_endsWith(h, '.ru') || _endsWith(h, '.рф') || _endsWith(h, '.xn--p1ai') || _endsWith(h, '.su') || _endsWith(h, '.by')) {
     return 'DIRECT';
   }
   for (var i = 0; i < DIRECT_RULES.length; i++) {
     if (_matchRule(h, DIRECT_RULES[i])) return 'DIRECT';
   }
+  // Tier 4: Enabled categories + Telegram DC + proxy_all
   if (ROUTE_TG_DC && _isTelegramDCIP(h)) {
     return PROXY_CHAIN;
   }

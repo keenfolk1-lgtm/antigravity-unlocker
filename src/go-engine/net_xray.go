@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"container/list"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -41,14 +42,33 @@ type RouteRadarEntry struct {
 	Error     string `json:"error,omitempty"`
 }
 
+type radarUDPKey struct {
+	Proto  string
+	Domain string
+	Action string
+}
+
+type radarNode struct {
+	entry     RouteRadarEntry
+	udpKey    radarUDPKey
+	isTUNUDP  bool
+	aliasSeqs []uint64
+	orderElem *list.Element
+	udpElem   *list.Element
+}
+
 // RouteRadar is a fixed-capacity lock-safe ring buffer of live routing events.
+// TUN-UDP entries are coalesced by (Proto, Domain, Action) with O(1) lookup and
+// capped at 30% of capacity so STUN/ICE bursts never evict TCP/AI routes.
 type RouteRadar struct {
-	mu      sync.RWMutex
-	capSize int
-	ring    []RouteRadarEntry
-	head    int
-	count   int
-	seq     atomic.Uint64
+	mu          sync.RWMutex
+	capSize     int
+	udpMaxSlots int
+	order       *list.List
+	udpOrder    *list.List
+	udpIndex    map[radarUDPKey]*radarNode
+	seqIndex    map[uint64]*radarNode
+	seq         atomic.Uint64
 }
 
 // NewRouteRadar constructs a RouteRadar ring buffer (default capacity 100).
@@ -56,13 +76,45 @@ func NewRouteRadar(capacity int) *RouteRadar {
 	if capacity <= 0 {
 		capacity = 100
 	}
+	udpMax := (capacity * 30) / 100
+	if udpMax < 1 {
+		udpMax = 1
+	}
 	return &RouteRadar{
-		capSize: capacity,
-		ring:    make([]RouteRadarEntry, capacity),
+		capSize:     capacity,
+		udpMaxSlots: udpMax,
+		order:       list.New(),
+		udpOrder:    list.New(),
+		udpIndex:    make(map[radarUDPKey]*radarNode),
+		seqIndex:    make(map[uint64]*radarNode),
 	}
 }
 
-// Record appends an entry into the ring buffer, overwriting the oldest when full.
+func (r *RouteRadar) evictNodeLocked(n *radarNode) {
+	if n == nil {
+		return
+	}
+	if n.orderElem != nil {
+		r.order.Remove(n.orderElem)
+		n.orderElem = nil
+	}
+	if n.udpElem != nil {
+		r.udpOrder.Remove(n.udpElem)
+		n.udpElem = nil
+	}
+	if n.isTUNUDP {
+		if cur, ok := r.udpIndex[n.udpKey]; ok && cur == n {
+			delete(r.udpIndex, n.udpKey)
+		}
+	}
+	delete(r.seqIndex, n.entry.Seq)
+	for _, s := range n.aliasSeqs {
+		delete(r.seqIndex, s)
+	}
+	n.aliasSeqs = nil
+}
+
+// Record appends (or coalesces for TUN-UDP) an entry into the bounded radar buffer.
 func (r *RouteRadar) Record(ent RouteRadarEntry) uint64 {
 	seq := r.seq.Add(1)
 	now := time.Now()
@@ -75,30 +127,87 @@ func (r *RouteRadar) Record(ent RouteRadarEntry) uint64 {
 	ent.Seq = seq
 
 	r.mu.Lock()
-	r.ring[r.head] = ent
-	r.head = (r.head + 1) % r.capSize
-	if r.count < r.capSize {
-		r.count++
+	defer r.mu.Unlock()
+
+	if ent.Proto == "TUN-UDP" {
+		key := radarUDPKey{Proto: ent.Proto, Domain: ent.Domain, Action: ent.Action}
+		if existing, ok := r.udpIndex[key]; ok {
+			prevSeq := existing.entry.Seq
+			ent.BytesUp += existing.entry.BytesUp
+			ent.BytesDown += existing.entry.BytesDown
+			if ent.PID == 0 && existing.entry.PID != 0 {
+				ent.PID = existing.entry.PID
+				ent.Process = existing.entry.Process
+			}
+			if prevSeq != 0 {
+				if len(existing.aliasSeqs) >= 32 {
+					dropped := existing.aliasSeqs[0]
+					copy(existing.aliasSeqs, existing.aliasSeqs[1:])
+					existing.aliasSeqs[len(existing.aliasSeqs)-1] = prevSeq
+					delete(r.seqIndex, dropped)
+				} else {
+					existing.aliasSeqs = append(existing.aliasSeqs, prevSeq)
+				}
+			}
+			existing.entry = ent
+			r.seqIndex[seq] = existing
+			r.order.MoveToFront(existing.orderElem)
+			r.udpOrder.MoveToFront(existing.udpElem)
+			return seq
+		}
+
+		for len(r.udpIndex) >= r.udpMaxSlots && r.udpOrder.Len() > 0 {
+			back := r.udpOrder.Back()
+			if back == nil {
+				break
+			}
+			r.evictNodeLocked(back.Value.(*radarNode))
+		}
+		for r.order.Len() >= r.capSize {
+			back := r.order.Back()
+			if back == nil {
+				break
+			}
+			r.evictNodeLocked(back.Value.(*radarNode))
+		}
+
+		node := &radarNode{
+			entry:    ent,
+			udpKey:   key,
+			isTUNUDP: true,
+		}
+		node.orderElem = r.order.PushFront(node)
+		node.udpElem = r.udpOrder.PushFront(node)
+		r.udpIndex[key] = node
+		r.seqIndex[seq] = node
+		return seq
 	}
-	r.mu.Unlock()
+
+	for r.order.Len() >= r.capSize {
+		back := r.order.Back()
+		if back == nil {
+			break
+		}
+		r.evictNodeLocked(back.Value.(*radarNode))
+	}
+
+	node := &radarNode{entry: ent}
+	node.orderElem = r.order.PushFront(node)
+	r.seqIndex[seq] = node
 	return seq
 }
 
-// UpdateTraffic adds bytes transferred to an existing entry matching seq if still present.
+// UpdateTraffic adds bytes transferred to an existing entry matching seq in O(1) if still present.
 func (r *RouteRadar) UpdateTraffic(seq uint64, bytesUp, bytesDown int64, errStr string) {
 	if seq == 0 {
 		return
 	}
 	r.mu.Lock()
-	for i := 0; i < r.count; i++ {
-		idx := (r.head - 1 - i + r.capSize) % r.capSize
-		if r.ring[idx].Seq == seq {
-			r.ring[idx].BytesUp += bytesUp
-			r.ring[idx].BytesDown += bytesDown
-			if errStr != "" {
-				r.ring[idx].Error = errStr
-			}
-			break
+	if node, ok := r.seqIndex[seq]; ok && node != nil {
+		node.entry.BytesUp += bytesUp
+		node.entry.BytesDown += bytesDown
+		if errStr != "" {
+			node.entry.Error = errStr
 		}
 	}
 	r.mu.Unlock()
@@ -108,13 +217,13 @@ func (r *RouteRadar) UpdateTraffic(seq uint64, bytesUp, bytesDown int64, errStr 
 func (r *RouteRadar) List(limit int) []RouteRadarEntry {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if limit <= 0 || limit > r.count {
-		limit = r.count
+	n := r.order.Len()
+	if limit <= 0 || limit > n {
+		limit = n
 	}
 	out := make([]RouteRadarEntry, 0, limit)
-	for i := 0; i < limit; i++ {
-		idx := (r.head - 1 - i + r.capSize) % r.capSize
-		out = append(out, r.ring[idx])
+	for el := r.order.Front(); el != nil && len(out) < limit; el = el.Next() {
+		out = append(out, el.Value.(*radarNode).entry)
 	}
 	return out
 }

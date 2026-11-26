@@ -21,7 +21,9 @@ const (
 	DefaultFakeIPPoolSize    = 16384
 	DefaultTUNNATMaxEntries  = 8192
 	DefaultTUNUDPIdleTimeout = 60 * time.Second
-	MaxTUNUDPFlows           = 56
+	MaxTUNUDPFlows           = 512
+	MaxTUNUDPQueue           = 48
+	MaxTUNUDPFlowTargets     = 64
 
 	fakeIPRangeStart uint32 = (198 << 24) | (18 << 16) | (0 << 8) | 10
 	fakeIPRangeEnd   uint32 = (198 << 24) | (19 << 16) | (255 << 8) | 250
@@ -37,6 +39,7 @@ type TUNOptions struct {
 	ClassifyFn         func(host string) RuleAction
 	Resolver           *DohResolver
 	Mux                *MuxManager
+	Radar              *RouteRadar
 	IsDirectIPFn       func(ip net.IP) bool
 	BypassNodeIPsFn    func() []net.IP
 	AllowRawVoiceUDPFn func() bool
@@ -352,16 +355,23 @@ type TUNNATEntry struct {
 	elem        *list.Element
 }
 
+type tunNATKey struct {
+	ip   [4]byte
+	port uint16
+}
+
 // TUNNATTable performs bounded-LRU IPv4+TCP NAT translation between application sockets
 // and the local TUN TCP relay listener (e.g. 198.18.0.1:<relayPort>).
 type TUNNATTable struct {
-	mu           sync.Mutex
-	relayIP      [4]byte
-	relayPort    int
-	fakeIPs      *FakeIPPool
-	maxEntries   int
-	byClientPort map[int]*TUNNATEntry
-	lru          *list.List
+	mu          sync.Mutex
+	relayIP     [4]byte
+	relayPort   int
+	fakeIPs     *FakeIPPool
+	maxEntries  int
+	byClient    map[tunNATKey]*TUNNATEntry
+	byRelayPeer map[tunNATKey]*TUNNATEntry
+	byPort      map[int]*TUNNATEntry
+	lru         *list.List
 }
 
 // NewTUNNATTable constructs a thread-safe TCP NAT table.
@@ -370,11 +380,13 @@ func NewTUNNATTable(relayIP net.IP, relayPort int, fakeIPs *FakeIPPool, maxEntri
 		maxEntries = DefaultTUNNATMaxEntries
 	}
 	t := &TUNNATTable{
-		relayPort:    relayPort,
-		fakeIPs:      fakeIPs,
-		maxEntries:   maxEntries,
-		byClientPort: make(map[int]*TUNNATEntry),
-		lru:          list.New(),
+		relayPort:   relayPort,
+		fakeIPs:     fakeIPs,
+		maxEntries:  maxEntries,
+		byClient:    make(map[tunNATKey]*TUNNATEntry),
+		byRelayPeer: make(map[tunNATKey]*TUNNATEntry),
+		byPort:      make(map[int]*TUNNATEntry),
+		lru:         list.New(),
 	}
 	t.SetRelayEndpoint(relayIP, relayPort)
 	return t
@@ -394,7 +406,18 @@ func (t *TUNNATTable) SetRelayEndpoint(relayIP net.IP, relayPort int) {
 func (t *TUNNATTable) Count() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return len(t.byClientPort)
+	return len(t.byClient)
+}
+
+func makeNATKey(ip net.IP, port int) (tunNATKey, bool) {
+	v4 := ip.To4()
+	if v4 == nil || port <= 0 || port > 65535 {
+		return tunNATKey{}, false
+	}
+	var k tunNATKey
+	copy(k.ip[:], v4)
+	k.port = uint16(port)
+	return k, true
 }
 
 // TranslateOutbound translates an outbound IPv4+TCP packet (srcIP -> dstIP:dstPort)
@@ -429,6 +452,12 @@ func (t *TUNNATTable) TranslateOutbound(pkt []byte) ([]byte, bool) {
 		return nil, false
 	}
 
+	clientKey, ok1 := makeNATKey(srcIP, srcPort)
+	peerKey, ok2 := makeNATKey(dstIP, srcPort)
+	if !ok1 || !ok2 {
+		return nil, false
+	}
+
 	t.mu.Lock()
 	relayIP := t.relayIP
 	relayPort := t.relayPort
@@ -444,21 +473,36 @@ func (t *TUNNATTable) TranslateOutbound(pkt []byte) ([]byte, bool) {
 	}
 
 	now := time.Now()
-	if ent, exists := t.byClientPort[srcPort]; exists {
+	if ent, exists := t.byClient[clientKey]; exists {
 		isPureSYN := (flags&tcpFlagSYN) != 0 && (flags&tcpFlagACK) == 0
 		if isPureSYN {
+			if oldPeer, ok := makeNATKey(ent.OrigDstIP, ent.ClientPort); ok {
+				if t.byRelayPeer[oldPeer] == ent {
+					delete(t.byRelayPeer, oldPeer)
+				}
+			}
 			ent.ClientIP = append(net.IP(nil), srcIP.To4()...)
 			ent.OrigDstIP = append(net.IP(nil), dstIP.To4()...)
 			ent.OrigDstPort = dstPort
+			t.byRelayPeer[peerKey] = ent
 		}
 		ent.LastSeen = now
 		t.lru.MoveToFront(ent.elem)
+		t.byPort[srcPort] = ent
 	} else {
-		if len(t.byClientPort) >= t.maxEntries {
+		if len(t.byClient) >= t.maxEntries {
 			if back := t.lru.Back(); back != nil {
 				old := back.Value.(*TUNNATEntry)
 				t.lru.Remove(back)
-				delete(t.byClientPort, old.ClientPort)
+				if oldClient, ok := makeNATKey(old.ClientIP, old.ClientPort); ok {
+					delete(t.byClient, oldClient)
+				}
+				if oldPeer, ok := makeNATKey(old.OrigDstIP, old.ClientPort); ok && t.byRelayPeer[oldPeer] == old {
+					delete(t.byRelayPeer, oldPeer)
+				}
+				if t.byPort[old.ClientPort] == old {
+					delete(t.byPort, old.ClientPort)
+				}
 			}
 		}
 		ent := &TUNNATEntry{
@@ -469,7 +513,9 @@ func (t *TUNNATTable) TranslateOutbound(pkt []byte) ([]byte, bool) {
 			LastSeen:    now,
 		}
 		ent.elem = t.lru.PushFront(ent)
-		t.byClientPort[srcPort] = ent
+		t.byClient[clientKey] = ent
+		t.byRelayPeer[peerKey] = ent
+		t.byPort[srcPort] = ent
 	}
 	t.mu.Unlock()
 
@@ -509,6 +555,7 @@ func (t *TUNNATTable) TranslateInbound(pkt []byte) ([]byte, bool) {
 		return nil, false
 	}
 	srcIP := net.IPv4(pkt[12], pkt[13], pkt[14], pkt[15])
+	dstIP := net.IPv4(pkt[16], pkt[17], pkt[18], pkt[19])
 
 	t.mu.Lock()
 	relayNetIP := net.IPv4(t.relayIP[0], t.relayIP[1], t.relayIP[2], t.relayIP[3])
@@ -516,7 +563,14 @@ func (t *TUNNATTable) TranslateInbound(pkt []byte) ([]byte, bool) {
 		t.mu.Unlock()
 		return nil, false
 	}
-	ent, ok := t.byClientPort[dstPort]
+	var ent *TUNNATEntry
+	var ok bool
+	if peerKey, kOk := makeNATKey(dstIP, dstPort); kOk {
+		ent, ok = t.byRelayPeer[peerKey]
+	}
+	if !ok {
+		ent, ok = t.byPort[dstPort]
+	}
 	if !ok {
 		t.mu.Unlock()
 		return nil, false
@@ -544,18 +598,12 @@ func (t *TUNNATTable) TranslateInbound(pkt []byte) ([]byte, bool) {
 	return out, true
 }
 
-// LookupOriginalTarget resolves the original domain (via FakeIPPool) or IPv4 target and port for clientPort.
-func (t *TUNNATTable) LookupOriginalTarget(clientPort int) (host string, port int, isFakeIP bool, ok bool) {
-	t.mu.Lock()
-	ent, exists := t.byClientPort[clientPort]
-	if !exists {
-		t.mu.Unlock()
+func (t *TUNNATTable) resolveEntryTarget(ent *TUNNATEntry) (host string, port int, isFakeIP bool, ok bool) {
+	if ent == nil {
 		return "", 0, false, false
 	}
 	origIP := append(net.IP(nil), ent.OrigDstIP...)
 	origPort := ent.OrigDstPort
-	t.mu.Unlock()
-
 	if t.fakeIPs != nil {
 		if domain, found := t.fakeIPs.LookupDomain(origIP); found {
 			return domain, origPort, true, true
@@ -568,17 +616,81 @@ func (t *TUNNATTable) LookupOriginalTarget(clientPort int) (host string, port in
 	return origIP.String(), origPort, false, true
 }
 
+// LookupOriginalTarget resolves the original domain (via FakeIPPool) or IPv4 target and port for clientPort.
+func (t *TUNNATTable) LookupOriginalTarget(clientPort int) (host string, port int, isFakeIP bool, ok bool) {
+	t.mu.Lock()
+	ent := t.byPort[clientPort]
+	if ent == nil {
+		t.mu.Unlock()
+		return "", 0, false, false
+	}
+	cp := *ent
+	t.mu.Unlock()
+	return t.resolveEntryTarget(&cp)
+}
+
+// LookupOriginalTargetForClient resolves the original target keyed by (clientIP, clientPort).
+func (t *TUNNATTable) LookupOriginalTargetForClient(clientIP net.IP, clientPort int) (host string, port int, isFakeIP bool, ok bool) {
+	key, kOk := makeNATKey(clientIP, clientPort)
+	if !kOk {
+		return "", 0, false, false
+	}
+	t.mu.Lock()
+	ent := t.byClient[key]
+	if ent == nil {
+		t.mu.Unlock()
+		return "", 0, false, false
+	}
+	cp := *ent
+	t.mu.Unlock()
+	return t.resolveEntryTarget(&cp)
+}
+
+// LookupOriginalTargetForAddr resolves the original target for an accepted relay TCP peer (origDstIP, clientPort).
+func (t *TUNNATTable) LookupOriginalTargetForAddr(origDstIP net.IP, clientPort int) (host string, port int, isFakeIP bool, ok bool) {
+	t.mu.Lock()
+	var ent *TUNNATEntry
+	if peerKey, kOk := makeNATKey(origDstIP, clientPort); kOk {
+		ent = t.byRelayPeer[peerKey]
+	}
+	if ent == nil {
+		ent = t.byPort[clientPort]
+	}
+	if ent == nil {
+		t.mu.Unlock()
+		return "", 0, false, false
+	}
+	cp := *ent
+	t.mu.Unlock()
+	return t.resolveEntryTarget(&cp)
+}
+
 type udpFlowKey struct {
 	clientIP   [4]byte
 	clientPort uint16
 }
 
+type tunUDPJob struct {
+	dstIP       net.IP
+	targetHost  string
+	dstPort     int
+	isFakeIP    bool
+	payload     []byte
+	decision    RuleAction
+	recordRadar bool
+}
+
 type tunUDPFlow struct {
-	key        udpFlowKey
-	elem       *list.Element
-	lastActive atomic.Int64
-	isProxy    bool
-	role       string
+	key             udpFlowKey
+	elem            *list.Element
+	lastActive      atomic.Int64
+	bytesUp         atomic.Int64
+	bytesDown       atomic.Int64
+	primaryRadarSeq atomic.Uint64
+	isProxy         bool
+	role            string
+	sendCh          chan tunUDPJob
+	doneCh          chan struct{}
 
 	mu            sync.Mutex
 	closed        bool
@@ -588,6 +700,7 @@ type tunUDPFlow struct {
 	fakeByPort    map[uint16]net.IP
 	directTargets map[string]bool
 	proxyTargets  map[string]bool
+	radarTargets  map[string]bool
 }
 
 func (f *tunUDPFlow) close() {
@@ -597,6 +710,9 @@ func (f *tunUDPFlow) close() {
 		return
 	}
 	f.closed = true
+	if f.doneCh != nil {
+		close(f.doneCh)
+	}
 	sess := f.sess
 	assocID := f.assocID
 	f.sess = nil
@@ -619,13 +735,15 @@ type TUNPacketProcessor struct {
 	FakeIP *FakeIPPool
 	NAT    *TUNNATTable
 
-	classifyFn         func(host string) RuleAction
-	isDirectIPFn       func(ip net.IP) bool
-	allowRawVoiceUDPFn func() bool
-	canProxyUDPFn      func() bool
-	resolver           *DohResolver
-	mux                *MuxManager
-	writePkt           func([]byte) error
+	classifyFn           func(host string) RuleAction
+	isDirectIPFn         func(ip net.IP) bool
+	allowRawVoiceUDPFn   func() bool
+	canProxyUDPFn        func() bool
+	resolver             *DohResolver
+	mux                  *MuxManager
+	radar                *RouteRadar
+	relayHandlesTCPRadar atomic.Bool
+	writePkt             func([]byte) error
 
 	dialCtrlMu        sync.RWMutex
 	directDialControl func(network, address string, c syscall.RawConn) error
@@ -633,6 +751,10 @@ type TUNPacketProcessor struct {
 	udpMu    sync.Mutex
 	udpFlows map[udpFlowKey]*tunUDPFlow
 	udpLRU   *list.List
+
+	quicRateMu  sync.Mutex
+	quicICMPAt  map[string]time.Time
+	quicRadarAt map[string]time.Time
 
 	dnsSem    chan struct{}
 	ctx       context.Context
@@ -654,15 +776,73 @@ func NewTUNPacketProcessor(opts TUNOptions, relayIP net.IP, relayPort int, write
 		canProxyUDPFn:      opts.CanProxyUDPFn,
 		resolver:           opts.Resolver,
 		mux:                opts.Mux,
+		radar:              opts.Radar,
 		writePkt:           writePkt,
-		udpFlows:     make(map[udpFlowKey]*tunUDPFlow),
-		udpLRU:       list.New(),
-		dnsSem:       make(chan struct{}, 64),
-		ctx:          ctx,
-		cancel:       cancel,
+		udpFlows:           make(map[udpFlowKey]*tunUDPFlow),
+		udpLRU:             list.New(),
+		quicICMPAt:         make(map[string]time.Time),
+		quicRadarAt:        make(map[string]time.Time),
+		dnsSem:             make(chan struct{}, 64),
+		ctx:                ctx,
+		cancel:             cancel,
 	}
 	go p.udpIdleGCLoop()
 	return p
+}
+
+// SetRelayHandlesTCPRadar marks whether an external TCP relay (e.g. TUNController) records
+// TUN TCP flows with full SNI/node/traffic metrics so ProcessPacket does not duplicate SYN entries.
+func (p *TUNPacketProcessor) SetRelayHandlesTCPRadar(v bool) {
+	if p != nil {
+		p.relayHandlesTCPRadar.Store(v)
+	}
+}
+
+func (p *TUNPacketProcessor) recordTUNRoute(proto, domain string, port int, decision RuleAction, node string, latMs, upBytes int64, errStr string) uint64 {
+	if p == nil || p.radar == nil || domain == "" || port <= 0 {
+		return 0
+	}
+	action := strings.ToUpper(strings.TrimSpace(decision.Action))
+	if action == "" {
+		action = "DIRECT"
+	}
+	return p.radar.Record(RouteRadarEntry{
+		Domain:  domain,
+		Port:    port,
+		Proto:   proto,
+		Action:  action,
+		Rule:    decision.Rule,
+		Node:    node,
+		Role:    decision.Role,
+		PingMs:  latMs,
+		BytesUp: upBytes,
+		Error:   errStr,
+	})
+}
+
+func (p *TUNPacketProcessor) recordOutboundTCPSYN(srcIP net.IP, clientPort int) {
+	host, port, isFakeIP, found := p.NAT.LookupOriginalTargetForClient(srcIP, clientPort)
+	if !found || host == "" || port <= 0 || port > 65535 {
+		return
+	}
+	decision := p.classifyHost(host)
+	if !isFakeIP && p.isDirectIPFn != nil {
+		if ip := net.ParseIP(host); ip != nil && p.isDirectIPFn(ip) {
+			decision.Action = "DIRECT"
+		}
+	}
+	var node string
+	var latMs int64
+	if strings.EqualFold(decision.Action, "PROXY") {
+		if p.mux != nil {
+			snap := p.mux.Snapshot()
+			node = snap.ActiveNode
+			latMs = snap.PingMs
+		}
+	} else {
+		node = "DIRECT"
+	}
+	p.recordTUNRoute("TUN-TCP", host, port, decision, node, latMs, 0, "")
 }
 
 // SetDirectDialControl sets the socket Control callback used for DIRECT UDP sockets.
@@ -702,6 +882,22 @@ func (p *TUNPacketProcessor) FakeIPCount() int {
 	return p.FakeIP.Count()
 }
 
+func (p *TUNPacketProcessor) flushUDPFlowTraffic(f *tunUDPFlow) {
+	if p == nil || f == nil {
+		return
+	}
+	up := f.bytesUp.Swap(0)
+	down := f.bytesDown.Swap(0)
+	if up == 0 && down == 0 {
+		return
+	}
+	if p.radar != nil {
+		if seq := f.primaryRadarSeq.Load(); seq != 0 {
+			p.radar.UpdateTraffic(seq, up, down, "")
+		}
+	}
+}
+
 // Close shuts down background DNS/UDP workers and unregisters all active UDP associations.
 func (p *TUNPacketProcessor) Close() {
 	p.closeOnce.Do(func() {
@@ -718,6 +914,7 @@ func (p *TUNPacketProcessor) Close() {
 		p.udpMu.Unlock()
 
 		for _, f := range flows {
+			p.flushUDPFlowTraffic(f)
 			f.close()
 		}
 	})
@@ -739,6 +936,7 @@ func (p *TUNPacketProcessor) udpIdleGCLoop() {
 func (p *TUNPacketProcessor) gcIdleUDPFlows(now time.Time, maxIdle time.Duration) int {
 	p.udpMu.Lock()
 	var expired []*tunUDPFlow
+	var active []*tunUDPFlow
 	for k, f := range p.udpFlows {
 		last := time.Unix(0, f.lastActive.Load())
 		if now.Sub(last) >= maxIdle {
@@ -748,11 +946,17 @@ func (p *TUNPacketProcessor) gcIdleUDPFlows(now time.Time, maxIdle time.Duration
 				p.udpLRU.Remove(f.elem)
 				f.elem = nil
 			}
+		} else {
+			active = append(active, f)
 		}
 	}
 	p.udpMu.Unlock()
 
+	for _, f := range active {
+		p.flushUDPFlowTraffic(f)
+	}
 	for _, f := range expired {
+		p.flushUDPFlowTraffic(f)
 		f.close()
 	}
 	return len(expired)
@@ -796,8 +1000,14 @@ func (p *TUNPacketProcessor) ProcessPacket(pkt []byte) {
 			p.emitPacket(out)
 			return
 		}
+		isPureSYN := (pkt[ihl+13]&tcpFlagSYN) != 0 && (pkt[ihl+13]&tcpFlagACK) == 0
+		srcIP := net.IPv4(pkt[12], pkt[13], pkt[14], pkt[15])
+		srcPort := int(binary.BigEndian.Uint16(pkt[ihl : ihl+2]))
 		if out, ok := p.NAT.TranslateOutbound(pkt[:totalLen]); ok {
 			p.emitPacket(out)
+			if isPureSYN && p.radar != nil && !p.relayHandlesTCPRadar.Load() {
+				p.recordOutboundTCPSYN(srcIP, srcPort)
+			}
 		}
 
 	case 17: // UDP
@@ -916,6 +1126,44 @@ func (p *TUNPacketProcessor) handleDNSQuery(srcIP, dstIP net.IP, srcPort, dstPor
 	}()
 }
 
+func (p *TUNPacketProcessor) allowRateLimitedQUICSignal(m map[string]time.Time, key string, interval time.Duration) bool {
+	now := time.Now()
+	p.quicRateMu.Lock()
+	defer p.quicRateMu.Unlock()
+	if last, ok := m[key]; ok && now.Sub(last) < interval {
+		return false
+	}
+	if len(m) >= 128 {
+		for k, ts := range m {
+			if now.Sub(ts) >= interval {
+				delete(m, k)
+			}
+		}
+		if len(m) >= 128 {
+			clear(m)
+		}
+	}
+	m[key] = now
+	return true
+}
+
+func (p *TUNPacketProcessor) emitQUICFallbackSignal(origPkt []byte, src4, dst4 net.IP, targetHost string, decision RuleAction) {
+	icmpKey := src4.String() + "->" + dst4.String()
+	if p.allowRateLimitedQUICSignal(p.quicICMPAt, icmpKey, 250*time.Millisecond) {
+		if icmp := buildICMPv4PortUnreachable(origPkt); icmp != nil {
+			p.emitPacket(icmp)
+		}
+	}
+	if p.radar != nil && p.allowRateLimitedQUICSignal(p.quicRadarAt, targetHost, 5*time.Second) {
+		sigDecision := decision
+		sigDecision.Rule = "quic_fallback"
+		if sigDecision.Role == "" {
+			sigDecision.Role = "media"
+		}
+		p.recordTUNRoute("TUN-UDP", targetHost, 443, sigDecision, "QUIC-TCP-Fallback", 0, 0, "quic_tcp_fallback")
+	}
+}
+
 func (p *TUNPacketProcessor) handleUDPPacket(origPkt []byte, srcIP, dstIP net.IP, srcPort, dstPort int, payload []byte) {
 	if len(payload) == 0 || len(payload) > 16384 {
 		return
@@ -954,9 +1202,7 @@ func (p *TUNPacketProcessor) handleUDPPacket(origPkt []byte, srcIP, dstIP net.IP
 	}
 
 	if dstPort == 443 && !isDirectIP && (strings.EqualFold(decision.Action, "PROXY") || !isFakeIP) {
-		if icmp := buildICMPv4PortUnreachable(origPkt); icmp != nil {
-			p.emitPacket(icmp)
-		}
+		p.emitQUICFallbackSignal(origPkt, src4, dst4, targetHost, decision)
 		return
 	}
 
@@ -974,9 +1220,7 @@ func (p *TUNPacketProcessor) handleUDPPacket(origPkt []byte, srcIP, dstIP net.IP
 	canUDP := p.canProxyUDPFn == nil || p.canProxyUDPFn()
 	if strings.EqualFold(decision.Action, "PROXY") && !canUDP {
 		if isFakeIP {
-			if icmp := buildICMPv4PortUnreachable(origPkt); icmp != nil {
-				p.emitPacket(icmp)
-			}
+			p.emitQUICFallbackSignal(origPkt, src4, dst4, targetHost, decision)
 			return
 		}
 		decision.Action = "DIRECT"
@@ -994,25 +1238,49 @@ func (p *TUNPacketProcessor) handleUDPPacket(origPkt []byte, srcIP, dstIP net.IP
 	}
 	flow.lastActive.Store(time.Now().UnixNano())
 
+	targetKey := targetHost + ":" + strconv.Itoa(dstPort)
+	shouldRecordRadar := false
 	flow.mu.Lock()
 	if flow.closed {
 		flow.mu.Unlock()
 		return
 	}
 	if isFakeIP {
-		flow.fakeByPort[uint16(dstPort)] = append(net.IP(nil), dst4...)
+		if _, ok := flow.fakeByPort[uint16(dstPort)]; ok || len(flow.fakeByPort) < MaxTUNUDPFlowTargets {
+			flow.fakeByPort[uint16(dstPort)] = append(net.IP(nil), dst4...)
+		}
 	} else if isProxy {
-		flow.proxyTargets[dst4.String()+":"+strconv.Itoa(dstPort)] = true
+		tk := dst4.String() + ":" + strconv.Itoa(dstPort)
+		if flow.proxyTargets[tk] || len(flow.proxyTargets) < MaxTUNUDPFlowTargets {
+			flow.proxyTargets[tk] = true
+		}
 	} else {
-		flow.directTargets[dst4.String()+":"+strconv.Itoa(dstPort)] = true
+		tk := dst4.String() + ":" + strconv.Itoa(dstPort)
+		if flow.directTargets[tk] || len(flow.directTargets) < MaxTUNUDPFlowTargets {
+			flow.directTargets[tk] = true
+		}
+	}
+	if p.radar != nil && !flow.radarTargets[targetKey] && len(flow.radarTargets) < MaxTUNUDPFlowTargets {
+		flow.radarTargets[targetKey] = true
+		shouldRecordRadar = true
 	}
 	flow.mu.Unlock()
 
-	if isProxy {
-		p.sendProxyUDP(flow, targetHost, dstPort, payload)
-		return
+	job := tunUDPJob{
+		dstIP:       append(net.IP(nil), dst4...),
+		targetHost:  targetHost,
+		dstPort:     dstPort,
+		isFakeIP:    isFakeIP,
+		payload:     append([]byte(nil), payload...),
+		decision:    decision,
+		recordRadar: shouldRecordRadar,
 	}
-	p.sendDirectUDP(flow, dst4, targetHost, dstPort, isFakeIP, payload)
+	select {
+	case flow.sendCh <- job:
+	case <-flow.doneCh:
+	default:
+		// Queue full: drop packet instead of blocking the single-threaded Wintun RX ring.
+	}
 }
 
 func (p *TUNPacketProcessor) isEstablishedProxyUDPTarget(key udpFlowKey, dstIP net.IP, dstPort int) bool {
@@ -1094,9 +1362,12 @@ func (p *TUNPacketProcessor) getOrCreateUDPFlow(key udpFlowKey, isProxy bool, ro
 		key:           key,
 		isProxy:       isProxy,
 		role:          role,
+		sendCh:        make(chan tunUDPJob, MaxTUNUDPQueue),
+		doneCh:        make(chan struct{}),
 		fakeByPort:    make(map[uint16]net.IP),
 		directTargets: make(map[string]bool),
 		proxyTargets:  make(map[string]bool),
+		radarTargets:  make(map[string]bool),
 	}
 	flow.lastActive.Store(now)
 	flow.elem = p.udpLRU.PushFront(flow)
@@ -1104,12 +1375,32 @@ func (p *TUNPacketProcessor) getOrCreateUDPFlow(key udpFlowKey, isProxy bool, ro
 	p.udpMu.Unlock()
 
 	for _, old := range toClose {
+		p.flushUDPFlowTraffic(old)
 		old.close()
 	}
+	go p.udpFlowWorker(flow)
 	return flow
 }
 
-func (p *TUNPacketProcessor) sendProxyUDP(flow *tunUDPFlow, targetHost string, dstPort int, payload []byte) {
+func (p *TUNPacketProcessor) udpFlowWorker(flow *tunUDPFlow) {
+	for {
+		select {
+		case <-flow.doneCh:
+			return
+		case <-p.ctx.Done():
+			return
+		case job := <-flow.sendCh:
+			if flow.isProxy {
+				p.sendProxyUDP(flow, job.targetHost, job.dstPort, job.payload, job.decision, job.recordRadar)
+			} else {
+				p.sendDirectUDP(flow, job.dstIP, job.targetHost, job.dstPort, job.isFakeIP, job.payload, job.decision, job.recordRadar)
+			}
+		}
+	}
+}
+
+func (p *TUNPacketProcessor) sendProxyUDP(flow *tunUDPFlow, targetHost string, dstPort int, payload []byte, decision RuleAction, recordRadar bool) {
+	t0 := time.Now()
 	flow.mu.Lock()
 	if flow.closed {
 		flow.mu.Unlock()
@@ -1118,43 +1409,80 @@ func (p *TUNPacketProcessor) sendProxyUDP(flow *tunUDPFlow, targetHost string, d
 	sess := flow.sess
 	assocID := flow.assocID
 	if sess == nil || sess.IsClosed() || assocID == 0 {
+		flow.mu.Unlock()
 		sctx, cancel := context.WithTimeout(p.ctx, 8*time.Second)
 		newSess, err := p.mux.GetOrConnectSession(sctx, flow.role)
 		cancel()
-		if err != nil || newSess == nil || flow.closed {
+		if err != nil || newSess == nil {
+			if recordRadar {
+				errStr := "mux session unavailable"
+				if err != nil {
+					errStr = err.Error()
+				}
+				seq := p.recordTUNRoute("TUN-UDP", targetHost, dstPort, decision, "", time.Since(t0).Milliseconds(), int64(len(payload)), errStr)
+				flow.primaryRadarSeq.CompareAndSwap(0, seq)
+			}
+			return
+		}
+
+		flow.mu.Lock()
+		if flow.closed {
 			flow.mu.Unlock()
 			return
 		}
-		clientIP := net.IPv4(flow.key.clientIP[0], flow.key.clientIP[1], flow.key.clientIP[2], flow.key.clientIP[3])
-		clientPort := int(flow.key.clientPort)
-		newAssoc := newSess.RegisterUDPHandler(func(repHost string, repPort int, repPayload []byte) {
-			if len(repPayload) == 0 || repPort <= 0 || repPort > 65535 || p.closed.Load() {
-				return
-			}
-			flow.lastActive.Store(time.Now().UnixNano())
-			pktSrcIP := p.resolveUDPReplySourceIP(flow, repHost, repPort)
-			if pktSrcIP == nil {
-				return
-			}
-			out := buildIPv4UDPPacket(pktSrcIP, clientIP, repPort, clientPort, repPayload)
-			if out != nil {
-				p.emitPacket(out)
-			}
-		})
-		flow.sess = newSess
-		flow.assocID = newAssoc
-		sess = newSess
-		assocID = newAssoc
+		if flow.sess != nil && !flow.sess.IsClosed() && flow.assocID != 0 {
+			sess = flow.sess
+			assocID = flow.assocID
+		} else {
+			clientIP := net.IPv4(flow.key.clientIP[0], flow.key.clientIP[1], flow.key.clientIP[2], flow.key.clientIP[3])
+			clientPort := int(flow.key.clientPort)
+			newAssoc := newSess.RegisterUDPHandler(func(repHost string, repPort int, repPayload []byte) {
+				if len(repPayload) == 0 || repPort <= 0 || repPort > 65535 || p.closed.Load() {
+					return
+				}
+				flow.lastActive.Store(time.Now().UnixNano())
+				flow.bytesDown.Add(int64(len(repPayload)))
+				pktSrcIP := p.resolveUDPReplySourceIP(flow, repHost, repPort)
+				if pktSrcIP == nil {
+					return
+				}
+				out := buildIPv4UDPPacket(pktSrcIP, clientIP, repPort, clientPort, repPayload)
+				if out != nil {
+					p.emitPacket(out)
+				}
+			})
+			flow.sess = newSess
+			flow.assocID = newAssoc
+			sess = newSess
+			assocID = newAssoc
+		}
 	}
 	flow.mu.Unlock()
 
-	if err := sess.SendUDP(assocID, targetHost, dstPort, payload); err != nil {
+	err := sess.SendUDP(assocID, targetHost, dstPort, payload)
+	if err != nil {
 		flow.mu.Lock()
 		if flow.sess == sess {
 			flow.sess = nil
 			flow.assocID = 0
 		}
 		flow.mu.Unlock()
+	} else if !recordRadar {
+		flow.bytesUp.Add(int64(len(payload)))
+	}
+	if recordRadar {
+		latMs := time.Since(t0).Milliseconds()
+		if latMs <= 0 && p.mux != nil {
+			if sessLat := p.mux.SessionLatencyMs(sess); sessLat > 0 {
+				latMs = sessLat
+			}
+		}
+		errStr := ""
+		if err != nil {
+			errStr = err.Error()
+		}
+		seq := p.recordTUNRoute("TUN-UDP", targetHost, dstPort, decision, sess.Node().Name, latMs, int64(len(payload)), errStr)
+		flow.primaryRadarSeq.CompareAndSwap(0, seq)
 	}
 }
 
@@ -1186,16 +1514,23 @@ func (p *TUNPacketProcessor) resolveUDPReplySourceIP(flow *tunUDPFlow, repHost s
 	return nil
 }
 
-func (p *TUNPacketProcessor) sendDirectUDP(flow *tunUDPFlow, dstIP net.IP, targetHost string, dstPort int, isFakeIP bool, payload []byte) {
+func (p *TUNPacketProcessor) sendDirectUDP(flow *tunUDPFlow, dstIP net.IP, targetHost string, dstPort int, isFakeIP bool, payload []byte, decision RuleAction, recordRadar bool) {
+	t0 := time.Now()
 	sendIP := dstIP
 	if isFakeIP {
 		if p.resolver == nil {
+			if recordRadar {
+				p.recordTUNRoute("TUN-UDP", targetHost, dstPort, decision, "DIRECT", time.Since(t0).Milliseconds(), int64(len(payload)), "doh resolver unavailable")
+			}
 			return
 		}
 		qctx, cancel := context.WithTimeout(p.ctx, 4*time.Second)
 		ips, err := p.resolver.LookupHost(qctx, targetHost)
 		cancel()
 		if err != nil {
+			if recordRadar {
+				p.recordTUNRoute("TUN-UDP", targetHost, dstPort, decision, "DIRECT", time.Since(t0).Milliseconds(), int64(len(payload)), err.Error())
+			}
 			return
 		}
 		var resolved net.IP
@@ -1206,6 +1541,9 @@ func (p *TUNPacketProcessor) sendDirectUDP(flow *tunUDPFlow, dstIP net.IP, targe
 			}
 		}
 		if resolved == nil {
+			if recordRadar {
+				p.recordTUNRoute("TUN-UDP", targetHost, dstPort, decision, "DIRECT", time.Since(t0).Milliseconds(), int64(len(payload)), "no IPv4 address")
+			}
 			return
 		}
 		sendIP = resolved
@@ -1222,6 +1560,9 @@ func (p *TUNPacketProcessor) sendDirectUDP(flow *tunUDPFlow, dstIP net.IP, targe
 		pc, err := lc.ListenPacket(p.ctx, "udp4", ":0")
 		if err != nil {
 			flow.mu.Unlock()
+			if recordRadar {
+				p.recordTUNRoute("TUN-UDP", targetHost, dstPort, decision, "DIRECT", time.Since(t0).Milliseconds(), int64(len(payload)), err.Error())
+			}
 			return
 		}
 		flow.directConn = pc
@@ -1230,7 +1571,18 @@ func (p *TUNPacketProcessor) sendDirectUDP(flow *tunUDPFlow, dstIP net.IP, targe
 	}
 	flow.mu.Unlock()
 
-	_, _ = dc.WriteTo(payload, &net.UDPAddr{IP: sendIP, Port: dstPort})
+	_, werr := dc.WriteTo(payload, &net.UDPAddr{IP: sendIP, Port: dstPort})
+	if werr == nil && !recordRadar {
+		flow.bytesUp.Add(int64(len(payload)))
+	}
+	if recordRadar {
+		errStr := ""
+		if werr != nil {
+			errStr = werr.Error()
+		}
+		seq := p.recordTUNRoute("TUN-UDP", targetHost, dstPort, decision, "DIRECT", time.Since(t0).Milliseconds(), int64(len(payload)), errStr)
+		flow.primaryRadarSeq.CompareAndSwap(0, seq)
+	}
 }
 
 func (p *TUNPacketProcessor) directUDPReadLoop(flow *tunUDPFlow, pc net.PacketConn) {
@@ -1251,6 +1603,7 @@ func (p *TUNPacketProcessor) directUDPReadLoop(flow *tunUDPFlow, pc net.PacketCo
 			continue
 		}
 		flow.lastActive.Store(time.Now().UnixNano())
+		flow.bytesDown.Add(int64(n))
 		pktSrcIP := p.resolveUDPReplySourceIP(flow, ua.IP.String(), ua.Port)
 		if pktSrcIP == nil {
 			continue

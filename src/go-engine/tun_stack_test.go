@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -778,5 +779,126 @@ func TestTUNRawIPDiscordVoiceAndBrowserDoHQUICAndSNI(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for TLS handshake via PeekConnTLSClientHelloSNI replayConn")
+	}
+}
+
+func TestTUNRouteRadarTCPAndUDPRecording(t *testing.T) {
+	pCli, pSrv := net.Pipe()
+	defer pSrv.Close()
+
+	mat, err := DerivePWP4KeyMaterial("tun-radar-secret", "cli-r", "srv-r")
+	if err != nil {
+		t.Fatalf("DerivePWP4KeyMaterial: %v", err)
+	}
+	cTx, _ := newPWP4Cipher(mat[0:32], mat[64:80])
+	cRx, _ := newPWP4Cipher(mat[32:64], mat[80:96])
+	sRx, _ := newPWP4Cipher(mat[0:32], mat[64:80])
+	go func() {
+		br := bufio.NewReader(pSrv)
+		for {
+			if _, _, _, _, rerr := sRx.OpenFrame(br, nil); rerr != nil {
+				return
+			}
+		}
+	}()
+
+	cfg := DefaultEngineConfig()
+	cfg.HTTPPort = 0
+	cfg.SOCKSPort = 0
+	cfg.ProxyAll = false
+	cfg.Categories = map[string]bool{"antigravity": true, "media": true}
+	cfg.RebuildEffectiveRules()
+	matcher := NewDomainRuleMatcher(cfg)
+
+	mux := NewMuxManager(cfg, nil)
+	defer mux.Close()
+	node := NodeConfig{Name: "RadarEdge-FI", Host: "10.0.0.5", Port: 443, Mux: true}
+	sess := NewClientMuxSession(pCli, bufio.NewReader(pCli), &pwp4ClientCodec{rx: cRx, tx: cTx}, node, LicenseMetadata{Proto: "PWP-4"})
+	mux.mu.Lock()
+	mux.sessions["ai"] = sess
+	mux.sessions["media"] = sess
+	mux.mu.Unlock()
+	mux.recordPrimaryPing(sess, 29)
+
+	srv := NewLocalProxyServer(LocalProxyOptions{
+		Config:     cfg,
+		Mux:        mux,
+		LocalToken: "radar-tok",
+	})
+	if err := srv.Start(); err != nil {
+		t.Fatalf("srv.Start: %v", err)
+	}
+	defer srv.Close()
+
+	proc := NewTUNPacketProcessor(TUNOptions{
+		ClassifyFn: matcher.Classify,
+		IsDirectIPFn: func(ip net.IP) bool {
+			return ip != nil && ip.String() == "77.88.55.80"
+		},
+		AllowRawVoiceUDPFn: matcher.AllowsRawVoiceUDP,
+		Mux:                mux,
+		Radar:              srv.Radar(),
+	}, net.IPv4(198, 18, 0, 1), 40009, func(pkt []byte) error {
+		return nil
+	})
+	defer proc.Close()
+
+	clientIP := net.IPv4(198, 18, 0, 1)
+
+	// 1. TUN TCP SYN to FakeIP (YouTube) -> recorded in RouteRadar as TUN-TCP PROXY
+	ytIP := proc.FakeIP.Assign("www.youtube.com")
+	synPkt := buildIPv4TCPPacket(clientIP, ytIP, 56101, 443, 100, 0, tcpFlagSYN, nil)
+	proc.ProcessPacket(synPkt)
+	// ACK packet for same flow must NOT create duplicate entry
+	ackPkt := buildIPv4TCPPacket(clientIP, ytIP, 56101, 443, 101, 200, tcpFlagACK, nil)
+	proc.ProcessPacket(ackPkt)
+
+	// 2. TUN UDP Discord Voice discovery + second SRTP packet -> recorded ONCE as TUN-UDP PROXY
+	disc := make([]byte, 74)
+	disc[0] = 0x00
+	disc[1] = 0x01
+	binary.BigEndian.PutUint16(disc[2:4], 70)
+	binary.BigEndian.PutUint32(disc[4:8], 0xAABBCCDD)
+	relayIP := net.IPv4(138, 199, 36, 10)
+	proc.ProcessPacket(buildIPv4UDPPacket(clientIP, relayIP, 56102, 50018, disc))
+	proc.ProcessPacket(buildIPv4UDPPacket(clientIP, relayIP, 56102, 50018, []byte("srtp-frame-2")))
+
+	// 3. TUN UDP DIRECT to RU IP -> recorded as TUN-UDP DIRECT
+	proc.ProcessPacket(buildIPv4UDPPacket(clientIP, net.IPv4(77, 88, 55, 80), 56103, 9999, []byte("ru-udp-direct")))
+
+	// Query /__pixelcore/v4/live-routes HTTP endpoint
+	req, _ := http.NewRequest(http.MethodGet, "http://"+srv.HTTPAddr()+"/__pixelcore/v4/live-routes?limit=20", nil)
+	req.Header.Set("X-Pixel-Local-Token", "radar-tok")
+	resp, err := (&http.Client{Timeout: 3 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatalf("GET live-routes: %v", err)
+	}
+	var out struct {
+		OK      bool              `json:"ok"`
+		Entries []RouteRadarEntry `json:"entries"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK || !out.OK {
+		t.Fatalf("live-routes failed: status=%d out=%+v", resp.StatusCode, out)
+	}
+	if len(out.Entries) != 3 {
+		t.Fatalf("expected exactly 3 deduplicated TUN entries in live-routes, got %d: %+v", len(out.Entries), out.Entries)
+	}
+
+	var sawYT, sawDiscord, sawRU bool
+	for _, e := range out.Entries {
+		switch {
+		case e.Domain == "www.youtube.com" && e.Proto == "TUN-TCP" && e.Action == "PROXY" && e.Node == "RadarEdge-FI" && e.PingMs == 29:
+			sawYT = true
+		case e.Domain == "138.199.36.10" && e.Port == 50018 && e.Proto == "TUN-UDP" && e.Action == "PROXY" && e.Node == "RadarEdge-FI" && e.PingMs > 0:
+			sawDiscord = true
+		case e.Domain == "77.88.55.80" && e.Port == 9999 && e.Proto == "TUN-UDP" && e.Action == "DIRECT" && e.Node == "DIRECT":
+			sawRU = true
+		}
+	}
+	if !sawYT || !sawDiscord || !sawRU {
+		t.Fatalf("missing expected TUN radar entries (yt=%v discord=%v ru=%v): %+v", sawYT, sawDiscord, sawRU, out.Entries)
 	}
 }

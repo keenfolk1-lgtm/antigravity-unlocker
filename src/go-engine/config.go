@@ -15,11 +15,13 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
+	"unicode"
 )
 
 const (
 	EngineName    = "PixelCore_v4_Go"
-	EngineVersion = "2.1.4"
+	EngineVersion = "2.2.0"
 
 	DefaultHost              = "185.103.103.162"
 	DefaultSNI               = "ai.pixelstore.space"
@@ -304,7 +306,7 @@ var CategoryDomains = func() map[string][]string {
 	}
 }()
 
-// BuiltinDirectDomains lists domains/suffixes routed DIRECT to avoid breaking Russian/local services.
+// BuiltinDirectDomains lists domains/suffixes routed DIRECT to avoid breaking Russian/local/game/update services.
 var BuiltinDirectDomains = []string{
 	".ru",
 	".xn--p1ai",
@@ -313,6 +315,8 @@ var BuiltinDirectDomains = []string{
 	"localhost",
 	"pixelstore.space",
 	"vk.com",
+	"vk.ru",
+	"userapi.com",
 	"yandex.ru",
 	"mail.ru",
 	"gosuslugi.ru",
@@ -324,6 +328,18 @@ var BuiltinDirectDomains = []string{
 	"dzen.ru",
 	"kinopoisk.ru",
 	"rutube.ru",
+	"chatzone.ru",
+	"radiofine.net",
+	"rusweb.net",
+	"steampowered.com",
+	"steamcontent.com",
+	"steamstatic.com",
+	"windowsupdate.com",
+	"epicgames.com",
+	"battle.net",
+	"wargaming.net",
+	"lesta.ru",
+	"vkplay.ru",
 }
 
 // NodeConfig describes one upstream PWP-4 / PWP-3 server node.
@@ -399,6 +415,7 @@ type V2Config struct {
 	SmartPAC          bool            `json:"smart_pac"`
 	PACRev            uint64          `json:"pac_rev,omitempty"`
 	ProxyAll          bool            `json:"proxy_all"`
+	InstantWake       *bool           `json:"instant_wake,omitempty"`
 	Categories        map[string]bool `json:"categories,omitempty"`
 	CustomProxy       []string        `json:"custom_proxy_domains,omitempty"`
 	CustomDirect      []string        `json:"custom_direct_domains,omitempty"`
@@ -407,27 +424,50 @@ type V2Config struct {
 
 // EngineConfig is the normalized in-memory client engine configuration.
 type EngineConfig struct {
-	HTTPPort        int             `json:"http_port"`
-	SOCKSPort       int             `json:"socks_port"`
-	EnableWSLBridge bool            `json:"wsl_bridge"`
-	PreferredRegion string          `json:"preferred_region"`
-	ActiveNode      NodeConfig      `json:"active_node"`
-	Nodes           []NodeConfig    `json:"nodes,omitempty"`
-	ClientUUID      string          `json:"client_uuid"`
-	DeviceHWID      string          `json:"device_hwid"`
-	SubLink         string          `json:"sub_link,omitempty"`
-	ProxyAll        bool            `json:"proxy_all"`
-	Categories      map[string]bool `json:"categories"`
-	ProxyDomains    []string        `json:"proxy_domains"`
-	DirectDomains   []string        `json:"direct_domains"`
-	CustomProxy     []string        `json:"custom_proxy_domains,omitempty"`
-	CustomDirect    []string        `json:"custom_direct_domains,omitempty"`
-	PinnedSPKI      []string        `json:"pinned_spki,omitempty"`
-	EdgeSNIs        []string        `json:"edge_snis,omitempty"`
-	DecoySNIs       []string        `json:"decoy_snis,omitempty"`
-	V2              V2Config        `json:"v2"`
-	ConfigPath      string          `json:"-"`
-	RawSourceJSON   []byte          `json:"-"`
+	HTTPPort                int             `json:"http_port"`
+	SOCKSPort               int             `json:"socks_port"`
+	EnableWSLBridge         bool            `json:"wsl_bridge"`
+	PreferredRegion         string          `json:"preferred_region"`
+	ActiveNode              NodeConfig      `json:"active_node"`
+	Nodes                   []NodeConfig    `json:"nodes,omitempty"`
+	ClientUUID              string          `json:"client_uuid"`
+	DeviceHWID              string          `json:"device_hwid"`
+	SubLink                 string          `json:"sub_link,omitempty"`
+	ProxyAll                bool            `json:"proxy_all"`
+	Categories              map[string]bool `json:"categories"`
+	ProxyDomains            []string        `json:"proxy_domains"`
+	DirectDomains           []string        `json:"direct_domains"`
+	CustomProxy             []string        `json:"custom_proxy_domains,omitempty"`
+	CustomDirect            []string        `json:"custom_direct_domains,omitempty"`
+	PinnedSPKI              []string        `json:"pinned_spki,omitempty"`
+	EdgeSNIs                []string        `json:"edge_snis,omitempty"`
+	DecoySNIs               []string        `json:"decoy_snis,omitempty"`
+	V2                      V2Config        `json:"v2"`
+	ConfigStaticProxy       []string        `json:"-"`
+	ConfigStaticDirect      []string        `json:"-"`
+	TemporaryProxy          []string        `json:"-"`
+	TemporaryProxyExpiresAt time.Time       `json:"-"`
+	ConfigPath              string          `json:"-"`
+	RawSourceJSON           []byte          `json:"-"`
+}
+
+// IsInstantWakeEnabled returns V2.InstantWake (defaulting to true when unset).
+func (c *EngineConfig) IsInstantWakeEnabled() bool {
+	if c == nil || c.V2.InstantWake == nil {
+		return true
+	}
+	return *c.V2.InstantWake
+}
+
+// ActiveTemporaryProxy returns sanitized temporary_proxy_domains when active and non-expired.
+func (c *EngineConfig) ActiveTemporaryProxy(now time.Time) []string {
+	if c == nil || len(c.TemporaryProxy) == 0 {
+		return nil
+	}
+	if !c.TemporaryProxyExpiresAt.IsZero() && !now.Before(c.TemporaryProxyExpiresAt) {
+		return nil
+	}
+	return sanitizeDomainSlice(c.TemporaryProxy)
 }
 
 // Clone returns a deep copy of EngineConfig safe for concurrent background updates.
@@ -467,12 +507,20 @@ func (c *EngineConfig) Clone() *EngineConfig {
 	}
 	cp.V2.CustomProxy = append([]string(nil), c.V2.CustomProxy...)
 	cp.V2.CustomDirect = append([]string(nil), c.V2.CustomDirect...)
+	if c.V2.InstantWake != nil {
+		iw := *c.V2.InstantWake
+		cp.V2.InstantWake = &iw
+	}
+	cp.ConfigStaticProxy = append([]string(nil), c.ConfigStaticProxy...)
+	cp.ConfigStaticDirect = append([]string(nil), c.ConfigStaticDirect...)
+	cp.TemporaryProxy = append([]string(nil), c.TemporaryProxy...)
 	cp.RawSourceJSON = append([]byte(nil), c.RawSourceJSON...)
 	return &cp
 }
 
 // DefaultEngineConfig initializes a sensible default configuration.
 func DefaultEngineConfig() *EngineConfig {
+	defaultInstantWake := true
 	return &EngineConfig{
 		HTTPPort:        DefaultHTTPPort,
 		SOCKSPort:       DefaultSOCKSPort,
@@ -496,6 +544,7 @@ func DefaultEngineConfig() *EngineConfig {
 			FailoverTimeoutMs: 1200,
 			SmartPAC:          true,
 			PACRev:            1,
+			InstantWake:       &defaultInstantWake,
 			PreferRoleRouting: true,
 		},
 		ActiveNode: NodeConfig{
@@ -535,6 +584,7 @@ type activeConfigRaw struct {
 		SmartPAC          *bool           `json:"smart_pac"`
 		PACRev            uint64          `json:"pac_rev"`
 		ProxyAll          *bool           `json:"proxy_all"`
+		InstantWake       *bool           `json:"instant_wake"`
 		Categories        map[string]bool `json:"categories"`
 		CustomProxy       []string        `json:"custom_proxy_domains"`
 		CustomDirect      []string        `json:"custom_direct_domains"`
@@ -603,6 +653,7 @@ type activeConfigRaw struct {
 	SubLink           string          `json:"subLink"`
 	ClientUUID        string          `json:"client_uuid"`
 	ProxyAll          *bool           `json:"proxy_all"`
+	InstantWake       *bool           `json:"instant_wake"`
 	Categories        map[string]bool `json:"categories"`
 	CustomProxy       []string        `json:"custom_proxy_domains"`
 	CustomDirect      []string        `json:"custom_direct_domains"`
@@ -934,6 +985,10 @@ func LoadConfigBytes(raw []byte) (*EngineConfig, error) {
 			cfg.ProxyAll = *doc.V2.ProxyAll
 			cfg.V2.ProxyAll = *doc.V2.ProxyAll
 		}
+		if doc.V2.InstantWake != nil {
+			iw := *doc.V2.InstantWake
+			cfg.V2.InstantWake = &iw
+		}
 		if doc.V2.RoleRouting != nil {
 			cfg.V2.PreferRoleRouting = *doc.V2.RoleRouting
 		}
@@ -955,6 +1010,10 @@ func LoadConfigBytes(raw []byte) (*EngineConfig, error) {
 	if doc.ProxyAll != nil {
 		cfg.ProxyAll = *doc.ProxyAll
 	}
+	if doc.InstantWake != nil {
+		iw := *doc.InstantWake
+		cfg.V2.InstantWake = &iw
+	}
 	for k, v := range doc.Categories {
 		cfg.Categories[strings.ToLower(strings.TrimSpace(k))] = v
 	}
@@ -968,8 +1027,15 @@ func LoadConfigBytes(raw []byte) (*EngineConfig, error) {
 	} else if len(doc.CustomDirectShort) > 0 {
 		cfg.CustomDirect = append(cfg.CustomDirect, doc.CustomDirectShort...)
 	}
+	cfg.CustomProxy = sanitizeDomainSlice(cfg.CustomProxy)
+	cfg.CustomDirect = sanitizeDomainSlice(cfg.CustomDirect)
+	cfg.V2.CustomProxy = append([]string(nil), cfg.CustomProxy...)
+	cfg.V2.CustomDirect = append([]string(nil), cfg.CustomDirect...)
 
-	// Routing rules matching C# active_config.json
+	customProxySet := sliceToSet(cfg.CustomProxy)
+	customDirectSet := sliceToSet(cfg.CustomDirect)
+
+	// Static routing rules matching C# active_config.json (kept separate from CustomProxy/CustomDirect)
 	if doc.Routing != nil {
 		if strings.EqualFold(doc.Routing.DefaultOutbound, "proxy") {
 			cfg.ProxyAll = true
@@ -983,9 +1049,13 @@ func LoadConfigBytes(raw []byte) (*EngineConfig, error) {
 				}
 				switch tag {
 				case "direct":
-					cfg.DirectDomains = append(cfg.DirectDomains, norm)
+					if _, isCustom := customDirectSet[norm]; !isCustom {
+						cfg.ConfigStaticDirect = append(cfg.ConfigStaticDirect, norm)
+					}
 				case "proxy":
-					cfg.ProxyDomains = append(cfg.ProxyDomains, norm)
+					if _, isCustom := customProxySet[norm]; !isCustom {
+						cfg.ConfigStaticProxy = append(cfg.ConfigStaticProxy, norm)
+					}
 				}
 			}
 		}
@@ -1215,7 +1285,9 @@ func SaveConfig(path string, cfg *EngineConfig) error {
 	return os.Rename(tmp, path)
 }
 
-// RebuildEffectiveRules computes deduplicated ProxyDomains and DirectDomains from categories + custom lists.
+// RebuildEffectiveRules computes deduplicated ProxyDomains and DirectDomains from scratch
+// using built-in lists, static config rules, enabled categories, and custom lists.
+// It never re-ingests prior ProxyDomains/DirectDomains so deletions take effect immediately.
 func (cfg *EngineConfig) RebuildEffectiveRules() {
 	proxySet := make(map[string]struct{})
 	directSet := make(map[string]struct{})
@@ -1239,9 +1311,11 @@ func (cfg *EngineConfig) RebuildEffectiveRules() {
 	for _, d := range RUEcosystemDomains {
 		addDirect(d)
 	}
-	for _, d := range cfg.DirectDomains {
+	for _, d := range cfg.ConfigStaticDirect {
 		addDirect(d)
 	}
+	cfg.CustomDirect = sanitizeDomainSlice(cfg.CustomDirect)
+	cfg.V2.CustomDirect = append([]string(nil), cfg.CustomDirect...)
 	for _, d := range cfg.CustomDirect {
 		addDirect(d)
 	}
@@ -1254,12 +1328,17 @@ func (cfg *EngineConfig) RebuildEffectiveRules() {
 			addProxy(d)
 		}
 	}
-	for _, d := range cfg.ProxyDomains {
+	for _, d := range cfg.ConfigStaticProxy {
 		addProxy(d)
 	}
+	cfg.CustomProxy = sanitizeDomainSlice(cfg.CustomProxy)
+	cfg.V2.CustomProxy = append([]string(nil), cfg.CustomProxy...)
 	for _, d := range cfg.CustomProxy {
 		addProxy(d)
 	}
+
+	addDirect("pixelstore.space")
+	addDirect(DefaultHost)
 	if cfg.ActiveNode.Host != "" {
 		addDirect(cfg.ActiveNode.Host)
 	}
@@ -1269,6 +1348,36 @@ func (cfg *EngineConfig) RebuildEffectiveRules() {
 
 	cfg.ProxyDomains = sortedSetKeys(proxySet)
 	cfg.DirectDomains = sortedSetKeys(directSet)
+}
+
+func sliceToSet(items []string) map[string]struct{} {
+	m := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		if n := normalizeDomainPattern(item); n != "" {
+			m[n] = struct{}{}
+		}
+	}
+	return m
+}
+
+func sanitizeDomainSlice(items []string) []string {
+	if len(items) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(items))
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		n := normalizeDomainPattern(item)
+		if n == "" {
+			continue
+		}
+		if _, ok := seen[n]; ok {
+			continue
+		}
+		seen[n] = struct{}{}
+		out = append(out, n)
+	}
+	return out
 }
 
 func sortedSetKeys(m map[string]struct{}) []string {
@@ -1288,19 +1397,76 @@ func sortedSetKeys(m map[string]struct{}) []string {
 	return out
 }
 
+// normalizeDomainPattern strips scheme/userinfo/path/query/fragment/port and strictly
+// validates the domain/suffix/IP pattern, rejecting quotes, semicolons, parens, whitespace,
+// and control characters.
 func normalizeDomainPattern(raw string) string {
-	s := strings.TrimSpace(strings.ToLower(raw))
+	s := strings.TrimSpace(raw)
 	if s == "" {
 		return ""
 	}
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f || unicode.IsSpace(r) {
+			return ""
+		}
+		switch r {
+		case '\'', '"', '`', ';', '(', ')', '{', '}', '[', ']', '\\', '<', '>', ',', '|':
+			return ""
+		}
+	}
+
+	s = strings.ToLower(s)
 	for _, prefix := range []string{"domain:", "full:", "geosite:"} {
 		if strings.HasPrefix(s, prefix) {
-			s = strings.TrimSpace(strings.TrimPrefix(s, prefix))
+			s = strings.TrimPrefix(s, prefix)
 			break
 		}
 	}
+	if idx := strings.Index(s, "://"); idx >= 0 {
+		s = s[idx+3:]
+	}
+	if idx := strings.IndexAny(s, "/?#"); idx >= 0 {
+		s = s[:idx]
+	}
+	if idx := strings.LastIndexByte(s, '@'); idx >= 0 {
+		s = s[idx+1:]
+	}
 	if strings.HasPrefix(s, "*.") {
 		s = "." + strings.TrimPrefix(s, "*.")
+	}
+	if strings.Count(s, ":") == 1 {
+		if host, port, err := net.SplitHostPort(s); err == nil && port != "" {
+			s = host
+		} else if idx := strings.LastIndexByte(s, ':'); idx >= 0 {
+			s = s[:idx]
+		}
+	}
+	s = strings.TrimSuffix(s, ".")
+	if s == "" || s == "." || len(s) > 253 {
+		return ""
+	}
+	if ip := net.ParseIP(s); ip != nil {
+		return ip.String()
+	}
+
+	check := strings.TrimPrefix(s, ".")
+	if check == "" || strings.HasPrefix(check, ".") || strings.Contains(check, "..") {
+		return ""
+	}
+	labels := strings.Split(check, ".")
+	for _, lbl := range labels {
+		if lbl == "" || len(lbl) > 63 || strings.HasPrefix(lbl, "-") || strings.HasSuffix(lbl, "-") {
+			return ""
+		}
+		for _, r := range lbl {
+			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+				continue
+			}
+			if r >= 0x80 && unicode.IsLetter(r) {
+				continue
+			}
+			return ""
+		}
 	}
 	return s
 }
@@ -1608,18 +1774,30 @@ func IsDiscordVoiceIP(ip net.IP) bool {
 	return false
 }
 
-// DomainRuleMatcher decides PROXY vs DIRECT synchronously with zero DNS lookups.
+// DomainRuleMatcher decides PROXY vs DIRECT synchronously with zero DNS lookups
+// using the unified 4-tier precedence:
+// Tier 0 self-bypass -> Tier 1 custom/temporary proxy -> Tier 2 custom direct ->
+// Tier 3 BUILTIN_DIRECT -> Tier 4 enabled categories / proxy_all -> DIRECT.
 type DomainRuleMatcher struct {
-	mu                sync.RWMutex
-	proxyAll          bool
-	routeTelegramDC   bool
-	routeDiscordMedia bool
-	exactDirect       map[string]struct{}
-	suffixDirect      []string
-	exactProxy        map[string]string // domain -> rule label
-	suffixProxy       []suffixRule
-	aiSuffixes        []string
-	mediaSuffix       []string
+	mu                 sync.RWMutex
+	proxyAll           bool
+	routeTelegramDC    bool
+	routeDiscordMedia  bool
+	exactBypass        map[string]struct{}
+	suffixBypass       []string
+	exactCustomProxy   map[string]struct{}
+	suffixCustomProxy  []string
+	exactTempProxy     map[string]struct{}
+	suffixTempProxy    []string
+	tempProxyExpires   time.Time
+	exactCustomDirect  map[string]struct{}
+	suffixCustomDirect []string
+	exactDirect        map[string]struct{}
+	suffixDirect       []string
+	exactProxy         map[string]string // domain -> rule label
+	suffixProxy        []suffixRule
+	aiSuffixes         []string
+	mediaSuffix        []string
 }
 
 type suffixRule struct {
@@ -1645,36 +1823,78 @@ func NewDomainRuleMatcher(cfg *EngineConfig) *DomainRuleMatcher {
 	return m
 }
 
+func appendDomainRuleToSet(pat string, exact map[string]struct{}, suffixes *[]string) {
+	p := normalizeDomainPattern(pat)
+	if p == "" {
+		return
+	}
+	if strings.HasPrefix(p, ".") {
+		*suffixes = append(*suffixes, p)
+		return
+	}
+	exact[p] = struct{}{}
+	if net.ParseIP(p) == nil {
+		*suffixes = append(*suffixes, "."+p)
+	}
+}
+
+func matchDomainSet(h string, exact map[string]struct{}, suffixes []string) bool {
+	if _, ok := exact[h]; ok {
+		return true
+	}
+	for _, suf := range suffixes {
+		if strings.HasSuffix(h, suf) {
+			return true
+		}
+	}
+	return false
+}
+
 // UpdateFromConfig rebuilds matcher tables safely under write lock.
 func (m *DomainRuleMatcher) UpdateFromConfig(cfg *EngineConfig) {
-	exactDirect := map[string]struct{}{
+	exactBypass := map[string]struct{}{
 		"localhost":             {},
 		"localhost.localdomain": {},
 	}
+	var suffixBypass []string
+	appendDomainRuleToSet("pixelstore.space", exactBypass, &suffixBypass)
+	appendDomainRuleToSet(DefaultHost, exactBypass, &suffixBypass)
+	if cfg != nil {
+		if cfg.ActiveNode.Host != "" {
+			appendDomainRuleToSet(cfg.ActiveNode.Host, exactBypass, &suffixBypass)
+		}
+		if cfg.ActiveNode.SNI != "" {
+			appendDomainRuleToSet(cfg.ActiveNode.SNI, exactBypass, &suffixBypass)
+		}
+		for _, n := range cfg.Nodes {
+			if n.Host != "" {
+				appendDomainRuleToSet(n.Host, exactBypass, &suffixBypass)
+			}
+			if n.SNI != "" {
+				appendDomainRuleToSet(n.SNI, exactBypass, &suffixBypass)
+			}
+		}
+	}
+
+	exactCustomProxy := make(map[string]struct{})
+	var suffixCustomProxy []string
+	exactTempProxy := make(map[string]struct{})
+	var suffixTempProxy []string
+	var tempExpires time.Time
+	exactCustomDirect := make(map[string]struct{})
+	var suffixCustomDirect []string
+	exactDirect := make(map[string]struct{})
 	var suffixDirect []string
-	addDirectRule := func(pat string) {
-		p := normalizeDomainPattern(pat)
-		if p == "" {
-			return
-		}
-		if strings.HasPrefix(p, ".") {
-			suffixDirect = append(suffixDirect, p)
-		} else {
-			exactDirect[p] = struct{}{}
-			suffixDirect = append(suffixDirect, "."+p)
-		}
+
+	for _, pat := range BuiltinDirectDomains {
+		appendDomainRuleToSet(pat, exactDirect, &suffixDirect)
 	}
 	for _, pat := range RUEcosystemDomains {
-		addDirectRule(pat)
-	}
-	for _, pat := range cfg.DirectDomains {
-		addDirectRule(pat)
+		appendDomainRuleToSet(pat, exactDirect, &suffixDirect)
 	}
 
-	// Build labeled proxy map from categories + custom + explicit rules
 	exactProxy := make(map[string]string)
 	var suffixProxy []suffixRule
-
 	addProxyRule := func(pat, label string) {
 		p := normalizeDomainPattern(pat)
 		if p == "" {
@@ -1684,35 +1904,71 @@ func (m *DomainRuleMatcher) UpdateFromConfig(cfg *EngineConfig) {
 			suffixProxy = append(suffixProxy, suffixRule{suffix: p, rule: label})
 		} else {
 			exactProxy[p] = label
-			suffixProxy = append(suffixProxy, suffixRule{suffix: "." + p, rule: label})
+			if net.ParseIP(p) == nil {
+				suffixProxy = append(suffixProxy, suffixRule{suffix: "." + p, rule: label})
+			}
 		}
 	}
 
-	for cat, enabled := range cfg.Categories {
-		if !enabled {
-			continue
+	var proxyAll bool
+	if cfg != nil {
+		proxyAll = cfg.ProxyAll
+		for _, pat := range cfg.ConfigStaticDirect {
+			appendDomainRuleToSet(pat, exactDirect, &suffixDirect)
 		}
-		for _, d := range CategoryDomains[strings.ToLower(cat)] {
-			addProxyRule(d, strings.ToLower(cat))
+		for _, pat := range cfg.CustomDirect {
+			appendDomainRuleToSet(pat, exactCustomDirect, &suffixCustomDirect)
 		}
-	}
-	for _, d := range cfg.ProxyDomains {
-		p := normalizeDomainPattern(d)
-		if _, ok := exactProxy[p]; !ok {
-			addProxyRule(p, "config_proxy")
+		for _, pat := range cfg.CustomProxy {
+			appendDomainRuleToSet(pat, exactCustomProxy, &suffixCustomProxy)
 		}
-	}
-	for _, d := range cfg.CustomProxy {
-		addProxyRule(d, "custom_proxy")
+		for _, pat := range cfg.ActiveTemporaryProxy(time.Now()) {
+			appendDomainRuleToSet(pat, exactTempProxy, &suffixTempProxy)
+		}
+		if len(exactTempProxy) > 0 || len(suffixTempProxy) > 0 {
+			tempExpires = cfg.TemporaryProxyExpiresAt
+		}
+		for cat, enabled := range cfg.Categories {
+			if !enabled {
+				continue
+			}
+			for _, d := range CategoryDomains[strings.ToLower(cat)] {
+				addProxyRule(d, strings.ToLower(cat))
+			}
+		}
+		for _, d := range cfg.ConfigStaticProxy {
+			p := normalizeDomainPattern(d)
+			if p == "" {
+				continue
+			}
+			if _, ok := exactProxy[p]; !ok {
+				addProxyRule(p, "config_proxy")
+			}
+		}
 	}
 
-	routeTelegramDC := cfg.Categories["social"] || cfg.Categories["telegram"] || cfg.Categories["media"] || exactProxy["telegram.org"] != ""
-	routeDiscordMedia := cfg.Categories["media"] || cfg.Categories["discord"] || exactProxy["discord.media"] != "" || exactProxy["discord.com"] != ""
+	_, customTG := exactCustomProxy["telegram.org"]
+	_, customDiscordMedia := exactCustomProxy["discord.media"]
+	_, customDiscordCom := exactCustomProxy["discord.com"]
+	routeTelegramDC := (cfg != nil && (cfg.Categories["social"] || cfg.Categories["telegram"] || cfg.Categories["media"])) ||
+		exactProxy["telegram.org"] != "" || customTG
+	routeDiscordMedia := (cfg != nil && (cfg.Categories["media"] || cfg.Categories["discord"])) ||
+		exactProxy["discord.media"] != "" || exactProxy["discord.com"] != "" ||
+		customDiscordMedia || customDiscordCom
 
 	m.mu.Lock()
-	m.proxyAll = cfg.ProxyAll
+	m.proxyAll = proxyAll
 	m.routeTelegramDC = routeTelegramDC
 	m.routeDiscordMedia = routeDiscordMedia
+	m.exactBypass = exactBypass
+	m.suffixBypass = suffixBypass
+	m.exactCustomProxy = exactCustomProxy
+	m.suffixCustomProxy = suffixCustomProxy
+	m.exactTempProxy = exactTempProxy
+	m.suffixTempProxy = suffixTempProxy
+	m.tempProxyExpires = tempExpires
+	m.exactCustomDirect = exactCustomDirect
+	m.suffixCustomDirect = suffixCustomDirect
 	m.exactDirect = exactDirect
 	m.suffixDirect = suffixDirect
 	m.exactProxy = exactProxy
@@ -1738,24 +1994,10 @@ func (m *DomainRuleMatcher) Classify(host string) RuleAction {
 		return RuleAction{Action: "DIRECT", Rule: "empty", Role: "ai"}
 	}
 
-	// Always direct loopback / private / link-local IP literals, and genuine Russian CIDRs
-	if ip := net.ParseIP(h); ip != nil {
-		if IsPrivateOrReservedIP(ip) {
-			return RuleAction{Action: "DIRECT", Rule: "private_ip", Role: "ai"}
-		}
-		if IsRussianIP(ip) {
-			return RuleAction{Action: "DIRECT", Rule: "ru_cidr", Role: "ai"}
-		}
-		m.mu.RLock()
-		routeTG := m.routeTelegramDC
-		routeDiscord := m.routeDiscordMedia
-		m.mu.RUnlock()
-		if routeTG && IsTelegramDCIP(ip) {
-			return RuleAction{Action: "PROXY", Rule: "telegram_dc", Role: "media"}
-		}
-		if routeDiscord && IsDiscordVoiceIP(ip) {
-			return RuleAction{Action: "PROXY", Rule: "discord_voice_ip", Role: "media"}
-		}
+	ip := net.ParseIP(h)
+	// Tier 0: Non-overridable loopback / private / link-local IP literals
+	if ip != nil && IsPrivateOrReservedIP(ip) {
+		return RuleAction{Action: "DIRECT", Rule: "private_ip", Role: "ai"}
 	}
 
 	role := m.inferRole(h)
@@ -1763,15 +2005,41 @@ func (m *DomainRuleMatcher) Classify(host string) RuleAction {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	if _, ok := m.exactDirect[h]; ok {
-		return RuleAction{Action: "DIRECT", Rule: "direct_rule", Role: role}
+	// Tier 0 (continued): Non-overridable self-bypass (pixelstore.space, active/cluster node hosts/IPs)
+	if matchDomainSet(h, m.exactBypass, m.suffixBypass) {
+		return RuleAction{Action: "DIRECT", Rule: "self_bypass", Role: "ai"}
 	}
-	for _, suf := range m.suffixDirect {
-		if strings.HasSuffix(h, suf) {
-			return RuleAction{Action: "DIRECT", Rule: "direct_suffix", Role: role}
+
+	// Tier 1: custom_proxy_domains + active non-expired temporary_proxy_domains (beats .ru and built-in direct)
+	if matchDomainSet(h, m.exactCustomProxy, m.suffixCustomProxy) {
+		return RuleAction{Action: "PROXY", Rule: "custom_proxy", Role: role}
+	}
+	if (len(m.exactTempProxy) > 0 || len(m.suffixTempProxy) > 0) &&
+		(m.tempProxyExpires.IsZero() || time.Now().Before(m.tempProxyExpires)) {
+		if matchDomainSet(h, m.exactTempProxy, m.suffixTempProxy) {
+			return RuleAction{Action: "PROXY", Rule: "temporary_proxy", Role: role}
 		}
 	}
 
+	// Tier 2: custom_direct_domains (beats enabled categories)
+	if matchDomainSet(h, m.exactCustomDirect, m.suffixCustomDirect) {
+		return RuleAction{Action: "DIRECT", Rule: "custom_direct", Role: role}
+	}
+
+	// Tier 3: BUILTIN_DIRECT (.ru/.su/.by/.xn--p1ai + BuiltinDirectDomains + RUEcosystemDomains + RU CIDRs)
+	for _, tld := range ruDirectTLDs {
+		if len(h) > len(tld) && strings.HasSuffix(h, tld) {
+			return RuleAction{Action: "DIRECT", Rule: "direct_tld", Role: role}
+		}
+	}
+	if matchDomainSet(h, m.exactDirect, m.suffixDirect) {
+		return RuleAction{Action: "DIRECT", Rule: "direct_builtin", Role: role}
+	}
+	if ip != nil && IsRussianIP(ip) {
+		return RuleAction{Action: "DIRECT", Rule: "ru_cidr", Role: "ai"}
+	}
+
+	// Tier 4: Enabled categories -> Telegram/Discord CIDRs -> proxy_all -> DIRECT
 	if lbl, ok := m.exactProxy[h]; ok {
 		return RuleAction{Action: "PROXY", Rule: lbl, Role: role}
 	}
@@ -1780,7 +2048,14 @@ func (m *DomainRuleMatcher) Classify(host string) RuleAction {
 			return RuleAction{Action: "PROXY", Rule: sr.rule, Role: role}
 		}
 	}
-
+	if ip != nil {
+		if m.routeTelegramDC && IsTelegramDCIP(ip) {
+			return RuleAction{Action: "PROXY", Rule: "telegram_dc", Role: "media"}
+		}
+		if m.routeDiscordMedia && IsDiscordVoiceIP(ip) {
+			return RuleAction{Action: "PROXY", Rule: "discord_voice_ip", Role: "media"}
+		}
+	}
 	if m.proxyAll {
 		return RuleAction{Action: "PROXY", Rule: "proxy_all", Role: role}
 	}

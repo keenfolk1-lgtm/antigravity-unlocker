@@ -42,19 +42,23 @@ type LocalProxyServer struct {
 	uiHandler   http.Handler // mounted at /ui* when standalone
 	uiCSRFStore *WebSessionStore
 
-	httpListener net.Listener
-	socksLn      net.Listener
-	wslHTTPLn    net.Listener
-	wslSOCKSLn   net.Listener
-	wslBridgeIP  string
-	wslHTTPPort  int
-	wslSOCKSPort int
+	httpListener      net.Listener
+	socksLn           net.Listener
+	wslMu             sync.Mutex
+	wslHTTPLn         net.Listener
+	wslSOCKSLn        net.Listener
+	wslBridgeIP       string
+	wslHTTPPort       int
+	wslSOCKSPort      int
+	findWSLBridgeIPFn func() (string, error)
+	listenWSLFunc     func(network, address string) (net.Listener, error)
 
-	pacRev      atomic.Uint64
-	activeConns atomic.Int64
-	bytesUp     atomic.Int64
-	bytesDown   atomic.Int64
-	startedAt   time.Time
+	pacRev          atomic.Uint64
+	activeConns     atomic.Int64
+	bytesUp         atomic.Int64
+	bytesDown       atomic.Int64
+	startedAt       time.Time
+	tempExpiryTimer *time.Timer
 
 	onRulesReloaded func(cfg *EngineConfig, pacRev uint64)
 	stopOnce        sync.Once
@@ -93,19 +97,21 @@ func NewLocalProxyServer(opts LocalProxyOptions) *LocalProxyServer {
 	matcher := NewDomainRuleMatcher(cfg)
 
 	srv := &LocalProxyServer{
-		cfg:             cfg,
-		matcher:         matcher,
-		mux:             opts.Mux,
-		resolver:        opts.Resolver,
-		radar:           radar,
-		headless:        opts.Headless,
-		manifestVer:     opts.ManifestVer,
-		manifestSrc:     opts.ManifestSrc,
-		localToken:      token,
-		uiCSRFStore:     NewWebSessionStore(),
-		startedAt:       time.Now(),
-		onRulesReloaded: opts.OnRulesReloaded,
-		stopCh:          make(chan struct{}),
+		cfg:               cfg,
+		matcher:           matcher,
+		mux:               opts.Mux,
+		resolver:          opts.Resolver,
+		radar:             radar,
+		headless:          opts.Headless,
+		manifestVer:       opts.ManifestVer,
+		manifestSrc:       opts.ManifestSrc,
+		localToken:        token,
+		uiCSRFStore:       NewWebSessionStore(),
+		startedAt:         time.Now(),
+		onRulesReloaded:   opts.OnRulesReloaded,
+		findWSLBridgeIPFn: FindWSLBridgeIP,
+		listenWSLFunc:     net.Listen,
+		stopCh:            make(chan struct{}),
 	}
 	initRev := uint64(1)
 	if cfg.V2.PACRev > 1 {
@@ -118,6 +124,7 @@ func NewLocalProxyServer(opts LocalProxyOptions) *LocalProxyServer {
 		},
 		Resolver: opts.Resolver,
 		Mux:      opts.Mux,
+		Radar:    radar,
 		IsDirectIPFn: func(ip net.IP) bool {
 			return IsPrivateOrReservedIP(ip) || IsRussianIP(ip)
 		},
@@ -160,20 +167,23 @@ func (s *LocalProxyServer) tunStatusSnapshot() TUNStatusSnapshot {
 	return s.tun.Status()
 }
 
-func (s *LocalProxyServer) syncTUNState(want bool) {
+func (s *LocalProxyServer) syncTUNState() {
 	if s == nil || s.tun == nil {
 		return
 	}
 	s.tunMu.Lock()
 	defer s.tunMu.Unlock()
 
+	cfg := s.getConfig()
+	want := cfg != nil && cfg.V2.TunMode
+	select {
+	case <-s.stopCh:
+		want = false
+	default:
+	}
+
 	cur := s.tun.Status()
 	if want {
-		select {
-		case <-s.stopCh:
-			return
-		default:
-		}
 		if !cur.Active {
 			if err := s.tun.Start(); err == nil && s.resolver != nil {
 				s.resolver.CloseIdleConnections()
@@ -247,7 +257,12 @@ func (s *LocalProxyServer) collectBypassNodeIPs() []net.IP {
 func (s *LocalProxyServer) LocalToken() string     { return s.localToken }
 func (s *LocalProxyServer) BootstrapToken() string { return s.uiCSRFStore.BootstrapToken() }
 func (s *LocalProxyServer) PACRev() uint64         { return s.pacRev.Load() }
-func (s *LocalProxyServer) WSLBridgeIP() string    { return s.wslBridgeIP }
+func (s *LocalProxyServer) WSLBridgeIP() string {
+	s.mu.RLock()
+	ip := s.wslBridgeIP
+	s.mu.RUnlock()
+	return ip
+}
 func (s *LocalProxyServer) Radar() *RouteRadar     { return s.radar }
 func (s *LocalProxyServer) HTTPAddr() string {
 	if s.httpListener != nil {
@@ -305,19 +320,79 @@ func (s *LocalProxyServer) Start() error {
 	go s.acceptSOCKSLoop(socksLn, false)
 
 	if cfg.EnableWSLBridge {
-		if wslIP, wErr := FindWSLBridgeIP(); wErr == nil && wslIP != "" && wslIP != "0.0.0.0" {
-			_ = s.bindWSLBridge(wslIP, cfg.HTTPPort, cfg.SOCKSPort)
-		}
+		s.syncWSLBridge()
 	}
 	if cfg.V2.TunMode {
-		go s.syncTUNState(true)
+		go s.syncTUNState()
 	}
 	return nil
 }
 
 // BindWSLBridgeOnIP allows tests or explicit callers to bind WSL listeners on a validated 172.16.0.0/12 IP.
 func (s *LocalProxyServer) BindWSLBridgeOnIP(ipStr string, httpPort, socksPort int) error {
+	s.wslMu.Lock()
+	defer s.wslMu.Unlock()
 	return s.bindWSLBridge(ipStr, httpPort, socksPort)
+}
+
+func (s *LocalProxyServer) syncWSLBridge() {
+	if s == nil {
+		return
+	}
+	s.wslMu.Lock()
+	defer s.wslMu.Unlock()
+
+	cfg := s.getConfig()
+	want := cfg != nil && cfg.EnableWSLBridge
+	select {
+	case <-s.stopCh:
+		want = false
+	default:
+	}
+
+	if !want {
+		s.unbindWSLBridgeLocked()
+		return
+	}
+
+	httpPort := s.HTTPPort()
+	socksPort := s.SOCKSPort()
+
+	s.mu.RLock()
+	alreadyBound := s.wslHTTPLn != nil && s.wslSOCKSLn != nil && s.wslBridgeIP != ""
+	s.mu.RUnlock()
+	if alreadyBound {
+		return
+	}
+
+	findFn := s.findWSLBridgeIPFn
+	if findFn == nil {
+		findFn = FindWSLBridgeIP
+	}
+	wslIP, wErr := findFn()
+	if wErr != nil || wslIP == "" || wslIP == "0.0.0.0" {
+		return
+	}
+	_ = s.bindWSLBridge(wslIP, httpPort, socksPort)
+}
+
+func (s *LocalProxyServer) unbindWSLBridgeLocked() {
+	s.mu.Lock()
+	wHTTP := s.wslHTTPLn
+	wSOCKS := s.wslSOCKSLn
+	s.wslHTTPLn = nil
+	s.wslSOCKSLn = nil
+	s.wslBridgeIP = ""
+	s.wslHTTPPort = 0
+	s.wslSOCKSPort = 0
+	s.mu.Unlock()
+
+	if wHTTP != nil {
+		_ = wHTTP.Close()
+	}
+	if wSOCKS != nil {
+		_ = wSOCKS.Close()
+	}
 }
 
 func (s *LocalProxyServer) bindWSLBridge(ipStr string, httpPort, socksPort int) error {
@@ -325,15 +400,21 @@ func (s *LocalProxyServer) bindWSLBridge(ipStr string, httpPort, socksPort int) 
 	if ip == nil || ip.IsUnspecified() || !isIPIn17216Range(ip) {
 		return fmt.Errorf("refusing non-WSL2 bind IP %q (must be 172.16.0.0/12, never 0.0.0.0)", ipStr)
 	}
-	wHTTP, err := net.Listen("tcp", net.JoinHostPort(ip.String(), strconv.Itoa(httpPort)))
+	listenFn := s.listenWSLFunc
+	if listenFn == nil {
+		listenFn = net.Listen
+	}
+	wHTTP, err := listenFn("tcp", net.JoinHostPort(ip.String(), strconv.Itoa(httpPort)))
 	if err != nil {
 		return err
 	}
-	wSOCKS, err := net.Listen("tcp", net.JoinHostPort(ip.String(), strconv.Itoa(socksPort)))
+	wSOCKS, err := listenFn("tcp", net.JoinHostPort(ip.String(), strconv.Itoa(socksPort)))
 	if err != nil {
 		_ = wHTTP.Close()
 		return err
 	}
+	s.unbindWSLBridgeLocked()
+
 	s.mu.Lock()
 	s.wslBridgeIP = ip.String()
 	s.wslHTTPLn = wHTTP
@@ -359,19 +440,22 @@ func (s *LocalProxyServer) bindWSLBridge(ipStr string, httpPort, socksPort int) 
 func (s *LocalProxyServer) Close() {
 	s.stopOnce.Do(func() {
 		close(s.stopCh)
-		s.syncTUNState(false)
+		s.mu.Lock()
+		if s.tempExpiryTimer != nil {
+			s.tempExpiryTimer.Stop()
+			s.tempExpiryTimer = nil
+		}
+		s.mu.Unlock()
+		s.syncTUNState()
 		if s.httpListener != nil {
 			_ = s.httpListener.Close()
 		}
 		if s.socksLn != nil {
 			_ = s.socksLn.Close()
 		}
-		if s.wslHTTPLn != nil {
-			_ = s.wslHTTPLn.Close()
-		}
-		if s.wslSOCKSLn != nil {
-			_ = s.wslSOCKSLn.Close()
-		}
+		s.wslMu.Lock()
+		s.unbindWSLBridgeLocked()
+		s.wslMu.Unlock()
 	})
 }
 
@@ -519,7 +603,7 @@ func (s *LocalProxyServer) serveLoopbackHTTP(w http.ResponseWriter, r *http.Requ
 		if path == "/proxy.pac" {
 			w.Header().Set("Content-Type", "application/x-ns-proxy-autoconfig; charset=utf-8")
 			w.Header().Set("Cache-Control", "no-store")
-			_, _ = io.WriteString(w, GenerateSmartPACJS(s.getConfig(), s.wslBridgeIP))
+			_, _ = io.WriteString(w, GenerateSmartPACJS(s.getConfig(), s.WSLBridgeIP()))
 			return
 		}
 		http.Error(w, "Forbidden on WSL bridge", http.StatusForbidden)
@@ -539,6 +623,10 @@ func (s *LocalProxyServer) serveLoopbackHTTP(w http.ResponseWriter, r *http.Requ
 	case path == "/__pixelcore/telemetry":
 		if !s.isValidLoopbackHost(r) {
 			http.Error(w, "Invalid Host", http.StatusForbidden)
+			return
+		}
+		if s.localToken != "" && !s.isAuthorizedLocalAPI(r) {
+			http.Error(w, "Unauthorized local API request", http.StatusUnauthorized)
 			return
 		}
 		s.handleLegacyTelemetry(w)
@@ -653,7 +741,8 @@ func (s *LocalProxyServer) handleLegacyTelemetry(w http.ResponseWriter) {
 		"failover_count":     snap.FailoverCount,
 		"instant_wake_count": snap.InstantWakeCount,
 		"pac_rev":            s.pacRev.Load(),
-		"wsl_bridge_ip":      s.wslBridgeIP,
+		"ping_ms":            snap.PingMs,
+		"wsl_bridge_ip":      s.WSLBridgeIP(),
 		"sticky_ai_node":     snap.StickyAINode,
 		"ai_migrations":      snap.AIMigrations,
 		"media_pool_conns":   snap.MediaPoolConns,
@@ -661,6 +750,7 @@ func (s *LocalProxyServer) handleLegacyTelemetry(w http.ResponseWriter) {
 		"tun_active":         tunSnap.Active,
 		"tun_status":         tunSnap.Status,
 		"fakeip_entries":     tunSnap.FakeIPEntries,
+		"instant_wake":       cfg.IsInstantWakeEnabled(),
 	}
 	writeJSON(w, http.StatusOK, payload)
 }
@@ -771,7 +861,8 @@ func (s *LocalProxyServer) writeV4Status(w http.ResponseWriter) {
 		"pac_rev":               s.pacRev.Load(),
 		"http_port":             s.HTTPPort(),
 		"socks_port":            s.SOCKSPort(),
-		"wsl_bridge_ip":         s.wslBridgeIP,
+		"ping_ms":               snap.PingMs,
+		"wsl_bridge_ip":         s.WSLBridgeIP(),
 		"license_tier":          tier,
 		"days_left":             snap.License.DaysLeft,
 		"hours_left":            snap.License.HoursLeft,
@@ -793,20 +884,73 @@ func (s *LocalProxyServer) writeV4Status(w http.ResponseWriter) {
 		"sticky_ai_node":        snap.StickyAINode,
 		"ai_migrations":         snap.AIMigrations,
 		"media_pool_conns":      snap.MediaPoolConns,
-		"tun_mode":              cfg.V2.TunMode,
-		"tun_active":            tunSnap.Active,
-		"tun_status":            tunSnap.Status,
-		"fakeip_entries":        tunSnap.FakeIPEntries,
+		"tun_mode":                cfg.V2.TunMode,
+		"tun_active":              tunSnap.Active,
+		"tun_status":              tunSnap.Status,
+		"fakeip_entries":          tunSnap.FakeIPEntries,
+		"instant_wake":            cfg.IsInstantWakeEnabled(),
+		"temporary_proxy_domains": cfg.ActiveTemporaryProxy(time.Now()),
 	})
+}
+
+func (s *LocalProxyServer) scheduleTempExpiryLocked(expiresAt time.Time) {
+	if s.tempExpiryTimer != nil {
+		s.tempExpiryTimer.Stop()
+		s.tempExpiryTimer = nil
+	}
+	if expiresAt.IsZero() {
+		return
+	}
+	d := time.Until(expiresAt)
+	if d <= 0 {
+		d = time.Millisecond
+	}
+	s.tempExpiryTimer = time.AfterFunc(d, s.expireTemporaryProxy)
+}
+
+func (s *LocalProxyServer) expireTemporaryProxy() {
+	select {
+	case <-s.stopCh:
+		return
+	default:
+	}
+
+	var cb func(*EngineConfig, uint64)
+	var cfgCopy *EngineConfig
+	var newRev uint64
+
+	s.mu.Lock()
+	if s.cfg != nil && len(s.cfg.TemporaryProxy) > 0 && !s.cfg.TemporaryProxyExpiresAt.IsZero() && !time.Now().Before(s.cfg.TemporaryProxyExpiresAt) {
+		cfgCopy = s.cfg.Clone()
+		cfgCopy.TemporaryProxy = nil
+		cfgCopy.TemporaryProxyExpiresAt = time.Time{}
+		s.cfg = cfgCopy
+		if s.mux != nil {
+			s.mux.UpdateConfig(cfgCopy)
+		}
+		s.matcher.UpdateFromConfig(cfgCopy)
+		newRev = s.pacRev.Add(1)
+		cb = s.onRulesReloaded
+		s.tempExpiryTimer = nil
+	}
+	s.mu.Unlock()
+
+	if cb != nil && cfgCopy != nil {
+		cb(cfgCopy, newRev)
+	}
 }
 
 func (s *LocalProxyServer) handleReloadRules(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Categories   map[string]bool `json:"categories"`
-		CustomProxy  []string        `json:"custom_proxy_domains"`
-		CustomDirect []string        `json:"custom_direct_domains"`
-		ProxyAll     *bool           `json:"proxy_all"`
-		TunMode      *bool           `json:"tun_mode"`
+		Categories           map[string]bool `json:"categories"`
+		CustomProxy          []string        `json:"custom_proxy_domains"`
+		CustomDirect         []string        `json:"custom_direct_domains"`
+		TemporaryProxy       []string        `json:"temporary_proxy_domains"`
+		TemporaryProxyTTLSec *int            `json:"temporary_proxy_ttl_sec"`
+		ProxyAll             *bool           `json:"proxy_all"`
+		TunMode              *bool           `json:"tun_mode"`
+		WSLBridge            *bool           `json:"wsl_bridge"`
+		InstantWake          *bool           `json:"instant_wake"`
 	}
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 512*1024))
 
@@ -833,6 +977,12 @@ func (s *LocalProxyServer) handleReloadRules(w http.ResponseWriter, r *http.Requ
 			if !hasDiskNodes && s.cfg != nil && len(s.cfg.Nodes) > 0 {
 				reloaded.Nodes = append([]NodeConfig(nil), s.cfg.Nodes...)
 			}
+			if s.cfg != nil {
+				if activeTemp := s.cfg.ActiveTemporaryProxy(time.Now()); len(activeTemp) > 0 {
+					reloaded.TemporaryProxy = activeTemp
+					reloaded.TemporaryProxyExpiresAt = s.cfg.TemporaryProxyExpiresAt
+				}
+			}
 			cfg = reloaded
 		}
 	} else if len(raw) > 0 {
@@ -847,10 +997,10 @@ func (s *LocalProxyServer) handleReloadRules(w http.ResponseWriter, r *http.Requ
 			}
 		}
 		if body.CustomProxy != nil {
-			cfg.CustomProxy = append([]string(nil), body.CustomProxy...)
+			cfg.CustomProxy = sanitizeDomainSlice(body.CustomProxy)
 		}
 		if body.CustomDirect != nil {
-			cfg.CustomDirect = append([]string(nil), body.CustomDirect...)
+			cfg.CustomDirect = sanitizeDomainSlice(body.CustomDirect)
 		}
 		if body.ProxyAll != nil {
 			cfg.ProxyAll = *body.ProxyAll
@@ -858,6 +1008,44 @@ func (s *LocalProxyServer) handleReloadRules(w http.ResponseWriter, r *http.Requ
 		if body.TunMode != nil {
 			cfg.V2.TunMode = *body.TunMode
 		}
+		if body.WSLBridge != nil {
+			cfg.EnableWSLBridge = *body.WSLBridge
+			cfg.V2.WSLBridge = *body.WSLBridge
+		}
+		if body.InstantWake != nil {
+			iw := *body.InstantWake
+			cfg.V2.InstantWake = &iw
+		}
+
+		now := time.Now()
+		if body.TemporaryProxyTTLSec != nil && *body.TemporaryProxyTTLSec <= 0 {
+			cfg.TemporaryProxy = nil
+			cfg.TemporaryProxyExpiresAt = time.Time{}
+		} else if body.TemporaryProxy != nil {
+			if len(body.TemporaryProxy) == 0 {
+				cfg.TemporaryProxy = nil
+				cfg.TemporaryProxyExpiresAt = time.Time{}
+			} else {
+				sanitized := sanitizeDomainSlice(body.TemporaryProxy)
+				if len(sanitized) == 0 {
+					cfg.TemporaryProxy = nil
+					cfg.TemporaryProxyExpiresAt = time.Time{}
+				} else {
+					ttlSec := 180
+					if body.TemporaryProxyTTLSec != nil && *body.TemporaryProxyTTLSec > 0 {
+						ttlSec = *body.TemporaryProxyTTLSec
+					}
+					cfg.TemporaryProxy = sanitized
+					cfg.TemporaryProxyExpiresAt = now.Add(time.Duration(ttlSec) * time.Second)
+				}
+			}
+		} else if body.TemporaryProxyTTLSec != nil && *body.TemporaryProxyTTLSec > 0 && len(cfg.TemporaryProxy) > 0 {
+			cfg.TemporaryProxyExpiresAt = now.Add(time.Duration(*body.TemporaryProxyTTLSec) * time.Second)
+		} else if !cfg.TemporaryProxyExpiresAt.IsZero() && !now.Before(cfg.TemporaryProxyExpiresAt) {
+			cfg.TemporaryProxy = nil
+			cfg.TemporaryProxyExpiresAt = time.Time{}
+		}
+
 		cfg.RebuildEffectiveRules()
 		if cfg.ConfigPath != "" && !s.headless {
 			_ = SaveConfig(cfg.ConfigPath, cfg)
@@ -868,24 +1056,31 @@ func (s *LocalProxyServer) handleReloadRules(w http.ResponseWriter, r *http.Requ
 		s.mux.UpdateConfig(cfg)
 	}
 	s.matcher.UpdateFromConfig(cfg)
+	s.scheduleTempExpiryLocked(cfg.TemporaryProxyExpiresAt)
 	newRev := s.pacRev.Add(1)
 	cb := s.onRulesReloaded
 	s.mu.Unlock()
 
-	s.syncTUNState(cfg.V2.TunMode)
+	s.syncWSLBridge()
+	s.syncTUNState()
 	tunSnap := s.tunStatusSnapshot()
+	curCfg := s.getConfig()
 
 	if cb != nil {
-		cb(cfg, newRev)
+		cb(curCfg, newRev)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":             true,
-		"pac_rev":        newRev,
-		"proxy_domains":  len(cfg.ProxyDomains),
-		"direct_domains": len(cfg.DirectDomains),
-		"tun_mode":       cfg.V2.TunMode,
-		"tun_active":     tunSnap.Active,
-		"tun_status":     tunSnap.Status,
+		"ok":                      true,
+		"pac_rev":                 newRev,
+		"proxy_domains":           len(curCfg.ProxyDomains),
+		"direct_domains":          len(curCfg.DirectDomains),
+		"temporary_proxy_domains": len(curCfg.ActiveTemporaryProxy(time.Now())),
+		"instant_wake":            curCfg.IsInstantWakeEnabled(),
+		"tun_mode":                curCfg.V2.TunMode,
+		"tun_active":              tunSnap.Active,
+		"tun_status":              tunSnap.Status,
+		"wsl_bridge":              curCfg.EnableWSLBridge,
+		"wsl_bridge_ip":           s.WSLBridgeIP(),
 	})
 }
 
@@ -1108,6 +1303,9 @@ func (s *LocalProxyServer) acceptSOCKSLoop(ln net.Listener, isWSL bool) {
 	for {
 		c, err := ln.Accept()
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
 			select {
 			case <-s.stopCh:
 				return
