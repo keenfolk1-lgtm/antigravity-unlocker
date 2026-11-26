@@ -926,6 +926,22 @@ func (x *XRayRunner) cardIDESockets(cfg *EngineConfig) XRayCard {
 	} else {
 		card.Summary = "0 bypassed AI IDE sockets detected"
 	}
+	if ShouldAutoPatchAntigravity() {
+		patchSum := PatchAntigravityLanguageServers(AntigravityPatchOptions{CheckOnly: true})
+		unpatched := 0
+		for _, r := range patchSum.Results {
+			if r.NeedsPatch {
+				unpatched++
+			}
+		}
+		card.Metrics["antigravity_ls_found"] = patchSum.Found
+		card.Metrics["antigravity_ls_verified"] = patchSum.Verified
+		card.Metrics["antigravity_ls_unpatched"] = unpatched
+		if unpatched > 0 {
+			card.Status = "warn"
+			card.Summary += "; Antigravity language_server unpatched (run 'pixeltunnel patch' or 'sudo pixeltunnel patch')"
+		}
+	}
 	return card
 }
 

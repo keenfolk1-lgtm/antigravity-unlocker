@@ -79,6 +79,8 @@ func runCLI(args []string) int {
 		return cmdDoctor(rest)
 	case "env":
 		return cmdEnv(rest)
+	case "patch":
+		return cmdPatch(rest)
 	case "activate":
 		return cmdActivate(rest)
 	default:
@@ -97,6 +99,7 @@ Usage:
   pixeltunnel status
   pixeltunnel doctor [--json]
   pixeltunnel env [--ps]
+  pixeltunnel patch [--check] [--tiers-only] [--path <binary>]
   pixeltunnel activate <key-or-uri>
 `, EngineVersion, runtime.GOOS, runtime.GOARCH)
 }
@@ -245,6 +248,12 @@ func runStartEngine(opts startEngineOptions) int {
 			pacURL := fmt.Sprintf("http://127.0.0.1:%d/proxy.pac?r=%d", httpPort, proxySrv.PACRev())
 			_ = ConfigureSystemProxy(pacURL, httpPort, false)
 			HealIDEConfigurations(httpPort, true, false)
+			if ShouldAutoPatchAntigravity() {
+				patchSummary := PatchAntigravityLanguageServers(AntigravityPatchOptions{RestartProcesses: true})
+				if hint := FormatAntigravityPatchHint(patchSummary); hint != "" {
+					fmt.Println(hint)
+				}
+			}
 		}
 		_ = writeRuntimeMeta(&runtimeMetadata{
 			PID:       os.Getpid(),
@@ -407,12 +416,66 @@ func cmdEnv(args []string) int {
 		fmt.Printf("$env:HTTP_PROXY=\"http://127.0.0.1:%d\"\n", httpPort)
 		fmt.Printf("$env:HTTPS_PROXY=\"http://127.0.0.1:%d\"\n", httpPort)
 		fmt.Printf("$env:ALL_PROXY=\"socks5h://127.0.0.1:%d\"\n", socksPort)
+		fmt.Printf("$env:AG_LS_PROXY=\"http://127.0.0.1:%d\"\n", httpPort)
 		return 0
 	}
 	fmt.Printf("export HTTP_PROXY=\"http://127.0.0.1:%d\"\n", httpPort)
 	fmt.Printf("export HTTPS_PROXY=\"http://127.0.0.1:%d\"\n", httpPort)
 	fmt.Printf("export ALL_PROXY=\"socks5h://127.0.0.1:%d\"\n", socksPort)
+	fmt.Printf("export AG_LS_PROXY=\"http://127.0.0.1:%d\"\n", httpPort)
 	return 0
+}
+
+func cmdPatch(args []string) int {
+	fs := flag.NewFlagSet("patch", flag.ContinueOnError)
+	checkOnly := fs.Bool("check", false, "Inspect language_server binaries without modifying files")
+	tiersOnly := fs.Bool("tiers-only", false, "Patch ineligible_tiers/ineligibleTiers only (skip AG_LS_PROXY rewrite)")
+	targetPath := fs.String("path", "", "Explicit path to Antigravity language_server binary")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	opts := AntigravityPatchOptions{
+		CheckOnly:        *checkOnly,
+		TiersOnly:        *tiersOnly,
+		RestartProcesses: !*checkOnly,
+	}
+	if p := strings.TrimSpace(*targetPath); p != "" {
+		opts.ExplicitPaths = []string{p}
+	}
+
+	summary := PatchAntigravityLanguageServers(opts)
+	if summary.Found == 0 {
+		fmt.Println("No Antigravity language_server binaries found.")
+		return 0
+	}
+
+	exitCode := 0
+	for _, r := range summary.Results {
+		switch {
+		case r.PermissionDenied:
+			fmt.Printf("NEEDS SUDO  %s (%s)\n", r.Path, r.Err)
+			exitCode = 1
+		case r.Err != "":
+			fmt.Printf("ERROR       %s (%s)\n", r.Path, r.Err)
+			exitCode = 1
+		case r.NeedsPatch:
+			fmt.Printf("NEEDS PATCH %s (tiers=%v proxy=%v)\n", r.Path, r.TiersVerified, r.ProxyVerified)
+			exitCode = 1
+		case r.PatchedNow:
+			fmt.Printf("PATCHED     %s (tiers=%v proxy=%v tag=%s)\n", r.Path, r.TiersVerified, r.ProxyVerified, r.ProxyPatchTag)
+		default:
+			fmt.Printf("OK          %s (tiers=%v proxy=%v)\n", r.Path, r.TiersVerified, r.ProxyVerified)
+		}
+	}
+	if summary.PermissionDenied > 0 {
+		exe := "pixeltunnel"
+		if ex, err := os.Executable(); err == nil && strings.TrimSpace(ex) != "" {
+			exe = ex
+		}
+		fmt.Printf("Run with elevated privileges: sudo %s patch\n", exe)
+	}
+	return exitCode
 }
 
 func cmdActivate(args []string) int {

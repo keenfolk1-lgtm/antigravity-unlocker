@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // FindWSLBridgeIP returns empty on Linux host OS (WSL2 bridge listener runs on Windows host).
@@ -203,6 +204,11 @@ func ConfigureSystemProxy(pacURL string, httpPort int, headless bool) error {
 	if _, err := exec.LookPath("systemctl"); err == nil {
 		_ = exec.Command("systemctl", "--user", "set-environment", fmt.Sprintf("AG_LS_PROXY=http://127.0.0.1:%d", httpPort)).Run()
 	}
+	if _, err := exec.LookPath("dbus-update-activation-environment"); err == nil {
+		cmd := exec.Command("dbus-update-activation-environment", "--systemd", "AG_LS_PROXY")
+		cmd.Env = append(os.Environ(), fmt.Sprintf("AG_LS_PROXY=http://127.0.0.1:%d", httpPort))
+		_ = cmd.Run()
+	}
 
 	st := &ProxyRollbackState{
 		Managed: true,
@@ -280,4 +286,150 @@ func HealIDEConfigurations(httpPort int, enable bool, headless bool) {
 // DetectExternalPacketDesyncTool is a Windows-specific WinDivert probe (empty on Linux).
 func DetectExternalPacketDesyncTool() string {
 	return ""
+}
+
+// ShouldAutoPatchAntigravity enables Antigravity language_server binary patching on Linux.
+func ShouldAutoPatchAntigravity() bool {
+	return true
+}
+
+// ResignPatchedBinary is a no-op on Linux (ad-hoc codesigning is macOS-specific).
+func ResignPatchedBinary(tmpPath string) error {
+	_ = tmpPath
+	return nil
+}
+
+func collectLinuxCandidateHomes() []string {
+	seen := make(map[string]struct{})
+	var homes []string
+	addHome := func(h string) {
+		h = strings.TrimSpace(h)
+		if h == "" || h == "/" {
+			return
+		}
+		h = filepath.Clean(h)
+		if _, ok := seen[h]; !ok {
+			seen[h] = struct{}{}
+			homes = append(homes, h)
+		}
+	}
+
+	if h, err := os.UserHomeDir(); err == nil {
+		addHome(h)
+	}
+	if sudoUser := strings.TrimSpace(os.Getenv("SUDO_USER")); sudoUser != "" && sudoUser != "root" {
+		if raw, err := os.ReadFile("/etc/passwd"); err == nil {
+			prefix := sudoUser + ":"
+			for _, line := range strings.Split(string(raw), "\n") {
+				if strings.HasPrefix(line, prefix) {
+					fields := strings.Split(line, ":")
+					if len(fields) >= 6 {
+						addHome(fields[5])
+					}
+					break
+				}
+			}
+		}
+		addHome(filepath.Join("/home", sudoUser))
+	}
+	return homes
+}
+
+// DiscoverAntigravityLanguageServerBinaries finds Antigravity language_server binaries across system, user, and running processes on Linux.
+func DiscoverAntigravityLanguageServerBinaries() []string {
+	var rawCandidates []string
+	appendGlobs := func(patterns ...string) {
+		for _, pat := range patterns {
+			if matches, err := filepath.Glob(pat); err == nil {
+				rawCandidates = append(rawCandidates, matches...)
+			}
+		}
+	}
+
+	appendGlobs(
+		"/usr/share/antigravity/resources/app/extensions/antigravity/bin/language_server*",
+		"/usr/share/antigravity/resources/bin/language_server*",
+		"/opt/antigravity/resources/app/extensions/antigravity/bin/language_server*",
+		"/opt/Antigravity/resources/app/extensions/antigravity/bin/language_server*",
+		"/usr/lib/antigravity/resources/app/extensions/antigravity/bin/language_server*",
+	)
+
+	for _, home := range collectLinuxCandidateHomes() {
+		appendGlobs(
+			filepath.Join(home, ".antigravity-server", "bin", "*", "extensions", "antigravity", "bin", "language_server*"),
+			filepath.Join(home, ".antigravity-server", "bin", "*", "resources", "app", "extensions", "antigravity", "bin", "language_server*"),
+			filepath.Join(home, ".antigravity", "bin", "language_server*"),
+			filepath.Join(home, ".local", "share", "antigravity", "resources", "app", "extensions", "antigravity", "bin", "language_server*"),
+			filepath.Join(home, ".local", "share", "Antigravity", "resources", "app", "extensions", "antigravity", "bin", "language_server*"),
+		)
+	}
+
+	if procEntries, err := os.ReadDir("/proc"); err == nil {
+		for _, ent := range procEntries {
+			if !ent.IsDir() {
+				continue
+			}
+			pid, perr := strconv.Atoi(ent.Name())
+			if perr != nil || pid <= 0 {
+				continue
+			}
+			exe, lerr := os.Readlink(filepath.Join("/proc", ent.Name(), "exe"))
+			if lerr != nil {
+				continue
+			}
+			exe = strings.TrimSuffix(exe, " (deleted)")
+			base := filepath.Base(exe)
+			if strings.HasPrefix(base, "language_server") {
+				rawCandidates = append(rawCandidates, exe)
+			} else if strings.EqualFold(base, "antigravity") {
+				dir := filepath.Dir(exe)
+				appendGlobs(
+					filepath.Join(dir, "resources", "app", "extensions", "antigravity", "bin", "language_server*"),
+					filepath.Join(dir, "resources", "bin", "language_server*"),
+				)
+			}
+		}
+	}
+
+	return resolveAndDedupeBinaryPaths(rawCandidates)
+}
+
+// StopLanguageServerProcessesForPath sends SIGTERM to running language_server processes matching binPath.
+func StopLanguageServerProcessesForPath(binPath string) {
+	if strings.TrimSpace(binPath) == "" {
+		return
+	}
+	target, err := filepath.EvalSymlinks(binPath)
+	if err != nil {
+		target = filepath.Clean(binPath)
+	}
+	selfPID := os.Getpid()
+	procEntries, err := os.ReadDir("/proc")
+	if err != nil {
+		return
+	}
+	for _, ent := range procEntries {
+		if !ent.IsDir() {
+			continue
+		}
+		pid, perr := strconv.Atoi(ent.Name())
+		if perr != nil || pid <= 0 || pid == selfPID {
+			continue
+		}
+		exe, lerr := os.Readlink(filepath.Join("/proc", ent.Name(), "exe"))
+		if lerr != nil {
+			continue
+		}
+		exe = strings.TrimSuffix(exe, " (deleted)")
+		if !strings.HasPrefix(filepath.Base(exe), "language_server") {
+			continue
+		}
+		resolvedExe, rerr := filepath.EvalSymlinks(exe)
+		if rerr != nil {
+			resolvedExe = filepath.Clean(exe)
+		}
+		if resolvedExe == target {
+			_ = syscall.Kill(pid, syscall.SIGTERM)
+		}
+	}
 }

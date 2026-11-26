@@ -250,3 +250,24 @@ func DetectExternalPacketDesyncTool() string {
 	extDesyncMu.Unlock()
 	return detected
 }
+
+// ShouldAutoPatchAntigravity is false on Windows because PixelTunnelNext.cs manages Windows language_server patching.
+func ShouldAutoPatchAntigravity() bool {
+	return false
+}
+
+// DiscoverAntigravityLanguageServerBinaries is a no-op on Windows (handled by C# WPF host).
+func DiscoverAntigravityLanguageServerBinaries() []string {
+	return nil
+}
+
+// StopLanguageServerProcessesForPath is a no-op on Windows (handled by C# WPF host).
+func StopLanguageServerProcessesForPath(binPath string) {
+	_ = binPath
+}
+
+// ResignPatchedBinary is a no-op on Windows.
+func ResignPatchedBinary(tmpPath string) error {
+	_ = tmpPath
+	return nil
+}

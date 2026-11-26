@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // FindWSLBridgeIP returns empty on macOS (WSL2 bridge is Windows-only).
@@ -182,4 +183,125 @@ func listMacNetworkServices() ([]string, error) {
 // DetectExternalPacketDesyncTool is a Windows-specific WinDivert probe (empty on macOS).
 func DetectExternalPacketDesyncTool() string {
 	return ""
+}
+
+// ShouldAutoPatchAntigravity enables Antigravity language_server binary patching on macOS.
+func ShouldAutoPatchAntigravity() bool {
+	return true
+}
+
+// ResignPatchedBinary applies an ad-hoc codesign signature before atomic rename on macOS (required on Apple Silicon).
+func ResignPatchedBinary(tmpPath string) error {
+	out, err := exec.Command("codesign", "--force", "--sign", "-", tmpPath).CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg != "" {
+			return fmt.Errorf("codesign failed: %w (%s)", err, msg)
+		}
+		return fmt.Errorf("codesign failed: %w", err)
+	}
+	return nil
+}
+
+func collectDarwinCandidateHomes() []string {
+	seen := make(map[string]struct{})
+	var homes []string
+	addHome := func(h string) {
+		h = strings.TrimSpace(h)
+		if h == "" || h == "/" {
+			return
+		}
+		h = filepath.Clean(h)
+		if _, ok := seen[h]; !ok {
+			seen[h] = struct{}{}
+			homes = append(homes, h)
+		}
+	}
+	if h, err := os.UserHomeDir(); err == nil {
+		addHome(h)
+	}
+	if sudoUser := strings.TrimSpace(os.Getenv("SUDO_USER")); sudoUser != "" && sudoUser != "root" {
+		addHome(filepath.Join("/Users", sudoUser))
+	}
+	return homes
+}
+
+// DiscoverAntigravityLanguageServerBinaries finds Antigravity language_server binaries across macOS app bundles, user dirs, and ps.
+func DiscoverAntigravityLanguageServerBinaries() []string {
+	var rawCandidates []string
+	appendGlobs := func(patterns ...string) {
+		for _, pat := range patterns {
+			if matches, err := filepath.Glob(pat); err == nil {
+				rawCandidates = append(rawCandidates, matches...)
+			}
+		}
+	}
+
+	appendGlobs(
+		"/Applications/Antigravity.app/Contents/Resources/app/extensions/antigravity/bin/language_server*",
+		"/Applications/Antigravity.app/Contents/Resources/bin/language_server*",
+	)
+	for _, home := range collectDarwinCandidateHomes() {
+		appendGlobs(
+			filepath.Join(home, "Applications", "Antigravity.app", "Contents", "Resources", "app", "extensions", "antigravity", "bin", "language_server*"),
+			filepath.Join(home, "Applications", "Antigravity.app", "Contents", "Resources", "bin", "language_server*"),
+			filepath.Join(home, ".antigravity-server", "bin", "*", "extensions", "antigravity", "bin", "language_server*"),
+			filepath.Join(home, ".antigravity-server", "bin", "*", "resources", "app", "extensions", "antigravity", "bin", "language_server*"),
+		)
+	}
+
+	if out, err := exec.Command("ps", "-ax", "-o", "comm=").Output(); err == nil {
+		for _, line := range strings.Split(string(out), "\n") {
+			p := strings.TrimSpace(line)
+			if p == "" || !filepath.IsAbs(p) {
+				continue
+			}
+			if strings.HasPrefix(filepath.Base(p), "language_server") {
+				rawCandidates = append(rawCandidates, p)
+			}
+		}
+	}
+
+	return resolveAndDedupeBinaryPaths(rawCandidates)
+}
+
+// StopLanguageServerProcessesForPath sends SIGTERM to running language_server processes matching binPath on macOS.
+func StopLanguageServerProcessesForPath(binPath string) {
+	if strings.TrimSpace(binPath) == "" {
+		return
+	}
+	target, err := filepath.EvalSymlinks(binPath)
+	if err != nil {
+		target = filepath.Clean(binPath)
+	}
+	out, err := exec.Command("ps", "-ax", "-o", "pid=,comm=").Output()
+	if err != nil {
+		return
+	}
+	selfPID := os.Getpid()
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		pid, perr := strconv.Atoi(fields[0])
+		if perr != nil || pid <= 0 || pid == selfPID {
+			continue
+		}
+		comm := strings.TrimSpace(strings.TrimPrefix(line, fields[0]))
+		if !filepath.IsAbs(comm) || !strings.HasPrefix(filepath.Base(comm), "language_server") {
+			continue
+		}
+		resolved, rerr := filepath.EvalSymlinks(comm)
+		if rerr != nil {
+			resolved = filepath.Clean(comm)
+		}
+		if resolved == target {
+			_ = syscall.Kill(pid, syscall.SIGTERM)
+		}
+	}
 }

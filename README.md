@@ -2,7 +2,7 @@
   <img src="docs/avatar.png" alt="PixelTunnel" width="68" />
 </p>
 
-# PixelTunnel v2.2.0 — Open-Source AI & IDE Unlocker (Antigravity, Cursor, Claude Code, Windsurf)
+# PixelTunnel v2.2.1 — Open-Source AI & IDE Unlocker (Antigravity, Cursor, Claude Code, Windsurf)
 
 [![Release](https://img.shields.io/github/v/release/keenfolk1-lgtm/antigravity-unlocker?label=release&color=2ea44f)](https://github.com/keenfolk1-lgtm/antigravity-unlocker/releases/latest)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)](https://github.com/keenfolk1-lgtm/antigravity-unlocker/releases/latest)
@@ -18,7 +18,7 @@
 - 📢 **Telegram-канал по обходу (обновления, гайды и помощь)**: [t.me/pixel_antigravity_fix](https://t.me/pixel_antigravity_fix)
 - 🌐 **Официальный сайт / Подписки**: [pixelstore.space](https://pixelstore.space/)
 - 🤖 **Telegram-бот (PRO-ключи, YouTube, Discord, iOS/Android)**: [@p1xivpn_bot](https://t.me/p1xivpn_bot)
-- 📦 **Скачать готовый билд**: [GitHub Releases (v2.2.0)](https://github.com/keenfolk1-lgtm/antigravity-unlocker/releases/latest)
+- 📦 **Скачать готовый билд**: [GitHub Releases (v2.2.1)](https://github.com/keenfolk1-lgtm/antigravity-unlocker/releases/latest)
 
 <p align="center">
   <img src="docs/ui.png" alt="PixelTunnel v2.2.0 UI — Obsidian Precision + PRISM ASCII" width="760" />
@@ -35,6 +35,10 @@
 </table>
 
 ![Схема маршрутизации PixelTunnel](docs/architecture.png)
+
+## Что нового в v2.2.1
+- **Авто-патчер Antigravity `language_server` для Linux и macOS**: при запуске `pixeltunnel start` и через новую команду `pixeltunnel patch [--check] [--tiers-only] [--path <binary>]` движок автоматически патчит `language_server` (`ineligible_tiers` / `ineligibleTiers` → обход ограничения региона аккаунта + `HTTPS_PROXY` → `AG_LS_PROXY`), выполняет атомарную замену без `ETXTBSY`, применяет ad-hoc `codesign` на macOS Apple Silicon и мягко перезапускает затронутый `language_server`.
+- **Проброс `AG_LS_PROXY` и проверка в Diagnostics 4.0**: `pixeltunnel env` теперь экспортирует `AG_LS_PROXY`, на Linux дополнительно обновляется `dbus-update-activation-environment --systemd AG_LS_PROXY`, а `pixeltunnel doctor` (`cardIDESockets`) проверяет наличие и состояние патча `language_server`.
 
 ## Что нового в v2.2.0
 - **Новый интерфейс Obsidian Precision v2.2 + PRISM ASCII**: двухколоночное окно без пустых зазоров, живая переливающаяся ASCII-эмблема Google Antigravity, адаптивная светлая/тёмная тема (`#FAFBFD` / `#08090D`), 3D ASCII-капсулы выбора VPN в «Наш VPN» и живой 5-узловой ASCII-сканер (`uTLS · PWP4 · PAC · IDE · AI`) в «Умной диагностике».

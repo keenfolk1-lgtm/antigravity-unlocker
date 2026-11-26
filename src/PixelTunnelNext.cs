@@ -36,8 +36,8 @@ using ShapePath = System.Windows.Shapes.Path;
 [assembly: AssemblyTrademark("")]
 [assembly: AssemblyCulture("")]
 [assembly: ComVisible(false)]
-[assembly: AssemblyVersion("2.2.0.0")]
-[assembly: AssemblyFileVersion("2.2.0.0")]
+[assembly: AssemblyVersion("2.2.1.0")]
+[assembly: AssemblyFileVersion("2.2.1.0")]
 [assembly: System.Runtime.Versioning.TargetFramework(".NETFramework,Version=v4.8", FrameworkDisplayName = ".NET Framework 4.8")]
 
 namespace PixelTunnel
@@ -641,7 +641,7 @@ namespace PixelTunnel
         public static string GetFreeModeSentinelUri() { return "pwp3://free@ai.pixelstore.space:443#PixelTunnel-Free"; }
         private static string GetDefaultClusterHost() { return "ai.pixelstore.space"; }
 
-        public const string APP_VERSION = "2.2.0";
+        public const string APP_VERSION = "2.2.1";
         public const string IPC_PIPE_NAME = "Local\\PixelTunnel_IPC_v2";
         private const int LOCAL_MIXED_PORT = 17890;
         internal static volatile bool _isConfigGenMode = false;
